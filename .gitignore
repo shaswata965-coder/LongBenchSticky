@@ -1,0 +1,57 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+venv/
+.env
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Datasets and generated files
+1LongBenchData/
+*baseline_results.json
+*.jsonl
+*.json
+Results/*.json
+LIR/*.json
+LIR/*.png
+Jaccard/*.json
+Jaccard/*.png
+Dataset/__pycache__/
+Results/__pycache__/
+LIR/__pycache__/
+Jaccard/__pycache__/
+Metrices/__pycache__/

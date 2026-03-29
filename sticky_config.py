@@ -14,7 +14,7 @@ LOCAL_NUM_TOKENS = 32
 
 OMEGA = 5  # Window size for KV cache grouping
 SINK_TOKENS = 5  # Number of permanently protected sink tokens
-
+tracking_flag = 0
 
 S_IDX = 0     # Starting index for window tracking
 SEEDS = [42]

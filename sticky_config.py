@@ -10,11 +10,11 @@ R_RATIO = 50  # Total KV cache budget (e.g., 25% of sequence length)
 # P_RATIO = 50 # Local/Recent window size as % of total budget
 
 # To use a fixed number of tokens for local windows, set LOCAL_NUM_TOKENS (e.g., 256) and comment out P_RATIO
-LOCAL_NUM_TOKENS = 32
+LOCAL_NUM_TOKENS = 0
 
 OMEGA = 5  # Window size for KV cache grouping
-SINK_TOKENS = 5  # Number of permanently protected sink tokens
-tracking_flag = 0
+SINK_TOKENS = 0  # Number of permanently protected sink tokens
+tracking_flag = 1
 
 S_IDX = 0     # Starting index for window tracking
 SEEDS = [42]

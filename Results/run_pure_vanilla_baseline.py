@@ -37,12 +37,18 @@ def main():
     if os.path.exists(OUTPUT_FILE):
         print(f"Removing existing {OUTPUT_FILE} to prevent appending bugs...")
         os.remove(OUTPUT_FILE)
+        
+    STICKY_OUTPUT_FILE = "sticky_baseline_results.json"
+    if os.path.exists(STICKY_OUTPUT_FILE):
+        print(f"Removing existing {STICKY_OUTPUT_FILE} to force a synchronized regeneration run...")
+        os.remove(STICKY_OUTPUT_FILE)
     
     print(f"Loading Pure HuggingFace LLaMA (No sticky cache logic) from {MODEL_PATH}...")
     try:
         from transformers.models.llama.configuration_llama import LlamaConfig as HFLlamaConfig
         with open(os.path.join(MODEL_PATH, "config.json"), "r") as f:
             v_config_dict = json.load(f)
+        rope_scaling_config = v_config_dict.get("rope_scaling", None)
         if "rope_scaling" in v_config_dict:
             del v_config_dict["rope_scaling"]
         v_config = HFLlamaConfig(**v_config_dict)
@@ -54,6 +60,26 @@ def main():
             device_map="auto"
         )
         tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
+        
+        # --- MONKEY PATCH LLAMA 3 ROPE ---
+        if rope_scaling_config is not None:
+            rope_type = rope_scaling_config.get("type", rope_scaling_config.get("rope_type", ""))
+            if rope_type == "llama3":
+                print("Monkey-patching HuggingFace 4.35 model with custom Llama 3 RoPE...")
+                from sticky_llama_attention import Llama3RotaryEmbedding
+                dim = v_config.hidden_size // v_config.num_attention_heads
+                max_pos = v_config.max_position_embeddings
+                base = getattr(v_config, "rope_theta", 500000.0)
+                factor = rope_scaling_config.get("factor", 8.0)
+                low_freq = rope_scaling_config.get("low_freq_factor", 1.0)
+                high_freq = rope_scaling_config.get("high_freq_factor", 4.0)
+                orig_max_pos = rope_scaling_config.get("original_max_position_embeddings", 8192)
+                for layer in model.model.layers:
+                    layer.self_attn.rotary_emb = Llama3RotaryEmbedding(
+                        dim=dim, max_position_embeddings=max_pos, base=base,
+                        scaling_factor=factor, low_freq_factor=low_freq,
+                        high_freq_factor=high_freq, original_max_position_embeddings=orig_max_pos
+                    ).to(device=model.device)
     except Exception as e:
         print(f"Error loading model: {e}")
         return
@@ -134,7 +160,8 @@ def main():
             layer_attn_view = layer_attn[0, :, :current_seq_len, :].view(NUM_KV_HEADS, GROUP_SIZE, current_seq_len, -1)
             
             # 1. Compute mean across Q-heads -> [8, prefill_len, prefill_len]
-            scores_for_cache = layer_attn_view.mean(dim=1)
+            # Must enforce contiguous layout so bfloat16 summation vectorization utilizes equivalent SIMD buffers!
+            scores_for_cache = layer_attn_view.mean(dim=1).contiguous()
             
             # To achieve 100% parity with Sticky's internal mechanism, we must sum the 5 window tokens in bfloat16 BEFORE float casting!
             # And we MUST ALSO slice the tensor before calling .sum(dim=1) so the PyTorch kernel uses identical vectorization strides!

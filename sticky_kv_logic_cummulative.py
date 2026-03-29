@@ -26,10 +26,10 @@ def _make_causal_mask(bsz, tgt_len, past_len, dtype, device):
     return mask[None, None, :, :].expand(bsz, 1, tgt_len, tgt_len + past_len)
 
 
-def apply_rotary_pos_emb_single(x, cos, sin, position_ids):
-    cos = cos.squeeze(1).squeeze(0)[position_ids].unsqueeze(1)
-    sin = sin.squeeze(1).squeeze(0)[position_ids].unsqueeze(1)
-    return (x * cos) + (rotate_half(x) * sin)
+def apply_rotary_pos_emb_single(q, cos, sin, position_ids, unsqueeze_dim=1):
+    cos = cos[position_ids].unsqueeze(unsqueeze_dim)
+    sin = sin[position_ids].unsqueeze(unsqueeze_dim)
+    return (q * cos) + (rotate_half(q) * sin)
 
 
 class STICKYKVCache_LayerWise(nn.Module):
@@ -81,7 +81,11 @@ class STICKYKVCache_LayerWise(nn.Module):
         self.num_of_tokens_without_eviction = 0
         self.prompt_boundary = [-1 for _ in range(self.num_heads)]
         self._prefill_done = False  # Tracks whether initial prefill has completed
-        self.tracking_flag = getattr(config, "tracking_flag", 1) == 1
+        try:
+            from sticky_config import tracking_flag
+            self.tracking_flag = (tracking_flag == 1)
+        except ImportError:
+            self.tracking_flag = getattr(config, "tracking_flag", 1) == 1
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -96,12 +100,12 @@ class STICKYKVCache_LayerWise(nn.Module):
             max_windows = 10000
 
         window_ids = torch.arange(max_windows, device=device)
-        token_map = (window_ids.unsqueeze(1) * self.omega + 5) + torch.arange(
+        token_map = (window_ids.unsqueeze(1) * self.omega + self.sink_tokens) + torch.arange(
             self.omega, device=device
         )
 
         self.register_buffer("window_to_token_map", token_map)
-        self.register_buffer("sink_indices", torch.arange(0, 5, device=device))
+        self.register_buffer("sink_indices", torch.arange(0, self.sink_tokens, device=device) if self.sink_tokens > 0 else torch.zeros(0, dtype=torch.long, device=device))
         self.register_buffer(
             "window_scores",
             torch.full(
@@ -139,7 +143,7 @@ class STICKYKVCache_LayerWise(nn.Module):
         self.prefill_attention_matrix = None
 
         self.cache_size = int(
-            self.omega * (1 + self.local_num + self.k_windows + self.start_idx) + 5 
+            self.omega * (1 + self.local_num + self.k_windows + self.start_idx) + self.sink_tokens 
         )
         
 
@@ -184,7 +188,7 @@ class STICKYKVCache_LayerWise(nn.Module):
         if num_new_tokens > 1:
             self._update_k_win_and_local_num(num_new_tokens, 64)
             self.cache_size = (
-                self.omega * (1 + self.local_num + self.k_windows + self.start_idx) + 5
+                self.omega * (1 + self.local_num + self.k_windows + self.start_idx) + self.sink_tokens
             )
             self.num_of_tokens_without_eviction += seq_len
             for h in range(self.num_heads):
@@ -198,14 +202,14 @@ class STICKYKVCache_LayerWise(nn.Module):
         if num_new_tokens > 1:  # Prompt Stage
             # --- OMEGA OBSERVATION WINDOW SCORING ---
             # Observation Window: The final OMEGA tokens of the prefill sequence strictly exclude Sinks
-            ob_start = max(5, seq_len - self.omega)
+            ob_start = max(self.sink_tokens, seq_len)
             ob_end = seq_len - 1
             
             # Determine local token count precisely
             local_tokens_count = self.local_num_tokens if self.use_fixed_local_tokens else (self.local_num * self.omega)
             
-            # Application boundary: Exclude Sinks [0:5] and Local+Observation windows
-            score_end = max(5, seq_len - local_tokens_count - self.omega)
+            # Application boundary: Exclude Sinks, Local windows, and Observation windows
+            score_end = max(self.sink_tokens, seq_len - local_tokens_count)
             num_windows = max(0, (score_end - self.sink_tokens) // self.omega)
             
             if num_windows > 0:
@@ -317,7 +321,6 @@ class STICKYKVCache_LayerWise(nn.Module):
                     scores_slice = self.running_attention_votes[:, self.sink_tokens:actual_review_end]
                     win_scores = scores_slice.view(self.num_heads, num_competing_windows, self.omega).sum(dim=2).to(dtype=torch.float32)
                 
-                # Retrieve logical ids (using min bound because Vanilla has extra k_windows space)
                 num_old_windows = num_competing_windows - 1
                 valid_old_windows = min(self.k_windows, num_old_windows)
                 
@@ -329,21 +332,15 @@ class STICKYKVCache_LayerWise(nn.Module):
                 competing_ids = torch.cat([old_ids, last_id_tensor], dim=1) # [heads, valid_old + 1]
                 
                 # Build competing_hist to exactly match num_competing_windows
-                # Start with zeros for ALL competing windows
                 competing_hist = torch.zeros((self.num_heads, num_competing_windows), device=device, dtype=torch.float32)
-                # Place old scores at the correct positions (first valid_old_windows entries)
                 if valid_old_windows > 0:
                     old_scores = torch.nan_to_num(self.window_scores[:, :valid_old_windows, 0], nan=0.0)
                     competing_hist[:, :valid_old_windows] = old_scores
-                # New window (last entry in competing_ids) gets 0 history — already zero
                 
                 # win_scores covers ALL num_competing_windows from the slice
-                # competing_hist also has num_competing_windows entries
-                # But competing_ids only has valid_old_windows + 1 entries
                 # We need to align: take only the windows that have IDs
                 num_with_ids = competing_ids.shape[1]
                 if num_with_ids < num_competing_windows:
-                    # More windows in the slice than we track — take only the tracked subset
                     win_scores = win_scores[:, :num_with_ids]
                     competing_hist = competing_hist[:, :num_with_ids]
                     num_competing_windows = num_with_ids
@@ -437,8 +434,8 @@ class STICKYKVCache_LayerWise(nn.Module):
 
     def _update_window_scores_generation_vectorized(self, attn_scores, local_id, orig_id):
         device = self.window_scores.device
-        w_start, w_end = int(local_id * self.omega + 5), int(
-            local_id * self.omega + 4 + self.omega
+        w_start, w_end = int(local_id * self.omega + self.sink_tokens), int(
+            local_id * self.omega + (self.sink_tokens - 1) + self.omega
         )
         new_scores = (
             attn_scores[0, :, 0, w_start : w_end + 1]
@@ -525,7 +522,7 @@ class STICKYKVCache_LayerWise(nn.Module):
             past_key_values[0].shape[-1],
         )
         
-        num_w, remainder = (seq_len - 5) // self.omega, (seq_len - 5) % self.omega
+        num_w, remainder = (seq_len - self.sink_tokens) // self.omega, (seq_len - self.sink_tokens) % self.omega
         sticky_w = torch.nan_to_num(
             self.window_scores[:, : self.k_windows, 1], nan=0.0
         ).long()

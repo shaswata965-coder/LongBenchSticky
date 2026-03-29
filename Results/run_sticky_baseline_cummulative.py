@@ -35,8 +35,8 @@ def main():
         config = LlamaConfig.from_pretrained(MODEL_PATH)
         
         if hasattr(config, "rope_scaling") and config.rope_scaling is not None:
-            if "rope_type" in config.rope_scaling and "type" not in config.rope_scaling:
-                config.rope_scaling["type"] = config.rope_scaling["rope_type"]
+             if "rope_type" in config.rope_scaling and "type" not in config.rope_scaling:
+                 config.rope_scaling["type"] = config.rope_scaling["rope_type"]
         
         config.rope_theta = getattr(config, "rope_theta", 500000.0)
             
@@ -167,14 +167,15 @@ def main():
             current_seq_len = prefill_tensor.shape[-1]
             
 
-            # FIX ISSUE 4: Capture true entire prefill attention
-            q_importance = prefill_tensor[:, :current_seq_len, :].sum(dim=1).float()
-            kv_importance = q_importance.view(num_kv_heads, group_size, -1).mean(dim=1).cpu().numpy()
+            # FIX ISSUE 4: Capture true entire prefill attention, aligning bfloat16 fp-commutation perfectly with Vanilla!
+            prefill_tensor_view = prefill_tensor[:, :current_seq_len, :].view(num_kv_heads, group_size, current_seq_len, -1)
+            scores_for_cache = prefill_tensor_view.mean(dim=1).contiguous()
+            kv_importance_val = scores_for_cache.sum(dim=1).float().cpu().numpy()
             
             layer_data = {}
             layer_ws_data = {}
             for kv_head_idx in tracked_heads:
-                layer_data[str(kv_head_idx)] = kv_importance[kv_head_idx].tolist()
+                layer_data[str(kv_head_idx)] = kv_importance_val[kv_head_idx].tolist()
                 
                 head_ws = ws[kv_head_idx]
                 valid_mask = ~np.isnan(head_ws[:, 1])

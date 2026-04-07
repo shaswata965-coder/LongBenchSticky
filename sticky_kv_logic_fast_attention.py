@@ -81,11 +81,6 @@ class STICKYKVCache_LayerWise(nn.Module):
         self.num_of_tokens_without_eviction = 0
         self.prompt_boundary = [-1 for _ in range(self.num_heads)]
         self._prefill_done = False  # Tracks whether initial prefill has completed
-        try:
-            from sticky_config import tracking_flag
-            self.tracking_flag = (tracking_flag == 1)
-        except ImportError:
-            self.tracking_flag = getattr(config, "tracking_flag", 1) == 1
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -126,66 +121,22 @@ class STICKYKVCache_LayerWise(nn.Module):
             torch.zeros((self.num_heads, max_context), dtype=torch.float32, device=device)
         )
 
-        # Tracks arrival order for the entire context
-        self.register_buffer("global_token_counter", torch.tensor(0, dtype=torch.long))
 
-        # The Ledger: [Global_ID, Layer_ID, Phys_id_Head0, Phys_id_Head1, ..., Score_Head0, Score_Head1, ...]
-        # Size: 2 + num_heads (for physical indices) + num_heads (for scores) = 2 + 2 * num_heads
-        self.register_buffer("token_ledger", 
-                            torch.full((max_context, 2 + 2 * self.num_heads), -1.0, dtype=torch.float32))
-
-        # Local History Buffer: cumulative window score per logical window id.
-        # Used when a window transitions from the local protected region into
-        # eviction contention.
-        self.register_buffer(
-            "local_history",
-            torch.zeros((self.num_heads, max_windows), dtype=torch.float32, device=device),
-        )
-
-        # Optional: High-resolution 2D history for research (Global_ID x Heads)
-        self.register_buffer("global_score_history", 
-                            torch.full((max_context, num_heads), -1.0, dtype=torch.float32))
-
-        # Optional: Full NxN prefill matrix for rigorous research comparison
-        # We initialize it as empty and allocate on demand to save memory if not used
-        self.prefill_attention_matrix = None
 
         self.cache_size = int(
             self.omega * (1 + self.local_num + self.k_windows + self.start_idx) + self.sink_tokens 
         )
         
 
-    def __call__(self, past_key_values, attn_score_cache, full_attn_scores=None):
-        bsz, q_heads, q_len, kv_seq_len = attn_score_cache.shape
+    def __call__(self, past_key_values, attn_score_cache, full_attn_scores=None, q_len=None):
+        bsz, q_heads, q_len_cache, kv_seq_len = attn_score_cache.shape
         
+        q_len = q_len if q_len is not None else q_len_cache
         num_new_tokens = q_len
 
         # FIX: Define seq_len immediately to avoid ReferenceError in arrival loop
         seq_len = past_key_values[0].size(self.k_seq_dim) if past_key_values is not None else 0
         # === Inside __call__ ===
-        global_start = self.global_token_counter.item()
-        
-        # --- LEDGER REGISTRATION ---
-        if not self._prefill_done:
-            num_new = q_len
-            self.global_token_counter += num_new
-            if self.tracking_flag:
-                for i in range(num_new):
-                    g_id = global_start + i
-                    if g_id < self.token_ledger.shape[0]:
-                        self.token_ledger[g_id, 0] = float(g_id)
-                        self.token_ledger[g_id, 1] = float(self.layer_idx)
-                        phys_idx = float((seq_len if past_key_values else 0) + i)
-                        self.token_ledger[g_id, 2:2+self.num_heads] = phys_idx
-        else:
-            self.global_token_counter += 1
-            if self.tracking_flag:
-                g_id = global_start
-                if g_id < self.token_ledger.shape[0]:
-                    self.token_ledger[g_id, 0] = float(g_id)
-                    self.token_ledger[g_id, 1] = float(self.layer_idx)
-                    phys_idx = float(seq_len - 1)
-                    self.token_ledger[g_id, 2:2+self.num_heads] = phys_idx
         
         if past_key_values is None:
             return past_key_values
@@ -258,53 +209,12 @@ class STICKYKVCache_LayerWise(nn.Module):
 
             self._evict_from_window_scores()
 
-            # --- CAPTURE SCORES BEFORE EVICTION ---
-            if self.tracking_flag:
-                importance_map = attn_score_cache[0, :, :seq_len, :].sum(dim=1)
-                active_mask = (self.token_ledger[:, 2] >= 0) & (self.token_ledger[:, 0] >= 0)
-                active_g_ids = torch.where(active_mask)[0]
-                for g_id in active_g_ids:
-                    pre_eviction_phys_idx = self.token_ledger[g_id, 2].long()
-                    if pre_eviction_phys_idx < importance_map.shape[1]:
-                        self.token_ledger[g_id, 2+self.num_heads:2+2*self.num_heads] = importance_map[:, pre_eviction_phys_idx]
-                        self.global_score_history[g_id, :] = importance_map[:, pre_eviction_phys_idx]
+            # Tracking logic removed per Fast Attention v2 instructions.
 
             # --- 1. GET SURVIVOR MAP ---
             updated_kv, survivor_ids = self._create_mask_and_evict_from_kv_cache_prompt_stage(
                 past_key_values, attn_score_cache
             )
-
-            if self.tracking_flag:
-                full_scores_ref = full_attn_scores if full_attn_scores is not None else attn_score_cache
-                raw_matrix = full_scores_ref[0].detach().cpu()
-                num_q_heads_total = raw_matrix.shape[0]
-                group_size = num_q_heads_total // self.num_heads  
-                sparse_matrix = torch.zeros_like(raw_matrix)
-                
-                try:
-                    for kv_h in range(self.num_heads):
-                        kv_survivors = survivor_ids[kv_h].cpu().long()
-                        kv_survivors = torch.unique(torch.clamp(kv_survivors, 0, seq_len - 1))
-                        q_start = kv_h * group_size
-                        q_end = q_start + group_size
-                        sparse_matrix[q_start:q_end, :, kv_survivors] = raw_matrix[q_start:q_end, :, kv_survivors]
-                except IndexError as e:
-                    print(f"IndexError details ---> raw_matrix: {raw_matrix.shape}, sparse_matrix: {sparse_matrix.shape}")
-                    raise e
-                
-                self.prefill_attention_matrix = sparse_matrix
-                full_importance = attn_score_cache[0, :, :seq_len, :].sum(dim=1)
-                self.token_ledger[:, 2:2+self.num_heads] = -1.0  
-                
-                for head_idx in range(self.num_heads):
-                    clean_survivors = survivor_ids[head_idx].to(torch.long) 
-                    for phys_idx, g_id in enumerate(clean_survivors):
-                        if g_id >= 0 and g_id < self.token_ledger.shape[0]:
-                            self.token_ledger[g_id, 2 + head_idx] = float(phys_idx)
-                            
-                    for g_id in clean_survivors:
-                        if g_id >= 0 and g_id < self.token_ledger.shape[0] and g_id < full_importance.shape[1]:
-                            self.token_ledger[g_id, 2 + self.num_heads + head_idx] = full_importance[head_idx, g_id]
 
             self._prefill_done = True  # Mark prefill as complete
             return updated_kv
@@ -315,22 +225,6 @@ class STICKYKVCache_LayerWise(nn.Module):
             # 1. ACCUMULATE VOTES
             self.running_attention_votes[:, :seq_len] += attn_score_cache[0, :, 0, :seq_len]
             self.tokens_since_last_review += 1
-            
-            # --- LEDGER: Update Scores for Live Tokens ---
-            if self.tracking_flag:
-                live_mask = self.token_ledger[:, 2] >= 0
-                live_g_ids = torch.where(live_mask)[0]
-                
-                for head_idx in range(self.num_heads):
-                    phys_indices = self.token_ledger[live_g_ids, 2 + head_idx].long()
-                    valid_mask = phys_indices >= 0
-                    valid_phys = phys_indices[valid_mask]
-                    valid_g_ids = live_g_ids[valid_mask]
-                    
-                    if len(valid_phys) > 0 and valid_phys.max() < seq_len:
-                        head_scores = attn_score_cache[0, head_idx, 0, valid_phys]
-                        self.token_ledger[valid_g_ids, 2 + self.num_heads + head_idx] = head_scores.float()
-                        self.global_score_history[valid_g_ids, head_idx] = head_scores.float()
             
             # 2. PERIODIC EVALUATION
             if self.tokens_since_last_review == self.omega:
@@ -444,15 +338,6 @@ class STICKYKVCache_LayerWise(nn.Module):
                 k_kept = torch.gather(past_key_values[0][0], 1, gather_idx).unsqueeze(0)
                 v_kept = torch.gather(past_key_values[1][0], 1, gather_idx).unsqueeze(0)
                 updated_kv = (k_kept, v_kept)
-                
-                if self.tracking_flag:
-                    # Universal ledger shift for generic tools - Shift correctly per head
-                    for head_idx in range(self.num_heads):
-                        phys_col = 2 + head_idx
-                        mask_evict = (self.token_ledger[:, phys_col] >= local_start - self.omega) & (self.token_ledger[:, phys_col] < local_start)
-                        mask_shift = self.token_ledger[:, phys_col] >= local_start
-                        self.token_ledger[mask_evict, phys_col] = -1.0
-                        self.token_ledger[mask_shift, phys_col] -= self.omega
 
                 # Reset accumulator
                 self.running_attention_votes.zero_()
@@ -464,27 +349,10 @@ class STICKYKVCache_LayerWise(nn.Module):
             
     def get_ledger_data(self):
         """
-        Retrieves the tri-axial tracking data for research analysis.
-        Returns a dictionary containing only the processed tokens.
+        Retrieves the tracking data for research analysis.
+        (Deprecated in Fast Attention v2.0 - returns empty dict)
         """
-        # 1. Identify tokens that have entered the system
-        total_processed = self.global_token_counter.item()
-        
-        # 2. Slice the ledger to exclude unused pre-allocated buffer space
-        active_ledger = self.token_ledger[:total_processed].detach().cpu()
-        
-        # 3. Extract the columns for clarity
-        global_ids = active_ledger[:, 0].long()
-        layer_ids = active_ledger[:, 1].long()
-        physical_positions = active_ledger[:, 2:2+self.num_heads].long()
-        attention_scores = active_ledger[:, 2+self.num_heads:2+2*self.num_heads]
-        
-        return {
-            "global_id": global_ids,
-            "layer_id": layer_ids,
-            "physical_id": physical_positions, # [num_tokens, num_heads]
-            "attention_score": attention_scores # [num_tokens, num_heads]
-        }
+        return {}
 
     def _update_window_scores_generation_vectorized(self, attn_scores, local_id, orig_id):
         device = self.window_scores.device
@@ -556,15 +424,6 @@ class STICKYKVCache_LayerWise(nn.Module):
         # Use index_select to preserve the tensor shape across all other dims
         k_kept = torch.index_select(past_key_values[0], self.k_seq_dim, keep_indices)
         v_kept = torch.index_select(past_key_values[1], self.k_seq_dim, keep_indices)
-        
-        if self.tracking_flag:
-            # Keep the logging ledger physically mapped to the compacted space (per-head):
-            for head_idx in range(self.num_heads):
-                phys_col = 2 + head_idx
-                mask_evict = (self.token_ledger[:, phys_col] >= start_drop) & (self.token_ledger[:, phys_col] < end_drop)
-                mask_shift = self.token_ledger[:, phys_col] >= end_drop
-                self.token_ledger[mask_evict, phys_col] = -1.0
-                self.token_ledger[mask_shift, phys_col] -= self.omega
         
         return (k_kept, v_kept), keep_indices.unsqueeze(0)
 

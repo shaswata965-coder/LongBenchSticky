@@ -66,10 +66,10 @@ def main():
             # Print intermediate sample size completion
             print(f"Completed {task_name} (Seed {seed}): Evaluated {res['sample_size']} instances.")
 
-    # Save outputs
-    output_file = "long_bench_pure_vanilla_metrics.json"
-    with open(output_file, "w") as f:
-        json.dump(all_results, f, indent=2)
+    # Save outputs as NPZ
+    import numpy as np
+    output_file = "long_bench_pure_vanilla_metrics.npz"
+    np.savez_compressed(output_file, data=np.array([json.dumps(all_results)]))
     
     print(f"\nAll evaluations complete. Results saved to {output_file}")
 

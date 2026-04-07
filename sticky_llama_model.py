@@ -1,5 +1,5 @@
 from transformers.models.llama.modeling_llama import LlamaForCausalLM
-from sticky_llama_attention import STICKYLlamaAttention
+from sticky_llama_attention_fast_attention import STICKYLlamaAttention
 
 import copy # ensure copy is imported if not already
 

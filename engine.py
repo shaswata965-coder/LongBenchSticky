@@ -94,11 +94,6 @@ def generate(prompt, model, tokenizer, device, refs=None, task=None, **kwargs):
                 layer.self_attn._clean_cache()
                 if hasattr(layer.self_attn, "kv_cache"):
                     layer.self_attn.kv_cache._prefill_done = False
-                    layer.self_attn.kv_cache.global_token_counter.zero_()
-                    layer.self_attn.kv_cache.token_ledger.fill_(-1.0)
-                    layer.self_attn.kv_cache.global_score_history.fill_(-1.0)
-                    if getattr(layer.self_attn.kv_cache, "prefill_attention_matrix", None) is not None:
-                        layer.self_attn.kv_cache.prefill_attention_matrix = None
 
     if device == "cuda":
         torch.cuda.synchronize()

@@ -4,7 +4,8 @@
 
   [![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://www.python.org/)
   [![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-ee4c2c.svg)](https://pytorch.org/)
-  [![Transformers](https://img.shields.io/badge/HuggingFace-Transformers-yellow.svg)](https://huggingface.co/)
+  [![Transformers](https://img.shields.io/badge/HuggingFace-Transformers_4.35.2-yellow.svg)](https://huggingface.co/)
+  [![FlashAttention](https://img.shields.io/badge/FlashAttention-2.0-orange.svg)](https://github.com/Dao-AILab/flash-attention)
   [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 </div>
 
@@ -24,6 +25,7 @@ This repository runs standardized configurations of the [LongBench](https://gith
 - **Granular Token Ledger**: Meticulously tracks attention scores across windows, globally across the context sequence.
 - **Layer Information Retention (LIR) Metrics**: Custom metric pipelines to quantitatively analyze the retention of important tokens layer-by-layer.
 - **Attention Jaccard Similarity**: Determines the overlap and fidelity of the Sticky KV cache compared exactly against the pure, uncompressed Vanilla baseline.
+- **Flash Attention 2.0 Integration**: A native, OOM-safe `fast_attention` variant of the algorithm utilizing the `flash_attn` package directly to accelerate prefill stages on Ampere+ hardware without compromising rigorous eviction tracking.
 - **Unrestricted Context Evaluations**: Capable of processing raw LongBench datasets with zero mid-truncation or chunking for pure, standardized benchmarking.
 
 ## 🗄️ Supported Datasets
@@ -40,12 +42,12 @@ The evaluation suite seamlessly supports subsets of the LongBench and PG-19 data
 
 ### Prerequisites
 
-Ensure you have a machine with a CUDA-compatible GPU and PyTorch installed.
+Ensure you have a machine with a CUDA-compatible GPU (Ampere/Hopper recommended for FA2 operations) and PyTorch installed.
 
 ```bash
 git clone https://github.com/shaswata965-coder/LongBenchSticky.git
 cd LongBenchSticky
-pip install -r requirements.txt # (Ensure torch, transformers, datasets, numpy are installed)
+pip install -r requirements.txt # (Installs transformers==4.35.2, flash_attn natively, etc.)
 ```
 
 ### Running Evaluations
@@ -73,7 +75,7 @@ pip install -r requirements.txt # (Ensure torch, transformers, datasets, numpy a
 ## 🏗️ Architecture Design
 
 * **`engine.py`**: The core driver for generating text and calculating QA/Rouge/Edit Similarity metrics across LongBench subsets.
-* **`sticky_kv_logic_cummulative.py`**: The engine room of the eviction algorithm. Contains the `STICKYKVCache_LayerWise` class that drops non-essential KV data at generation time based on accumulated window scores.
+* **`sticky_kv_logic_cummulative.py` & `sticky_llama_attention_fast_attention.py`**: The engine rooms of the eviction methodology. Contains strictly benchmark-tracked models as well as native Flash Attention 2 implementations enabling ultra-fast evaluation.
 * **`data_loader.py`**: A clean, unrestricted parser for routing LongBench multi-task datasets, applying tailored prompts seamlessly.
 
 ## 🤝 Contributing

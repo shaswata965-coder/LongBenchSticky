@@ -91,8 +91,8 @@ class STICKYKVCache_LayerWise(nn.Module):
             )
             max_windows = max(max_windows, 100)
         else:
-            max_context = 8192
-            max_windows = 10000
+            max_context = 131072
+            max_windows = 30000
 
         window_ids = torch.arange(max_windows, device=device)
         token_map = (window_ids.unsqueeze(1) * self.omega + self.sink_tokens) + torch.arange(
@@ -114,6 +114,8 @@ class STICKYKVCache_LayerWise(nn.Module):
             "head_indices", torch.arange(self.num_heads, device=device)
         )
         
+        self.register_buffer("global_token_counter", torch.tensor(0, dtype=torch.long))
+        
         # Accumulates 1D attention votes from generated tokens over OMEGA steps
         # Max context size is enough to track physically alive tokens
         self.register_buffer(
@@ -121,6 +123,10 @@ class STICKYKVCache_LayerWise(nn.Module):
             torch.zeros((self.num_heads, max_context), dtype=torch.float32, device=device)
         )
 
+        self.register_buffer(
+            "local_history",
+            torch.zeros((self.num_heads, max_windows), dtype=torch.float32, device=device),
+        )
 
 
         self.cache_size = int(
@@ -138,6 +144,11 @@ class STICKYKVCache_LayerWise(nn.Module):
         seq_len = past_key_values[0].size(self.k_seq_dim) if past_key_values is not None else 0
         # === Inside __call__ ===
         
+        if not self._prefill_done:
+            self.global_token_counter += q_len
+        else:
+            self.global_token_counter += 1
+        
         if past_key_values is None:
             return past_key_values
 
@@ -145,7 +156,8 @@ class STICKYKVCache_LayerWise(nn.Module):
         num_new_tokens = q_len
 
         if num_new_tokens > 1:
-            self._update_k_win_and_local_num(num_new_tokens, 64)
+            import sticky_config as config_module
+            self._update_k_win_and_local_num(num_new_tokens, config_module.GENERATION_CONFIG.get("max_new_tokens", 512))
             self.cache_size = (
                 self.omega * (1 + self.local_num + self.k_windows + self.start_idx) + self.sink_tokens
             )
@@ -400,32 +412,7 @@ class STICKYKVCache_LayerWise(nn.Module):
         self.window_scores[:, :curr_k, 2] = torch.gather(kept_orig, 1, sort_idx)
         return []
 
-    def _create_mask_and_evict_from_kv_cache_generation_stage(self, past_key_values, evicted_windows):
-        seq_len, head_dim = (
-            past_key_values[0].size(self.k_seq_dim),
-            past_key_values[0].shape[-1],
-        )
-        
-        # Calculate exactly which relative physical indices to keep.
-        # Format: Sinks (5) -> Sticky (k_windows * omega) -> Local + Trailing
-        # The oldest local window is immediately after the sticky windows.
-        start_drop = self.sink_tokens + self.k_windows * self.omega
-        end_drop = start_drop + self.omega
-        
-        keep_sinks_and_sticky = torch.arange(
-            0, start_drop, device=past_key_values[0].device
-        )
-        keep_recent_local = torch.arange(
-            end_drop, seq_len, device=past_key_values[0].device
-        )
-        
-        keep_indices = torch.cat([keep_sinks_and_sticky, keep_recent_local])
-        
-        # Use index_select to preserve the tensor shape across all other dims
-        k_kept = torch.index_select(past_key_values[0], self.k_seq_dim, keep_indices)
-        v_kept = torch.index_select(past_key_values[1], self.k_seq_dim, keep_indices)
-        
-        return (k_kept, v_kept), keep_indices.unsqueeze(0)
+
 
     def _create_mask_and_evict_from_kv_cache_prompt_stage(self, past_key_values, attn_scores):
         seq_len, head_dim = (
@@ -541,3 +528,4 @@ class STICKYKVCache_LayerWise(nn.Module):
         if hasattr(self, "running_attention_votes"):
             self.running_attention_votes.zero_()
         self.window_scores.fill_(float("nan"))
+        self.global_token_counter.zero_()

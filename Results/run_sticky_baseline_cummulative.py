@@ -10,13 +10,11 @@ import random
 import glob
 from sticky_config import OMEGA, SINK_TOKENS, dataset_tracker
 from npz_io import save_results_npz, load_results_npz
-
+import sticky_config as config
 
 # --- Configuration ---
-MODEL_PATH = "/kaggle/input/llama-3.2/transformers/1b-instruct/1"
 VANILLA_RESULTS_PATH = "pure_vanilla_baseline_results.npz"
 OUTPUT_FILE = "sticky_baseline_results.npz"
-MAX_NEW_TOKENS = 1024
 
 def main():
     # 1. Load Vanilla Results to get the exact samples
@@ -31,26 +29,26 @@ def main():
     vanilla_data = load_results_npz(VANILLA_RESULTS_PATH, metadata_only=True)
 
     # 2. Initialize Sticky Model
-    print(f"Loading StickyLlama from {MODEL_PATH}...")
+    print(f"Loading StickyLlama from {config.MODEL_PATH}...")
     try:
-        config = LlamaConfig.from_pretrained(MODEL_PATH)
+        model_config = LlamaConfig.from_pretrained(config.MODEL_PATH)
         
-        if hasattr(config, "rope_scaling") and config.rope_scaling is not None:
-             if "rope_type" in config.rope_scaling and "type" not in config.rope_scaling:
-                 config.rope_scaling["type"] = config.rope_scaling["rope_type"]
+        if hasattr(model_config, "rope_scaling") and model_config.rope_scaling is not None:
+             if "rope_type" in model_config.rope_scaling and "type" not in model_config.rope_scaling:
+                 model_config.rope_scaling["type"] = model_config.rope_scaling["rope_type"]
         
-        config.rope_theta = getattr(config, "rope_theta", 500000.0)
+        model_config.rope_theta = getattr(model_config, "rope_theta", 500000.0)
             
-        config.r_ratio = 50
-        config.start_idx = 0
+        model_config.r_ratio = getattr(config, "R_RATIO", 50)
+        model_config.start_idx = getattr(config, "S_IDX", 0)
 
         model = STICKYLlamaForCausalLM.from_pretrained(
-            MODEL_PATH, 
-            config=config, 
+            config.MODEL_PATH, 
+            config=model_config, 
             torch_dtype=torch.bfloat16, # Match vanilla baseline dtype
             device_map="auto"
         )
-        tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
+        tokenizer = AutoTokenizer.from_pretrained(config.MODEL_PATH)
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
 
@@ -64,8 +62,8 @@ def main():
 
     # Map for tracked heads (Attention Head -> KV Head)
     # Llama 3.2 1B has 32 Q heads and 8 KV heads -> Group size 4
-    num_q_heads = config.num_attention_heads
-    num_kv_heads = config.num_key_value_heads
+    num_q_heads = model_config.num_attention_heads
+    num_kv_heads = model_config.num_key_value_heads
     group_size = num_q_heads // num_kv_heads
 
     # Extract tracked layers from vanilla data
@@ -77,17 +75,18 @@ def main():
     # RELOAD SAMPLES using the same method as vanilla baseline
     # This ensures inputs are identical.
     import random
-    random.seed(42)
-    np.random.seed(42)
-    torch.manual_seed(42)
-    torch.cuda.manual_seed_all(42)
+    seed = config.SEEDS[0]
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
     
     if dataset_tracker == 1:
         from pg19_loader import get_pg19_blocks
-        raw_samples = get_pg19_blocks(MODEL_PATH, num_samples=len(vanilla_data), min_tokens=1024)
+        raw_samples = get_pg19_blocks(config.MODEL_PATH, num_samples=len(vanilla_data), min_tokens=config.DATASET_MIN_TOKENS)
     else:
         from wiki_text_loader import get_wikitext103_drift_blocks
-        raw_samples = get_wikitext103_drift_blocks(MODEL_PATH, num_samples=len(vanilla_data), min_tokens=1024)
+        raw_samples = get_wikitext103_drift_blocks(config.MODEL_PATH, num_samples=len(vanilla_data), min_tokens=config.DATASET_MIN_TOKENS)
     
     # Verify alignment
     if len(raw_samples) != len(vanilla_data):

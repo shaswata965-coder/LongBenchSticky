@@ -2,6 +2,7 @@ import torch
 from transformers import AutoTokenizer
 from configuration_sticky_llama import LlamaConfig
 from sticky_llama_model import STICKYLlamaForCausalLM
+import sticky_config
 
 def main():
     # 1. Path to your local model weights/directory
@@ -16,8 +17,8 @@ def main():
     # Configuration Option B: Use a fixed number of recent tokens (e.g., 256 tokens)
     config.local_num_tokens = 256 
     
-    config.r_ratio = 50  # Example: 50% total cache ratio
-    config.start_idx = 0 # Example: starting index for eviction
+    config.r_ratio = getattr(sticky_config, "R_RATIO", 50)
+    config.start_idx = getattr(sticky_config, "S_IDX", 0)
     config.alpha = 32    # Observation window size for prefill stage
     print(f"Loading model with Config: p_ratio={config.p_ratio}, r_ratio={config.r_ratio}")
 
@@ -84,10 +85,7 @@ def main():
 
     output = model.generate(
         **inputs, 
-        max_new_tokens=200,
-        temperature=0.7,
-        do_sample=True,
-        top_p=0.9,
+        **sticky_config.GENERATION_CONFIG,
         repetition_penalty=1.1,
         eos_token_id=terminators,
         pad_token_id=tokenizer.eos_token_id,

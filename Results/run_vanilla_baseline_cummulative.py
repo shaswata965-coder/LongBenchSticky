@@ -12,24 +12,13 @@ import glob
 from tqdm import tqdm
 from sticky_config import OMEGA, SINK_TOKENS, dataset_tracker
 from npz_io import save_results_npz
-
+import sticky_config as config
 
 # --- Configuration ---
-MODEL_PATH = "/kaggle/input/llama-3.2/transformers/1b-instruct/1"
-NUM_SAMPLES = 5
-MAX_NEW_TOKENS = 1024
-SEED = 42
 OUTPUT_FILE = "vanilla_baseline_results.npz"
 
-# We hardcode these so they are consistent across runs if we re-run this script
-TRACKED_LAYERS = [1, 3, 5, 8, 10, 11, 14, 15] # 8 random layers from 0-15
-
-# KV-head indices (0-7) — matches the granularity used by sticky eviction
-# Llama 3.2 1B: 32 Q-heads, 8 KV-heads, group_size=4
-NUM_Q_HEADS = 32
-NUM_KV_HEADS = 8
-GROUP_SIZE = NUM_Q_HEADS // NUM_KV_HEADS
-TRACKED_HEADS = list(range(NUM_KV_HEADS))  # [0, 1, 2, 3, 4, 5, 6, 7]
+GROUP_SIZE = config.NUM_Q_HEADS // config.NUM_KV_HEADS
+TRACKED_HEADS = list(range(config.NUM_KV_HEADS))
 
 def setup_seed(seed):
     random.seed(seed)
@@ -38,33 +27,33 @@ def setup_seed(seed):
     torch.cuda.manual_seed_all(seed)
 
 def main():
-    setup_seed(SEED)
+    setup_seed(config.SEEDS[0])
     
     for f in glob.glob(OUTPUT_FILE.replace('.npz', '*.npz')):
         print(f"Removing existing {f} to prevent appending bugs...")
         os.remove(f)
     
-    print(f"Loading STICKYLlama (eviction DISABLED) from {MODEL_PATH}...")
+    print(f"Loading STICKYLlama (eviction DISABLED) from {config.MODEL_PATH}...")
     try:
-        config = LlamaConfig.from_pretrained(MODEL_PATH)
+        model_config = LlamaConfig.from_pretrained(config.MODEL_PATH)
         
-        if hasattr(config, "rope_scaling") and config.rope_scaling is not None:
-            if "rope_type" in config.rope_scaling and "type" not in config.rope_scaling:
-                config.rope_scaling["type"] = config.rope_scaling["rope_type"]
+        if hasattr(model_config, "rope_scaling") and model_config.rope_scaling is not None:
+            if "rope_type" in model_config.rope_scaling and "type" not in model_config.rope_scaling:
+                model_config.rope_scaling["type"] = model_config.rope_scaling["rope_type"]
         
-        config.rope_theta = getattr(config, "rope_theta", 500000.0)
+        model_config.rope_theta = getattr(model_config, "rope_theta", config.ROPE_THETA)
             
         # CRITICAL: Set r_ratio=100 to keep 100% of tokens (no eviction)
-        config.r_ratio = 100   # <-- This disables eviction
-        config.start_idx = 0
+        model_config.r_ratio = 100   # <-- This disables eviction
+        model_config.start_idx = 0
 
         model = STICKYLlamaForCausalLM.from_pretrained(
-            MODEL_PATH, 
-            config=config,
+            config.MODEL_PATH, 
+            config=model_config,
             torch_dtype=torch.bfloat16, 
             device_map="auto"
         )
-        tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
+        tokenizer = AutoTokenizer.from_pretrained(config.MODEL_PATH)
     except Exception as e:
         print(f"Error loading model: {e}")
         return
@@ -72,15 +61,15 @@ def main():
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
         
-    print(f"Model loaded (r_ratio=100, no eviction). Tracking {len(TRACKED_LAYERS)} layers and {len(TRACKED_HEADS)} heads.")
+    print(f"Model loaded (r_ratio=100, no eviction). Tracking {len(config.TRACKED_LAYERS)} layers and {len(TRACKED_HEADS)} heads.")
 
     # Load samples using the local PG-19 or WikiText loader
     if dataset_tracker == 1:
         from pg19_loader import get_pg19_blocks
-        samples = get_pg19_blocks(MODEL_PATH, num_samples=NUM_SAMPLES, min_tokens=4096)
+        samples = get_pg19_blocks(config.MODEL_PATH, num_samples=config.NUM_SAMPLES, min_tokens=config.DATASET_MIN_TOKENS)
     else:
         from wiki_text_loader import get_wikitext103_drift_blocks
-        samples = get_wikitext103_drift_blocks(MODEL_PATH, num_samples=NUM_SAMPLES, min_tokens=4096)
+        samples = get_wikitext103_drift_blocks(config.MODEL_PATH, num_samples=config.NUM_SAMPLES, min_tokens=config.DATASET_MIN_TOKENS)
     
     results = []
 
@@ -105,7 +94,7 @@ def main():
         
         # --- Tokenize the REMAINING article text to get ground-truth continuation tokens ---
         gt_tokens = tokenizer(remaining_text, add_special_tokens=False, return_tensors="pt").input_ids[0]
-        num_gt_tokens = min(MAX_NEW_TOKENS, len(gt_tokens))
+        num_gt_tokens = min(config.GENERATION_CONFIG.get("max_new_tokens", 512), len(gt_tokens))
         
         if num_gt_tokens == 0:
             print(f"  Warning: No remaining text for sample {idx}. Skipping.")

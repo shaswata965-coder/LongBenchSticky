@@ -25,14 +25,23 @@ from sticky_kv_logic import (
 )
 
 class Llama3RotaryEmbedding(nn.Module):
-    def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None, scaling_factor=1.0, low_freq_factor=1.0, high_freq_factor=4.0, original_max_position_embeddings=8192):
+    def __init__(self, dim, max_position_embeddings=None, base=None, device=None, scaling_factor=None, low_freq_factor=None, high_freq_factor=None, original_max_position_embeddings=None):
         super().__init__()
+        import sticky_config
+        max_position_embeddings = max_position_embeddings if max_position_embeddings is not None else sticky_config.MAX_POSITION_EMBEDDINGS
+        base = base if base is not None else sticky_config.ROPE_THETA
+        scaling_factor = scaling_factor if scaling_factor is not None else sticky_config.ROPE_SCALING_FACTOR
+        low_freq_factor = low_freq_factor if low_freq_factor is not None else sticky_config.ROPE_LOW_FREQ_FACTOR
+        high_freq_factor = high_freq_factor if high_freq_factor is not None else sticky_config.ROPE_HIGH_FREQ_FACTOR
+        
         self.scaling_factor = scaling_factor
         self.dim = dim
         self.max_position_embeddings = max_position_embeddings
         self.base = base
         self.low_freq_factor = low_freq_factor
         self.high_freq_factor = high_freq_factor
+        if original_max_position_embeddings is None:
+            original_max_position_embeddings = sticky_config.ORIGINAL_MAX_POSITION_EMBEDDINGS
         self.original_max_position_embeddings = original_max_position_embeddings
         
         inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2, dtype=torch.int64).float().to(device) / self.dim))
@@ -77,8 +86,8 @@ class Llama3RotaryEmbedding(nn.Module):
             self._set_cos_sin_cache(seq_len=seq_len, device=x.device, dtype=x.dtype)
 
         return (
-            self.cos_cached[:seq_len].to(dtype=x.dtype),
-            self.sin_cached[:seq_len].to(dtype=x.dtype),
+            self.cos_cached[:seq_len].to(device=x.device, dtype=x.dtype),
+            self.sin_cached[:seq_len].to(device=x.device, dtype=x.dtype),
         )
 
 class STICKYLlamaAttention(nn.Module):
@@ -126,10 +135,12 @@ class STICKYLlamaAttention(nn.Module):
                  max_pos = self.max_position_embeddings
                  base = self.rope_theta
                  
-                 factor = rope_scaling.get("factor", 8.0)
-                 low_freq = rope_scaling.get("low_freq_factor", 1.0)
-                 high_freq = rope_scaling.get("high_freq_factor", 4.0)
-                 orig_max_pos = rope_scaling.get("original_max_position_embeddings", 8192)
+                 import sticky_config
+                 factor = rope_scaling.get("factor", sticky_config.ROPE_SCALING_FACTOR)
+                 low_freq = rope_scaling.get("low_freq_factor", sticky_config.ROPE_LOW_FREQ_FACTOR)
+                 high_freq = rope_scaling.get("high_freq_factor", sticky_config.ROPE_HIGH_FREQ_FACTOR)
+                 import sticky_config
+                 orig_max_pos = rope_scaling.get("original_max_position_embeddings", sticky_config.ORIGINAL_MAX_POSITION_EMBEDDINGS)
                  
                  self.rotary_emb = Llama3RotaryEmbedding(
                      dim=dim,

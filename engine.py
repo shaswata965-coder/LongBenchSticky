@@ -151,7 +151,8 @@ def evaluate_dataset(name, dataset, seed, model, tokenizer, device):
     np.random.seed(seed)
 
     results = []
-    sample_size = min(100, len(dataset))
+    # Use fallback 100 if attribute doesn't exist to not break other pipelines
+    sample_size = min(getattr(config, "LONGBENCH_SAMPLES", 100), len(dataset))
 
     for i in range(sample_size):
         ex = dataset[i]

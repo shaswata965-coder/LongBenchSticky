@@ -8,23 +8,13 @@ import gc
 import glob
 from sticky_config import OMEGA, SINK_TOKENS, dataset_tracker
 from npz_io import save_results_npz
+import sticky_config as config
 
 # --- Configuration ---
-MODEL_PATH = "/kaggle/input/llama-3.2/transformers/1b-instruct/1"
-NUM_SAMPLES = 10
-MAX_NEW_TOKENS = 256
-SEED = 42
 OUTPUT_FILE = "pure_vanilla_baseline_results.npz"
 
-# We hardcode these so they are consistent across runs if we re-run this script
-TRACKED_LAYERS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15] # 8 random layers from 0-15
-
-# KV-head indices (0-7) — matches the granularity used by sticky eviction
-# Llama 3.2 1B: 32 Q-heads, 8 KV-heads, group_size=4
-NUM_Q_HEADS = 32
-NUM_KV_HEADS = 8
-GROUP_SIZE = NUM_Q_HEADS // NUM_KV_HEADS
-TRACKED_HEADS = list(range(NUM_KV_HEADS))  # [0, 1, 2, 3, 4, 5, 6, 7]
+GROUP_SIZE = config.NUM_Q_HEADS // config.NUM_KV_HEADS
+TRACKED_HEADS = list(range(config.NUM_KV_HEADS))
 
 def setup_seed(seed):
     random.seed(seed)
@@ -33,7 +23,7 @@ def setup_seed(seed):
     torch.cuda.manual_seed_all(seed)
 
 def main():
-    setup_seed(SEED)
+    setup_seed(config.SEEDS[0])
     
     for f in glob.glob(OUTPUT_FILE.replace('.npz', '*.npz')):
         print(f"Removing existing {f} to prevent appending bugs...")
@@ -44,10 +34,10 @@ def main():
         print(f"Removing existing {f} to force a synchronized regeneration run...")
         os.remove(f)
     
-    print(f"Loading Pure HuggingFace LLaMA (No sticky cache logic) from {MODEL_PATH}...")
+    print(f"Loading Pure HuggingFace LLaMA (No sticky cache logic) from {config.MODEL_PATH}...")
     try:
         from transformers.models.llama.configuration_llama import LlamaConfig as HFLlamaConfig
-        with open(os.path.join(MODEL_PATH, "config.json"), "r") as f:
+        with open(os.path.join(config.MODEL_PATH, "config.json"), "r") as f:
             v_config_dict = json.load(f)
         rope_scaling_config = v_config_dict.get("rope_scaling", None)
         if "rope_scaling" in v_config_dict:
@@ -55,12 +45,12 @@ def main():
         v_config = HFLlamaConfig(**v_config_dict)
 
         model = AutoModelForCausalLM.from_pretrained(
-            MODEL_PATH, 
+            config.MODEL_PATH, 
             config=v_config,
             torch_dtype=torch.bfloat16, 
             device_map="auto"
         )
-        tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
+        tokenizer = AutoTokenizer.from_pretrained(config.MODEL_PATH)
         
         # --- MONKEY PATCH LLAMA 3 ROPE ---
         if rope_scaling_config is not None:
@@ -74,13 +64,13 @@ def main():
                 factor = rope_scaling_config.get("factor", 8.0)
                 low_freq = rope_scaling_config.get("low_freq_factor", 1.0)
                 high_freq = rope_scaling_config.get("high_freq_factor", 4.0)
-                orig_max_pos = rope_scaling_config.get("original_max_position_embeddings", 8192)
+                orig_max_pos = rope_scaling_config.get("original_max_position_embeddings", config.ORIGINAL_MAX_POSITION_EMBEDDINGS)
                 for layer in model.model.layers:
                     layer.self_attn.rotary_emb = Llama3RotaryEmbedding(
                         dim=dim, max_position_embeddings=max_pos, base=base,
                         scaling_factor=factor, low_freq_factor=low_freq,
                         high_freq_factor=high_freq, original_max_position_embeddings=orig_max_pos
-                    ).to(device=model.device)
+                    ).to(device=layer.self_attn.q_proj.weight.device)
     except Exception as e:
         print(f"Error loading model: {e}")
         return
@@ -88,17 +78,17 @@ def main():
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
         
-    print(f"Model loaded. Tracking {len(TRACKED_LAYERS)} layers and {len(TRACKED_HEADS)} heads.")
+    print(f"Model loaded. Tracking {len(config.TRACKED_LAYERS)} layers and {len(TRACKED_HEADS)} heads.")
 
     # Load samples — min_tokens=2560 ensures enough remaining for 512-token generation
     # after 0.5-0.7 truncation (worst case: 2560*0.3 = 768 tokens remaining)
     # Note: Cannot go higher due to O(N²) attention memory with output_attentions=True
     if dataset_tracker == 1:
         from pg19_loader import get_pg19_blocks
-        samples = get_pg19_blocks(MODEL_PATH, num_samples=NUM_SAMPLES, min_tokens=2560)
+        samples = get_pg19_blocks(config.MODEL_PATH, num_samples=config.NUM_SAMPLES, min_tokens=config.DATASET_MIN_TOKENS)
     else:
         from wiki_text_loader import get_wikitext103_drift_blocks
-        samples = get_wikitext103_drift_blocks(MODEL_PATH, num_samples=NUM_SAMPLES, min_tokens=2560)
+        samples = get_wikitext103_drift_blocks(config.MODEL_PATH, num_samples=config.NUM_SAMPLES, min_tokens=config.DATASET_MIN_TOKENS)
     
     results = []
 
@@ -122,7 +112,7 @@ def main():
         print(f"Processing sample {idx + 1}/{len(samples)} (original={len(text)}, truncated={len(truncated_text)} chars, remaining={len(remaining_text)} chars)...")
         
         gt_tokens = tokenizer(remaining_text, add_special_tokens=False, return_tensors="pt").input_ids[0]
-        num_gt_tokens = min(MAX_NEW_TOKENS, len(gt_tokens))
+        num_gt_tokens = min(config.GENERATION_CONFIG.get("max_new_tokens", 512), len(gt_tokens))
         
         if num_gt_tokens == 0:
             print(f"  Warning: No remaining text for sample {idx}. Skipping.")
@@ -139,7 +129,7 @@ def main():
         max_seq_len = prefill_len + num_gt_tokens
         
         # Track cumulative attention per token per layer/head
-        token_ledger_scores = {layer: np.zeros((NUM_KV_HEADS, max_seq_len), dtype=np.float32) for layer in TRACKED_LAYERS}
+        token_ledger_scores = {layer: np.zeros((config.NUM_KV_HEADS, max_seq_len), dtype=np.float32) for layer in config.TRACKED_LAYERS}
 
         # === STEP 1: PREFILL — Single forward pass with the full prompt ===
         print("  Running prefill...")
@@ -157,12 +147,12 @@ def main():
         prefill_data = {}
         prefill_window_scores = {}
         
-        for layer_idx in TRACKED_LAYERS:
+        for layer_idx in config.TRACKED_LAYERS:
             layer_attn = prefill_attentions[layer_idx] # [1, 32, prefill_len, prefill_len]
             current_seq_len = prefill_len
             
             # Cumulative: Match sticky exactly (Mean across Q-heads first)
-            layer_attn_view = layer_attn[0, :, :current_seq_len, :].view(NUM_KV_HEADS, GROUP_SIZE, current_seq_len, -1)
+            layer_attn_view = layer_attn[0, :, :current_seq_len, :].view(config.NUM_KV_HEADS, GROUP_SIZE, current_seq_len, -1)
             
             # 1. Compute mean across Q-heads -> [8, prefill_len, prefill_len]
             # Must enforce contiguous layout so bfloat16 summation vectorization utilizes equivalent SIMD buffers!
@@ -186,7 +176,7 @@ def main():
             # Sticky slices the actual_review_end BEFORE summing queries.
             scores_slice = scores_for_cache[:, :, SINK_TOKENS:actual_review_end] # [8, seq_len, num_windows * omega]
             obs_sum = scores_slice.sum(dim=1) # [8, num_windows * omega] 
-            win_scores = obs_sum.view(NUM_KV_HEADS, num_windows, OMEGA).sum(dim=2).float().cpu().numpy() # [8, num_windows]
+            win_scores = obs_sum.view(config.NUM_KV_HEADS, num_windows, OMEGA).sum(dim=2).float().cpu().numpy() # [8, num_windows]
             
             # Build output dicts from batched arrays (no per-window Python loop)
             layer_data = {}
@@ -228,12 +218,12 @@ def main():
             # --- Snapshot Ledger & Window Scores (BATCHED across all heads) ---
             step_data = {}
             step_ws_data = {}
-            for layer_idx in TRACKED_LAYERS:
+            for layer_idx in config.TRACKED_LAYERS:
                 layer_attn = gen_attentions[layer_idx] # [1, 32, 1, current_seq_len]
                 
                 # Vectorized: compute KV importance for ALL heads at once
                 q_importance = layer_attn[0, :, 0, :].float() # [32, current_seq_len]
-                kv_importance = q_importance.view(NUM_KV_HEADS, GROUP_SIZE, -1).mean(dim=1).cpu().numpy() # [8, current_seq_len]
+                kv_importance = q_importance.view(config.NUM_KV_HEADS, GROUP_SIZE, -1).mean(dim=1).cpu().numpy() # [8, current_seq_len]
                 
                 # Accumulate cumulative scores
                 token_ledger_scores[layer_idx][:, :current_seq_len] += kv_importance
@@ -247,10 +237,10 @@ def main():
                 if num_windows > 0:
                     evictable_end = SINK_TOKENS + num_windows * OMEGA
                     evictable = all_scores[:, SINK_TOKENS:evictable_end]  # [8, num_windows * OMEGA]
-                    win_scores = evictable.reshape(NUM_KV_HEADS, num_windows, OMEGA).sum(axis=2)  # [8, num_windows]
+                    win_scores = evictable.reshape(config.NUM_KV_HEADS, num_windows, OMEGA).sum(axis=2)  # [8, num_windows]
                     win_ids = np.arange(num_windows, dtype=np.float32)  # [num_windows]
                 else:
-                    win_scores = np.zeros((NUM_KV_HEADS, 0), dtype=np.float32)
+                    win_scores = np.zeros((config.NUM_KV_HEADS, 0), dtype=np.float32)
                     win_ids = np.array([], dtype=np.float32)
                 
                 # Build dicts from batched arrays (no per-window Python loop)
@@ -279,7 +269,7 @@ def main():
                 "truncation_char_index": truncation_char_index,
                 "teacher_forcing": True,
             },
-            "tracked_layers": TRACKED_LAYERS,
+            "tracked_layers": config.TRACKED_LAYERS,
             "tracked_heads": TRACKED_HEADS,
             "prefill_attention": prefill_data,
             "prefill_window_scores": prefill_window_scores,

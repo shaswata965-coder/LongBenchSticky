@@ -12,60 +12,66 @@ def sha256(text: str) -> str:
 def get_wikitext103_drift_blocks(
     tokenizer_name: str,
     num_samples: int = 5,
-    min_tokens: int = 2048,
+    min_tokens: int = 1024,
     seed: int = 42,
     split: str = "train",
 ):
 
-    print(f"Loading local WikiText-103 from Datasets/wiki.train.tokens...")
+    print(f"Loading local WikiText-103 from /kaggle/input/wiki-text-103-train/wiki.train.tokens...")
 
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, use_fast=True)
 
     ds = load_dataset(
         "text",
-        data_files={"train": "Datasets/wiki.train.tokens"},
+        data_files={"train": "/kaggle/input/wiki-text-103-train/wiki.train.tokens"},
         split=split,
-        streaming=True,
+        streaming=False,
     )
 
     rng = random.Random(seed)
 
-    samples = []
-    current_text = ""
-    current_tokens = 0
-    article_idx = 0
+    print("Assembling WikiText articles...")
+    all_articles = []
+    current_text = []
 
     for entry in ds:
         text = entry["text"].strip()
-
-        # WikiText article boundaries are marked by empty lines
         if text == "":
-            if current_tokens >= min_tokens:
-                samples.append({
-                    "text": current_text.strip(),
-                    "token_count": current_tokens,
-                    "sha256": sha256(current_text),
-                    "article_index": article_idx,
-                })
+            if current_text:
+                all_articles.append("\n".join(current_text).strip())
+                current_text = []
+        else:
+            current_text.append(text)
+            
+    if current_text:
+        all_articles.append("\n".join(current_text).strip())
+        
+    print(f"Found {len(all_articles)} total articles. Shuffling with seed {seed}...")
+    rng.shuffle(all_articles)
 
-            current_text = ""
-            current_tokens = 0
+    samples = []
+    article_idx = 0
+
+    print(f"Scanning shuffled articles for {num_samples} samples with >= {min_tokens} tokens...")
+    for article_text in all_articles:
+        tokens = tokenizer(
+            article_text,
+            add_special_tokens=False,
+        ).input_ids
+        
+        token_len = len(tokens)
+
+        if token_len >= min_tokens:
+            samples.append({
+                "text": article_text,
+                "token_count": token_len,
+                "sha256": sha256(article_text),
+                "article_index": article_idx,
+            })
             article_idx += 1
 
             if len(samples) >= num_samples:
                 break
-
-            continue
-
-        token_len = len(
-            tokenizer(
-                text,
-                add_special_tokens=False,
-            ).input_ids
-        )
-
-        current_text += text + "\n"
-        current_tokens += token_len
 
     print(f"Collected {len(samples)} reproducible drift blocks")
 

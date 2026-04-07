@@ -5,10 +5,12 @@ import numpy as np
 import sys
 from collections import defaultdict
 
+sys.path.append(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "Results"))
+from npz_io import load_results_npz
 from sticky_config import OMEGA, LOCAL_NUM_TOKENS
 
-VANILLA_PATH = "vanilla_baseline_results.json"
-STICKY_PATH = "sticky_baseline_results.json"
+VANILLA_PATH = "pure_vanilla_baseline_results.npz"
+STICKY_PATH = "sticky_baseline_results.npz"
 DETAILED_OUTPUT_PATH = "detailed_jaccard_results.json"
 K_TOP = 10
 
@@ -158,10 +160,8 @@ def main():
         print(f"Removing existing {DETAILED_OUTPUT_PATH} to prevent appending bugs...")
         os.remove(DETAILED_OUTPUT_PATH)
 
-    with open(VANILLA_PATH, "r") as f:
-        v_data = json.load(f)
-    with open(STICKY_PATH, "r") as f:
-        s_data = json.load(f)
+    v_data = load_results_npz(VANILLA_PATH, skip_attention=True)
+    s_data = load_results_npz(STICKY_PATH, skip_attention=True)
 
     prefill_jaccards = []
     prefill_lh = {}
@@ -184,6 +184,7 @@ def main():
     
     print(f"\nProcessing {num_samples} parallel samples...")
     for idx in range(num_samples):
+        print(f"  Sample {idx+1}/{num_samples} ...", flush=True)
         v = v_data[idx]
         s = s_data[idx]
         

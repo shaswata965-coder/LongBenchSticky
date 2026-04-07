@@ -5,18 +5,19 @@ import random
 import numpy as np
 import os
 import gc
-from pg19_loader import get_pg19_blocks
-from sticky_config import OMEGA, SINK_TOKENS
+import glob
+from sticky_config import OMEGA, SINK_TOKENS, dataset_tracker
+from npz_io import save_results_npz
 
 # --- Configuration ---
 MODEL_PATH = "/kaggle/input/llama-3.2/transformers/1b-instruct/1"
-NUM_SAMPLES = 5
-MAX_NEW_TOKENS = 128
+NUM_SAMPLES = 10
+MAX_NEW_TOKENS = 256
 SEED = 42
-OUTPUT_FILE = "pure_vanilla_baseline_results.json"
+OUTPUT_FILE = "pure_vanilla_baseline_results.npz"
 
 # We hardcode these so they are consistent across runs if we re-run this script
-TRACKED_LAYERS = [1, 3, 5, 8, 10, 11, 14, 15] # 8 random layers from 0-15
+TRACKED_LAYERS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15] # 8 random layers from 0-15
 
 # KV-head indices (0-7) — matches the granularity used by sticky eviction
 # Llama 3.2 1B: 32 Q-heads, 8 KV-heads, group_size=4
@@ -34,14 +35,14 @@ def setup_seed(seed):
 def main():
     setup_seed(SEED)
     
-    if os.path.exists(OUTPUT_FILE):
-        print(f"Removing existing {OUTPUT_FILE} to prevent appending bugs...")
-        os.remove(OUTPUT_FILE)
+    for f in glob.glob(OUTPUT_FILE.replace('.npz', '*.npz')):
+        print(f"Removing existing {f} to prevent appending bugs...")
+        os.remove(f)
         
-    STICKY_OUTPUT_FILE = "sticky_baseline_results.json"
-    if os.path.exists(STICKY_OUTPUT_FILE):
-        print(f"Removing existing {STICKY_OUTPUT_FILE} to force a synchronized regeneration run...")
-        os.remove(STICKY_OUTPUT_FILE)
+    STICKY_OUTPUT_FILE = "sticky_baseline_results.npz"
+    for f in glob.glob(STICKY_OUTPUT_FILE.replace('.npz', '*.npz')):
+        print(f"Removing existing {f} to force a synchronized regeneration run...")
+        os.remove(f)
     
     print(f"Loading Pure HuggingFace LLaMA (No sticky cache logic) from {MODEL_PATH}...")
     try:
@@ -89,34 +90,36 @@ def main():
         
     print(f"Model loaded. Tracking {len(TRACKED_LAYERS)} layers and {len(TRACKED_HEADS)} heads.")
 
-    # Load samples using PG-19 loader
-    samples = get_pg19_blocks(MODEL_PATH, num_samples=NUM_SAMPLES, min_tokens=2560)
+    # Load samples — min_tokens=2560 ensures enough remaining for 512-token generation
+    # after 0.5-0.7 truncation (worst case: 2560*0.3 = 768 tokens remaining)
+    # Note: Cannot go higher due to O(N²) attention memory with output_attentions=True
+    if dataset_tracker == 1:
+        from pg19_loader import get_pg19_blocks
+        samples = get_pg19_blocks(MODEL_PATH, num_samples=NUM_SAMPLES, min_tokens=2560)
+    else:
+        from wiki_text_loader import get_wikitext103_drift_blocks
+        samples = get_wikitext103_drift_blocks(MODEL_PATH, num_samples=NUM_SAMPLES, min_tokens=2560)
     
     results = []
 
     for idx, sample in enumerate(samples):
         text = sample["text"]
         
-        # We want the max tokens received (prefill) to be <= 512.
-        # We start with ~380 words to leave room for the prompt template.
-        words = text.split()
-        truncated_text = " ".join(words[:380])
+        # --- Unified truncation: 0.5-0.7 random cutoff with period-snap ---
+        truncate_pct = random.uniform(0.5, 0.7)
+        target_len = int(len(text) * truncate_pct)
         
-        while True:
-            messages = [{"role": "user", "content": f"Please write a comprehensive, detailed 200-word continuation expanding on the following text. Do not stop early:\n\n{truncated_text}"}]
-            prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-            inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
-            
-            if inputs.input_ids.shape[1] <= 512:
-                break
-            
-            # Back off by a few words until we fit under 512 tokens
-            words = words[:-5]
-            truncated_text = " ".join(words)
-            
-        remaining_text = text[len(truncated_text):].strip()
+        # Snap to nearest period for grammatical completeness
+        cut_idx = text.rfind('.', 0, target_len)
+        if cut_idx == -1: cut_idx = text.rfind(' ', 0, target_len)
+        if cut_idx == -1: cut_idx = target_len
         
-        print(f"Processing sample {idx + 1}/{len(samples)} (truncated={len(truncated_text)} chars, remaining={len(remaining_text)} chars)...")
+        # Keep the period so the block is fully grammatical
+        truncation_char_index = cut_idx + 1
+        truncated_text = text[:truncation_char_index].strip()
+        remaining_text = text[truncation_char_index:].strip()
+        
+        print(f"Processing sample {idx + 1}/{len(samples)} (original={len(text)}, truncated={len(truncated_text)} chars, remaining={len(remaining_text)} chars)...")
         
         gt_tokens = tokenizer(remaining_text, add_special_tokens=False, return_tensors="pt").input_ids[0]
         num_gt_tokens = min(MAX_NEW_TOKENS, len(gt_tokens))
@@ -128,6 +131,8 @@ def main():
         gt_continuation = gt_tokens[:num_gt_tokens]  # [num_gt_tokens]
         print(f"  Ground-truth continuation: {num_gt_tokens} tokens")
         
+        messages = [{"role": "user", "content": f"Please write a comprehensive, detailed 200-word continuation expanding on the following text. Do not stop early:\n\n{truncated_text}"}]
+        prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
         prefill_len = inputs.input_ids.shape[1]
         
@@ -183,17 +188,16 @@ def main():
             obs_sum = scores_slice.sum(dim=1) # [8, num_windows * omega] 
             win_scores = obs_sum.view(NUM_KV_HEADS, num_windows, OMEGA).sum(dim=2).float().cpu().numpy() # [8, num_windows]
             
+            # Build output dicts from batched arrays (no per-window Python loop)
             layer_data = {}
             layer_ws_data = {}
+            win_ids = np.arange(num_windows, dtype=np.float32)
             for kv_head_idx in TRACKED_HEADS:
                 layer_data[str(kv_head_idx)] = kv_importance[kv_head_idx].tolist()
-                
-                head_ws = []
-                for w in range(num_windows):
-                    w_score = win_scores[kv_head_idx, w]
-                    head_ws.append([float(w_score), float(w)])  # Format: [Score, ID] matching cumulative schema
-                
-                layer_ws_data[str(kv_head_idx)] = head_ws
+                if num_windows > 0:
+                    layer_ws_data[str(kv_head_idx)] = np.stack([win_scores[kv_head_idx], win_ids], axis=1).tolist()
+                else:
+                    layer_ws_data[str(kv_head_idx)] = []
             
             prefill_data[str(layer_idx)] = layer_data
             prefill_window_scores[str(layer_idx)] = layer_ws_data
@@ -221,48 +225,49 @@ def main():
             generated_token_ids.append(next_token_id)
             current_seq_len = prefill_len + step + 1
             
-            # --- Snapshot Ledger & Window Scores ---
+            # --- Snapshot Ledger & Window Scores (BATCHED across all heads) ---
             step_data = {}
             step_ws_data = {}
             for layer_idx in TRACKED_LAYERS:
                 layer_attn = gen_attentions[layer_idx] # [1, 32, 1, current_seq_len]
                 
-                # Squeeze the single query dim and sum over it (it's essentially a sum of 1)
+                # Vectorized: compute KV importance for ALL heads at once
                 q_importance = layer_attn[0, :, 0, :].float() # [32, current_seq_len]
                 kv_importance = q_importance.view(NUM_KV_HEADS, GROUP_SIZE, -1).mean(dim=1).cpu().numpy() # [8, current_seq_len]
                 
-                # Accumulate! The essence of Cumulative vanilla metric tracking
+                # Accumulate cumulative scores
                 token_ledger_scores[layer_idx][:, :current_seq_len] += kv_importance
                 
                 num_windows = max(0, (current_seq_len - SINK_TOKENS) // OMEGA)
                 
+                # Batch export: slice all heads at once -> [8, current_seq_len]
+                all_scores = token_ledger_scores[layer_idx][:, :current_seq_len]
+                
+                # Batch window scores: reshape evictable region into windows and sum
+                if num_windows > 0:
+                    evictable_end = SINK_TOKENS + num_windows * OMEGA
+                    evictable = all_scores[:, SINK_TOKENS:evictable_end]  # [8, num_windows * OMEGA]
+                    win_scores = evictable.reshape(NUM_KV_HEADS, num_windows, OMEGA).sum(axis=2)  # [8, num_windows]
+                    win_ids = np.arange(num_windows, dtype=np.float32)  # [num_windows]
+                else:
+                    win_scores = np.zeros((NUM_KV_HEADS, 0), dtype=np.float32)
+                    win_ids = np.array([], dtype=np.float32)
+                
+                # Build dicts from batched arrays (no per-window Python loop)
                 layer_step_data = {}
                 layer_ws_data_inner = {}
                 for head_idx in TRACKED_HEADS:
-                    kv_head_idx = head_idx
-                    
-                    # For generation step data, we just export the full tracked cumulative token scores up to current_seq_len
-                    full_row = token_ledger_scores[layer_idx][kv_head_idx, :current_seq_len]
-                    layer_step_data[str(head_idx)] = full_row.tolist()
-                    
-                    head_ws = []
-                    for w in range(num_windows):
-                        w_start = SINK_TOKENS + w * OMEGA
-                        w_end = w_start + OMEGA
-                        w_score = np.sum(token_ledger_scores[layer_idx][kv_head_idx, w_start:w_end])
-                        head_ws.append([float(w_score), float(w)])  # Format: [Score, ID] matching cumulative schema
-                    
-                    layer_ws_data_inner[str(head_idx)] = head_ws
+                    layer_step_data[str(head_idx)] = all_scores[head_idx].tolist()
+                    if num_windows > 0:
+                        layer_ws_data_inner[str(head_idx)] = np.stack([win_scores[head_idx], win_ids], axis=1).tolist()
+                    else:
+                        layer_ws_data_inner[str(head_idx)] = []
                 
                 step_data[str(layer_idx)] = layer_step_data
                 step_ws_data[str(layer_idx)] = layer_ws_data_inner
                 
             generation_data.append(step_data)
             generation_window_scores.append(step_ws_data)
-
-        # Decode the full sequence for reference
-        full_sequence = torch.cat([inputs.input_ids[0], torch.tensor(generated_token_ids, device=model.device)])
-        decoded_output = tokenizer.decode(full_sequence, skip_special_tokens=True)
 
         results.append({
             "metadata": {
@@ -271,7 +276,7 @@ def main():
                 "token_count_input": prefill_len,
                 "generated_token_count": len(generation_data),
                 "generated_token_ids": generated_token_ids,
-                "truncated_text": truncated_text,
+                "truncation_char_index": truncation_char_index,
                 "teacher_forcing": True,
             },
             "tracked_layers": TRACKED_LAYERS,
@@ -280,7 +285,6 @@ def main():
             "prefill_window_scores": prefill_window_scores,
             "generation_attention": generation_data,
             "generation_window_scores": generation_window_scores,
-            "full_text": decoded_output
         })
         
         # Free GPU memory
@@ -288,9 +292,8 @@ def main():
         gc.collect()
         torch.cuda.empty_cache()
 
-    # Save results
-    with open(OUTPUT_FILE, "w") as f:
-        json.dump(results, f, indent=2)
+    # Save results as compressed NPZ
+    save_results_npz(results, OUTPUT_FILE)
         
     print(f"Saved pure vanilla baseline results to {OUTPUT_FILE}")
 

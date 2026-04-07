@@ -8,9 +8,10 @@ import random
 import numpy as np
 import os
 import gc
+import glob
 from tqdm import tqdm
-from pg19_loader import get_pg19_blocks, sha256
-from sticky_config import OMEGA, SINK_TOKENS
+from sticky_config import OMEGA, SINK_TOKENS, dataset_tracker
+from npz_io import save_results_npz
 
 
 # --- Configuration ---
@@ -18,7 +19,7 @@ MODEL_PATH = "/kaggle/input/llama-3.2/transformers/1b-instruct/1"
 NUM_SAMPLES = 5
 MAX_NEW_TOKENS = 1024
 SEED = 42
-OUTPUT_FILE = "vanilla_baseline_results.json"
+OUTPUT_FILE = "vanilla_baseline_results.npz"
 
 # We hardcode these so they are consistent across runs if we re-run this script
 TRACKED_LAYERS = [1, 3, 5, 8, 10, 11, 14, 15] # 8 random layers from 0-15
@@ -39,9 +40,9 @@ def setup_seed(seed):
 def main():
     setup_seed(SEED)
     
-    if os.path.exists(OUTPUT_FILE):
-        print(f"Removing existing {OUTPUT_FILE} to prevent appending bugs...")
-        os.remove(OUTPUT_FILE)
+    for f in glob.glob(OUTPUT_FILE.replace('.npz', '*.npz')):
+        print(f"Removing existing {f} to prevent appending bugs...")
+        os.remove(f)
     
     print(f"Loading STICKYLlama (eviction DISABLED) from {MODEL_PATH}...")
     try:
@@ -73,8 +74,13 @@ def main():
         
     print(f"Model loaded (r_ratio=100, no eviction). Tracking {len(TRACKED_LAYERS)} layers and {len(TRACKED_HEADS)} heads.")
 
-    # Load samples using the local PG-19 loader
-    samples = get_pg19_blocks(MODEL_PATH, num_samples=NUM_SAMPLES, min_tokens=4096)
+    # Load samples using the local PG-19 or WikiText loader
+    if dataset_tracker == 1:
+        from pg19_loader import get_pg19_blocks
+        samples = get_pg19_blocks(MODEL_PATH, num_samples=NUM_SAMPLES, min_tokens=4096)
+    else:
+        from wiki_text_loader import get_wikitext103_drift_blocks
+        samples = get_wikitext103_drift_blocks(MODEL_PATH, num_samples=NUM_SAMPLES, min_tokens=4096)
     
     results = []
 
@@ -91,7 +97,8 @@ def main():
         if cut_idx == -1: cut_idx = target_len
         
         # Keep the period so the block is fully grammatical
-        truncated_text = text[:cut_idx + 1].strip()
+        truncation_char_index = cut_idx + 1
+        truncated_text = text[:truncation_char_index].strip()
         remaining_text = text[cut_idx + 1:].strip()
         
         print(f"Processing sample {idx + 1}/{len(samples)} (original={len(text)}, truncated={len(truncated_text)} chars, remaining={len(remaining_text)} chars)...")
@@ -158,14 +165,13 @@ def main():
             q_importance = layer_attn[0, :, :current_seq_len, :].sum(dim=1).float()
             kv_importance = q_importance.view(NUM_KV_HEADS, GROUP_SIZE, -1).mean(dim=1).cpu().numpy()
             
+            # Build output dicts — window scores are already batched in ws[head]
             layer_data = {}
             layer_ws_data = {}
             for kv_head_idx in TRACKED_HEADS:
                 layer_data[str(kv_head_idx)] = kv_importance[kv_head_idx].tolist()
-                
                 head_ws = ws[kv_head_idx]
-                valid_mask = ~np.isnan(head_ws[:, 1])
-                valid_ws = head_ws[valid_mask]
+                valid_ws = head_ws[~np.isnan(head_ws[:, 1])]  # filter in one line
                 layer_ws_data[str(kv_head_idx)] = valid_ws[:, :2].tolist()
             
             prefill_data[str(layer_idx)] = layer_data
@@ -195,7 +201,7 @@ def main():
             
             generated_token_ids.append(next_token_id)
             
-            # --- Snapshot Ledger & Window Scores (same as LedgerSnapshotProcessor) ---
+            # --- Snapshot Ledger & Window Scores (BATCHED) ---
             step_data = {}
             step_ws_data = {}
             for layer_idx in TRACKED_LAYERS:
@@ -204,24 +210,23 @@ def main():
                 ws = layer_module.self_attn.kv_cache.window_scores.detach().cpu().numpy()
                 total_tokens = int(layer_module.self_attn.kv_cache.global_token_counter.item())
                 
+                # Batch: compute live mask once, extract all heads' scores at once
+                live_mask = (ledger[:total_tokens, 1] >= 0)
+                live_indices = torch.where(live_mask)[0].cpu().numpy()
+                
+                # Batch extract scores for ALL heads: columns [3, 3+1, ..., 3+7]
+                all_full_rows = np.zeros((NUM_KV_HEADS, total_tokens), dtype=np.float32)
+                if len(live_indices) > 0:
+                    score_cols = [3 + h for h in TRACKED_HEADS]
+                    all_live_scores = ledger[live_indices][:, score_cols].cpu().numpy()  # [num_live, 8]
+                    all_full_rows[:, live_indices] = all_live_scores.T  # [8, total_tokens]
+                
                 layer_step_data = {}
                 layer_ws_data_inner = {}
                 for head_idx in TRACKED_HEADS:
-                    kv_head_idx = head_idx
-                    
-                    full_row = np.zeros(total_tokens, dtype=np.float32)
-                    live_mask = (ledger[:total_tokens, 1] >= 0)
-                    live_indices = torch.where(live_mask)[0].cpu().numpy()
-                    
-                    if len(live_indices) > 0:
-                        live_scores = ledger[live_indices, 3 + kv_head_idx].cpu().numpy()
-                        full_row[live_indices] = live_scores
-                    
-                    layer_step_data[str(head_idx)] = full_row.tolist()
-                    
-                    head_ws = ws[kv_head_idx]
-                    valid_mask = ~np.isnan(head_ws[:, 1])
-                    valid_ws = head_ws[valid_mask]
+                    layer_step_data[str(head_idx)] = all_full_rows[head_idx].tolist()
+                    head_ws = ws[head_idx]
+                    valid_ws = head_ws[~np.isnan(head_ws[:, 1])]
                     layer_ws_data_inner[str(head_idx)] = valid_ws[:, :2].tolist()
                 
                 step_data[str(layer_idx)] = layer_step_data
@@ -239,19 +244,21 @@ def main():
                 per_head = layer_attn[0, :, 0, :].float()  # [32, seq_len]
                 per_kv_head = per_head.view(NUM_KV_HEADS, GROUP_SIZE, -1).mean(dim=1).cpu().numpy()
                 
+                # Batch fresh attention: compute window scores for ALL heads at once
+                evictable_all = per_kv_head[:, SINK_TOKENS:]  # [8, evictable_len]
+                num_complete_windows = evictable_all.shape[1] // OMEGA
+                
+                if num_complete_windows > 0:
+                    windowed = evictable_all[:, :num_complete_windows * OMEGA].reshape(NUM_KV_HEADS, num_complete_windows, OMEGA)
+                    win_mags_all = windowed.sum(axis=2)  # [8, num_complete_windows]
+                    win_ids = np.arange(num_complete_windows, dtype=np.float32)
+                
                 layer_attn_fresh = {}
                 layer_ws_fresh = {}
                 for kv_head_idx in TRACKED_HEADS:
-                    head_attn = per_kv_head[kv_head_idx]  # [seq_len]
-                    layer_attn_fresh[str(kv_head_idx)] = head_attn.tolist()
-                    
-                    # Per-window fresh magnitude for Jaccard
-                    evictable = head_attn[SINK_TOKENS:]
-                    num_complete_windows = len(evictable) // OMEGA
+                    layer_attn_fresh[str(kv_head_idx)] = per_kv_head[kv_head_idx].tolist()
                     if num_complete_windows > 0:
-                        windowed = evictable[:num_complete_windows * OMEGA].reshape(num_complete_windows, OMEGA)
-                        win_mags = windowed.sum(axis=1)
-                        layer_ws_fresh[str(kv_head_idx)] = [[float(win_mags[j]), float(j)] for j in range(num_complete_windows)]
+                        layer_ws_fresh[str(kv_head_idx)] = np.stack([win_mags_all[kv_head_idx], win_ids], axis=1).tolist()
                     else:
                         layer_ws_fresh[str(kv_head_idx)] = []
                 
@@ -261,10 +268,6 @@ def main():
             generation_attention_fresh.append(step_attn_fresh)
             generation_window_scores_fresh.append(step_ws_fresh)
 
-        # Decode the full sequence for reference
-        full_sequence = torch.cat([inputs.input_ids[0], torch.tensor(generated_token_ids, device=model.device)])
-        decoded_output = tokenizer.decode(full_sequence, skip_special_tokens=True)
-
         results.append({
             "metadata": {
                 "sha256": sample["sha256"],
@@ -272,7 +275,7 @@ def main():
                 "token_count_input": prefill_len,
                 "generated_token_count": len(generation_data),
                 "generated_token_ids": generated_token_ids,
-                "truncated_text": truncated_text,
+                "truncation_char_index": truncation_char_index,
                 "teacher_forcing": True,
             },
             "tracked_layers": TRACKED_LAYERS,
@@ -283,7 +286,6 @@ def main():
             "generation_window_scores": generation_window_scores,
             "generation_attention_fresh": generation_attention_fresh,
             "generation_window_scores_fresh": generation_window_scores_fresh,
-            "full_text": decoded_output
         })
         
         # Free GPU memory
@@ -291,9 +293,8 @@ def main():
         gc.collect()
         torch.cuda.empty_cache()
 
-    # Save results
-    with open(OUTPUT_FILE, "w") as f:
-        json.dump(results, f, indent=2)
+    # Save results as compressed NPZ
+    save_results_npz(results, OUTPUT_FILE)
         
     print(f"Saved vanilla baseline results to {OUTPUT_FILE}")
 

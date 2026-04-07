@@ -6,6 +6,9 @@ from scipy.spatial.distance import cosine
 from scipy.stats import entropy
 import argparse
 
+sys.path.append(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "Results"))
+from npz_io import load_results_npz
+
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from sticky_config import SINK_TOKENS as _SINK, LOCAL_NUM_TOKENS as _LOCAL
 
@@ -180,8 +183,8 @@ def calculate_global_lir(vanilla_attn, sticky_attn):
 
 def main():
     parser = argparse.ArgumentParser(description="Calculate Layer-wise Information Retention (LIR)")
-    parser.add_argument("--vanilla", type=str, default="vanilla_baseline_results.json")
-    parser.add_argument("--sticky", type=str, default="sticky_baseline_results.json")
+    parser.add_argument("--vanilla", type=str, default="pure_vanilla_baseline_results.npz")
+    parser.add_argument("--sticky", type=str, default="sticky_baseline_results.npz")
     parser.add_argument("--output", type=str, default="lir_comparison.json")
     
     # In Jupyter notebooks/Kaggle, system adds arguments like '-f' which break standard parse_args()
@@ -192,12 +195,10 @@ def main():
         os.remove(args.output)
 
     print(f"Loading Vanilla results from: {args.vanilla}")
-    with open(args.vanilla, 'r') as f:
-        vanilla_data = json.load(f)
+    vanilla_data = load_results_npz(args.vanilla)
 
     print(f"Loading Sticky results from: {args.sticky}")
-    with open(args.sticky, 'r') as f:
-        sticky_data = json.load(f)
+    sticky_data = load_results_npz(args.sticky)
 
     if len(vanilla_data) != len(sticky_data):
         print(f"Warning: Number of samples differ! Vanilla: {len(vanilla_data)}, Sticky: {len(sticky_data)}")
@@ -209,6 +210,10 @@ def main():
     # Metrics structured by Layer
     metrics_by_layer_gen = {}
     metrics_by_layer_prefill = {}
+    
+    # Per-head detail: {phase: {layer: {head: {metric: [values]}}}} 
+    head_detail_prefill = {}
+    head_detail_gen = {}
     
     total_samples = len(vanilla_data)
     
@@ -229,6 +234,8 @@ def main():
                 metrics_by_layer_prefill[layer_idx_str] = {
                     "amr": [], "cosine": [], "kl_inv": [], "sparsity": [], "missed_mass": [], "global_lir": []
                 }
+            if layer_idx_str not in head_detail_prefill:
+                head_detail_prefill[layer_idx_str] = {}
                 
             for head_idx_str, v_head_data in v_layer_data.items():
                 if head_idx_str not in s_layer_data: continue
@@ -268,10 +275,27 @@ def main():
                     metrics_by_layer_prefill[layer_idx_str]["sparsity"].append(sparsity)
                     metrics_by_layer_prefill[layer_idx_str]["missed_mass"].append(missed_mass)
                     metrics_by_layer_prefill[layer_idx_str]["global_lir"].append(glir)
+                    
+                    # Per-head tracking
+                    if head_idx_str not in head_detail_prefill[layer_idx_str]:
+                        head_detail_prefill[layer_idx_str][head_idx_str] = {
+                            "amr": [], "cosine": [], "kl_inv": [], "sparsity": [], "missed_mass": [], "global_lir": []
+                        }
+                    hd = head_detail_prefill[layer_idx_str][head_idx_str]
+                    hd["amr"].append(amr)
+                    hd["cosine"].append(cos_sim)
+                    hd["kl_inv"].append(kl_inv)
+                    hd["sparsity"].append(sparsity)
+                    hd["missed_mass"].append(missed_mass)
+                    hd["global_lir"].append(glir)
 
         # --- GENERATION ---
-        v_gen = v_sample.get("generation_attention_fresh", v_sample.get("generation_attention", []))
-        s_gen = s_sample.get("generation_attention_fresh", s_sample.get("generation_attention", []))
+        if "generation_attention_fresh" in v_sample and "generation_attention_fresh" in s_sample:
+            v_gen = v_sample["generation_attention_fresh"]
+            s_gen = s_sample["generation_attention_fresh"]
+        else:
+            v_gen = v_sample.get("generation_attention", [])
+            s_gen = s_sample.get("generation_attention", [])
         
         # Ensure we only compare matching generation steps
         num_steps = min(len(v_gen), len(s_gen))
@@ -292,14 +316,22 @@ def main():
                     metrics_by_layer_gen[layer_idx_str] = {
                         "amr": [], "cosine": [], "kl_inv": [], "sparsity": [], "missed_mass": [], "global_lir": []
                     }
+                if layer_idx_str not in head_detail_gen:
+                    head_detail_gen[layer_idx_str] = {}
                 
                 # Iterate through heads in this layer
                 for head_idx_str in v_layer.keys():
                     if head_idx_str not in s_layer:
                         continue
                         
-                    v_head = np.array(v_layer[head_idx_str])
-                    s_head = np.array(s_layer[head_idx_str])
+                    try:
+                        v_head = np.array(v_layer[head_idx_str], dtype=float).flatten()
+                        s_head = np.array(s_layer[head_idx_str], dtype=float).flatten()
+                    except (ValueError, TypeError):
+                        continue
+                    
+                    v_head = np.nan_to_num(v_head)
+                    s_head = np.nan_to_num(s_head)
                     
                     # Ensure same length (due to generation step growing)
                     min_len = min(len(v_head), len(s_head))
@@ -331,6 +363,19 @@ def main():
                     metrics_by_layer_gen[layer_idx_str]["sparsity"].append(sparsity)
                     metrics_by_layer_gen[layer_idx_str]["missed_mass"].append(missed_mass)
                     metrics_by_layer_gen[layer_idx_str]["global_lir"].append(glir)
+                    
+                    # Per-head tracking
+                    if head_idx_str not in head_detail_gen[layer_idx_str]:
+                        head_detail_gen[layer_idx_str][head_idx_str] = {
+                            "amr": [], "cosine": [], "kl_inv": [], "sparsity": [], "missed_mass": [], "global_lir": []
+                        }
+                    hd = head_detail_gen[layer_idx_str][head_idx_str]
+                    hd["amr"].append(amr)
+                    hd["cosine"].append(cos_sim)
+                    hd["kl_inv"].append(kl_inv)
+                    hd["sparsity"].append(sparsity)
+                    hd["missed_mass"].append(missed_mass)
+                    hd["global_lir"].append(glir)
 
 
     def print_and_aggregate_metrics(metrics_dict, stage_name):
@@ -376,10 +421,40 @@ def main():
     print("\nNote: 'Cache Sparsity' shows what % of tokens were evicted from the cache.")
     print("Note: All LIR metrics are bounded (0 to 1), where 1.0 (100%) is perfect retention.")
     
-    # Write to file
+    # Write aggregate to file (existing behaviour)
     with open(args.output, 'w') as f:
         json.dump(summary_results, f, indent=4)
-    print(f"\nSaved detailed summary to {args.output}")
+    print(f"\nSaved aggregate summary to {args.output}")
+    
+    # Build and write per-head detailed JSON
+    def _aggregate_head_detail(hd_dict):
+        """Convert {layer: {head: {metric: [values]}}} → {layer: {head: {metric_mean: float}}}."""
+        result = {}
+        for layer_str in sorted(hd_dict.keys(), key=int):
+            result[layer_str] = {}
+            for head_str in sorted(hd_dict[layer_str].keys(), key=int):
+                h = hd_dict[layer_str][head_str]
+                result[layer_str][head_str] = {
+                    "amr_mean": float(np.mean(h["amr"])) if h["amr"] else 0.0,
+                    "missed_mass_mean": float(np.mean(h["missed_mass"])) if h["missed_mass"] else 0.0,
+                    "cosine_mean": float(np.mean(h["cosine"])) if h["cosine"] else 0.0,
+                    "kl_inv_mean": float(np.mean(h["kl_inv"])) if h["kl_inv"] else 0.0,
+                    "global_lir_mean": float(np.mean(h["global_lir"])) if h["global_lir"] else 0.0,
+                    "sparsity_mean": float(np.mean(h["sparsity"])) if h["sparsity"] else 0.0,
+                    "data_points": len(h["amr"])
+                }
+        return result
+    
+    detailed_results = {}
+    if head_detail_prefill:
+        detailed_results["prefill"] = _aggregate_head_detail(head_detail_prefill)
+    if head_detail_gen:
+        detailed_results["generation"] = _aggregate_head_detail(head_detail_gen)
+    
+    detailed_output = args.output.replace(".json", "_detailed.json")
+    with open(detailed_output, 'w') as f:
+        json.dump(detailed_results, f, indent=4)
+    print(f"Saved per-head detailed summary to {detailed_output}")
 
 if __name__ == "__main__":
     main()

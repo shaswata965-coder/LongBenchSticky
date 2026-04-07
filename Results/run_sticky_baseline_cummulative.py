@@ -7,13 +7,15 @@ import os
 from tqdm import tqdm
 import numpy as np
 import random
-from sticky_config import OMEGA, SINK_TOKENS
+import glob
+from sticky_config import OMEGA, SINK_TOKENS, dataset_tracker
+from npz_io import save_results_npz, load_results_npz
 
 
 # --- Configuration ---
 MODEL_PATH = "/kaggle/input/llama-3.2/transformers/1b-instruct/1"
-VANILLA_RESULTS_PATH = "vanilla_baseline_results.json"
-OUTPUT_FILE = "sticky_baseline_results.json"
+VANILLA_RESULTS_PATH = "pure_vanilla_baseline_results.npz"
+OUTPUT_FILE = "sticky_baseline_results.npz"
 MAX_NEW_TOKENS = 1024
 
 def main():
@@ -22,12 +24,11 @@ def main():
         print(f"Error: {VANILLA_RESULTS_PATH} not found. Run vanilla baseline first.")
         return
 
-    if os.path.exists(OUTPUT_FILE):
-        print(f"Removing existing {OUTPUT_FILE} to prevent appending bugs...")
-        os.remove(OUTPUT_FILE)
+    for f in glob.glob(OUTPUT_FILE.replace('.npz', '*.npz')):
+        print(f"Removing existing {f} to prevent appending bugs...")
+        os.remove(f)
 
-    with open(VANILLA_RESULTS_PATH, "r") as f:
-        vanilla_data = json.load(f)
+    vanilla_data = load_results_npz(VANILLA_RESULTS_PATH, metadata_only=True)
 
     # 2. Initialize Sticky Model
     print(f"Loading StickyLlama from {MODEL_PATH}...")
@@ -75,17 +76,18 @@ def main():
 
     # RELOAD SAMPLES using the same method as vanilla baseline
     # This ensures inputs are identical.
-    from pg19_loader import get_pg19_blocks
-    # Important: Use same seed as vanilla baseline if loader uses randomness
-    # But get_wikitext103_drift_blocks seems deterministic for a given set?
-    # run_vanilla_baseline used SEED=42.
     import random
     random.seed(42)
     np.random.seed(42)
     torch.manual_seed(42)
     torch.cuda.manual_seed_all(42)
     
-    raw_samples = get_pg19_blocks(MODEL_PATH, num_samples=len(vanilla_data), min_tokens=2560)
+    if dataset_tracker == 1:
+        from pg19_loader import get_pg19_blocks
+        raw_samples = get_pg19_blocks(MODEL_PATH, num_samples=len(vanilla_data), min_tokens=1024)
+    else:
+        from wiki_text_loader import get_wikitext103_drift_blocks
+        raw_samples = get_wikitext103_drift_blocks(MODEL_PATH, num_samples=len(vanilla_data), min_tokens=1024)
     
     # Verify alignment
     if len(raw_samples) != len(vanilla_data):
@@ -97,12 +99,10 @@ def main():
             print(f"Mismatch at index {idx}! SHA256 inconsistent.")
             continue
             
-        if "truncated_text" in v_result["metadata"]:
-            prompt = v_result["metadata"]["truncated_text"]
-            print(f"Loaded truncated prompt from metadata (len {len(prompt)})")
-        else:
-            prompt = raw_sample["text"]
-            print(f"Warning: truncated_text not found in metadata, using raw sample (len {len(prompt)})")
+        # Reconstruct the exact truncated prompt from the character index
+        truncation_char_index = v_result["metadata"]["truncation_char_index"]
+        prompt = raw_sample["text"][:truncation_char_index].strip()
+        print(f"Reconstructed truncated prompt from char index {truncation_char_index} (len {len(prompt)})")
         
         # --- Get the SAME ground-truth continuation tokens as vanilla ---
         gt_token_ids = v_result["metadata"]["generated_token_ids"]
@@ -143,7 +143,7 @@ def main():
                 input_ids=inputs.input_ids,
                 attention_mask=inputs.attention_mask,
                 use_cache=True,
-                output_attentions=True
+                output_attentions=False  # KV cache captures attention internally; returned tuple is unused
             )
             past_kv = prefill_outputs.past_key_values
 
@@ -189,9 +189,10 @@ def main():
         print(f"  Running teacher-forcing generation ({num_gt_tokens} steps)...")
         generation_data = []
         generation_window_scores = []
-        generation_attention_fresh = []
-        generation_window_scores_fresh = []
         generated_token_ids = []
+        
+        import time as _time
+        _gen_t0 = _time.time()
         
         for step in range(num_gt_tokens):
             next_token_id = gt_token_ids[step]
@@ -208,105 +209,59 @@ def main():
             
             generated_token_ids.append(next_token_id)
             
+            # Cache attention outputs for fresh-attention extraction
+            gen_attentions = gen_output.attentions
+            
             # --- Snapshot Ledger & Window Scores ---
+            # Single bulk GPU→CPU transfer per layer.
             step_data = {}
             step_ws_data = {}
+            
             for layer_idx in tracked_layers:
                 layer_module = model.model.layers[layer_idx]
-                ledger = layer_module.self_attn.kv_cache.token_ledger
-                ws = layer_module.self_attn.kv_cache.window_scores.detach().cpu().numpy()
-                total_tokens = int(layer_module.self_attn.kv_cache.global_token_counter.item())
+                kv_cache = layer_module.self_attn.kv_cache
+                total_tokens = int(kv_cache.global_token_counter.item())
+                num_kv_heads_cache = kv_cache.num_heads
+                
+                # === OPTIMIZATION: Single bulk GPU→CPU transfer per layer ===
+                # (Previously: 8+ per-head GPU reads for ledger + 2 redundant ws reads)
+                ledger_np = kv_cache.token_ledger[:total_tokens].detach().cpu().numpy()
+                ws_np = kv_cache.window_scores.detach().cpu().numpy()
+                
+                # Pre-allocate output arrays for all heads
+                all_full_rows = np.zeros((num_kv_heads, total_tokens), dtype=np.float32)
                 
                 layer_step_data = {}
                 layer_ws_data_inner = {}
-                num_kv_heads_cache = layer_module.self_attn.kv_cache.num_heads
+                
                 for head_idx in tracked_heads:
-                    kv_head_idx = head_idx
+                    phys_col = 2 + head_idx
+                    score_col = 2 + num_kv_heads_cache + head_idx
                     
-                    full_row = np.zeros(total_tokens, dtype=np.float32)
-                    # Per-head physical ID column: 2 + head_idx
-                    phys_col = 2 + kv_head_idx
-                    live_mask = (ledger[:total_tokens, phys_col] >= 0)
-                    live_indices = torch.where(live_mask)[0].cpu().numpy()
-                    
+                    # --- Ledger snapshot: CPU-only numpy ops (no GPU sync) ---
+                    live_mask = ledger_np[:, phys_col] >= 0
+                    live_indices = np.where(live_mask)[0]
                     if len(live_indices) > 0:
-                        # Per-head score column: 2 + num_heads + head_idx
-                        score_col = 2 + num_kv_heads_cache + kv_head_idx
-                        live_scores = ledger[live_indices, score_col].cpu().numpy()
-                        full_row[live_indices] = live_scores
+                        all_full_rows[head_idx, live_indices] = ledger_np[live_indices, score_col]
                     
-                    layer_step_data[str(head_idx)] = full_row.tolist()
+                    layer_step_data[str(head_idx)] = all_full_rows[head_idx].copy()
                     
-                    head_ws = ws[kv_head_idx]
-                    valid_mask = ~np.isnan(head_ws[:, 1])
-                    valid_ws = head_ws[valid_mask]
-                    layer_ws_data_inner[str(head_idx)] = valid_ws[:, :2].tolist()
+                    # --- Window scores (read once, used for both ledger and fresh) ---
+                    head_ws = ws_np[head_idx]
+                    valid_ws_mask = ~np.isnan(head_ws[:, 1])
+                    valid_ws = head_ws[valid_ws_mask]
+                    layer_ws_data_inner[str(head_idx)] = valid_ws[:, :2].tolist() if len(valid_ws) > 0 else []
                 
                 step_data[str(layer_idx)] = layer_step_data
                 step_ws_data[str(layer_idx)] = layer_ws_data_inner
-                
+            
             generation_data.append(step_data)
             generation_window_scores.append(step_ws_data)
             
-            # --- Fresh Per-Step Attention (non-cumulative, from this step only) ---
-            gen_attentions = gen_output.attentions
-            step_attn_fresh = {}
-            step_ws_fresh = {}
-            for layer_idx in tracked_layers:
-                layer_module = model.model.layers[layer_idx]
-                layer_attn = gen_attentions[layer_idx]  # [1, num_q_heads, 1, compressed_seq_len]
-                compressed_seq_len = layer_attn.shape[-1]
-                per_head = layer_attn[0, :, 0, :].float()  # [num_q_heads, compressed_seq_len]
-                per_kv_head = per_head.view(num_kv_heads, group_size, -1).mean(dim=1).cpu().numpy()
-                
-                ledger_fresh = layer_module.self_attn.kv_cache.token_ledger
-                ws_fresh = layer_module.self_attn.kv_cache.window_scores.detach().cpu().numpy()
-                total_tokens_fresh = int(layer_module.self_attn.kv_cache.global_token_counter.item())
-                
-                layer_attn_fresh = {}
-                layer_ws_fresh = {}
-                for head_idx in tracked_heads:
-                    kv_head_idx = head_idx
-                    head_attn = per_kv_head[kv_head_idx]  # [compressed_seq_len]
-                    
-                    # Per-token fresh attention: map compressed positions back to global
-                    full_row_fresh = np.zeros(total_tokens_fresh, dtype=np.float32)
-                    phys_col = 2 + kv_head_idx
-                    live_mask = (ledger_fresh[:total_tokens_fresh, phys_col] >= 0)
-                    live_indices = torch.where(live_mask)[0]
-                    if len(live_indices) > 0:
-                        phys_positions = ledger_fresh[live_indices, phys_col].long().cpu().numpy()
-                        valid = phys_positions < compressed_seq_len
-                        live_np = live_indices.cpu().numpy()
-                        full_row_fresh[live_np[valid]] = head_attn[phys_positions[valid]]
-                    
-                    layer_attn_fresh[str(head_idx)] = full_row_fresh.tolist()
-                    
-                    # Per-window fresh magnitude: use window_scores logical IDs
-                    head_ws_f = ws_fresh[kv_head_idx]
-                    valid_ws_mask = ~np.isnan(head_ws_f[:, 1])
-                    valid_ws_f = head_ws_f[valid_ws_mask]
-                    
-                    window_fresh = []
-                    for w_idx in range(len(valid_ws_f)):
-                        logical_id = int(valid_ws_f[w_idx, 1])
-                        phys_start = SINK_TOKENS + w_idx * OMEGA
-                        phys_end = phys_start + OMEGA
-                        if phys_end <= compressed_seq_len:
-                            win_mag = float(head_attn[phys_start:phys_end].sum())
-                            window_fresh.append([win_mag, float(logical_id)])
-                    
-                    layer_ws_fresh[str(head_idx)] = window_fresh
-                
-                step_attn_fresh[str(layer_idx)] = layer_attn_fresh
-                step_ws_fresh[str(layer_idx)] = layer_ws_fresh
-            
-            generation_attention_fresh.append(step_attn_fresh)
-            generation_window_scores_fresh.append(step_ws_fresh)
-
-        # Decode the full sequence for reference
-        full_sequence = torch.cat([inputs.input_ids[0], torch.tensor(generated_token_ids, device=model.device)])
-        decoded_output = tokenizer.decode(full_sequence, skip_special_tokens=True)
+            if (step + 1) % 50 == 0 or step == 0:
+                elapsed = _time.time() - _gen_t0
+                rate = (step + 1) / elapsed
+                print(f"    Step {step + 1}/{num_gt_tokens} ({rate:.1f} steps/s, elapsed {elapsed:.0f}s)")
 
         result_entry = {
             "metadata": {
@@ -315,7 +270,7 @@ def main():
                 "token_count_input": prefill_len,
                 "generated_token_count": len(generation_data),
                 "generated_token_ids": generated_token_ids,
-                "truncated_text": v_result["metadata"]["truncated_text"],
+                "truncation_char_index": truncation_char_index,
                 "teacher_forcing": True,
             },
             "tracked_layers": tracked_layers,
@@ -324,9 +279,6 @@ def main():
             "prefill_window_scores": prefill_window_scores,
             "generation_attention": generation_data,
             "generation_window_scores": generation_window_scores,
-            "generation_attention_fresh": generation_attention_fresh,
-            "generation_window_scores_fresh": generation_window_scores_fresh,
-            "full_text": decoded_output 
         }
         results.append(result_entry)
         
@@ -336,12 +288,10 @@ def main():
         del inputs
         del prefill_data
         del generation_data
-        del generation_attention_fresh, generation_window_scores_fresh
         gc.collect()
         torch.cuda.empty_cache()
 
-    with open(OUTPUT_FILE, "w") as f:
-        json.dump(results, f, indent=2)
+    save_results_npz(results, OUTPUT_FILE)
     
     print(f"Saved sticky baseline results to {OUTPUT_FILE}")
 

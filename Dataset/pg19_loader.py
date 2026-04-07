@@ -23,11 +23,8 @@ def get_pg19_blocks(
 
     ds = Dataset.from_file(arrow_path)
 
-    rng = random.Random(seed)
-    
-    # Optional: shuffle or sample if needed, but sequential is fine for reproducible testing
-    # indices = list(range(len(ds)))
-    # rng.shuffle(indices)
+    print(f"Shuffling dataset with seed {seed}...")
+    ds = ds.shuffle(seed=seed)
 
     samples = []
     article_idx = 0

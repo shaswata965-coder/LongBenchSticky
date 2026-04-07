@@ -4,7 +4,7 @@ from sticky_llama_attention_fast_attention import STICKYLlamaAttention
 import copy # ensure copy is imported if not already
 
 class STICKYLlamaForCausalLM(LlamaForCausalLM):
-    def __init__(self, config):
+    def __init__(self, config, **kwargs):
         # The parent LlamaForCausalLM initializes LlamaModel, which initializes LlamaAttention.
         # Standard LlamaAttention validates 'rope_scaling'. If it sees 'llama3' (unknown to older transformers), it crashes.
         # We must strip it for the parent init, then put the correct config back for OUR custom layers.

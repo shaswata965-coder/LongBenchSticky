@@ -49,7 +49,8 @@ def main():
         model_path, 
         config=config,
         torch_dtype=torch.bfloat16,
-        device_map="auto"
+        device_map="auto",
+        attn_implementation="flash_attention_2"
     )
     
     print(f"Model loaded on device: {model.device}")

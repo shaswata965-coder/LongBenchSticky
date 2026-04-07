@@ -3,6 +3,7 @@ from torch import nn
 import math
 from typing import Optional, Tuple
 import torch.nn.functional as F
+from flash_attn import flash_attn_func
 from sticky_kv_logic_fast_attention import (
     repeat_kv,
     _make_causal_mask,
@@ -192,20 +193,25 @@ class STICKYLlamaAttention(nn.Module):
         value_states_rep = repeat_kv(value_states, self.num_key_value_groups)
 
         if q_len > 1:
-            # --- FAST ATTENTION V2.0 FOR PREFILL (PROMPT) ---
+            # --- EXPLICIT FLASH ATTENTION V2.0 FOR PREFILL (PROMPT) ---
             
-            # --- 1. Generation Output via SDPA (OOM-safe, fast) ---
-            # By passing is_causal=True and NO mask, we guarantee PyTorch dispatches the optimized
-            # FlashAttention-2 kernel, bypassing standard Math backends that would OOM.
-            with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=True, enable_mem_efficient=True):
-                attn_output = F.scaled_dot_product_attention(
-                    query_states, 
-                    key_states_rep, 
-                    value_states_rep, 
-                    attn_mask=None,
-                    is_causal=True,
-                    dropout_p=0.0
-                )
+            # --- 1. Generation Output via flash_attn_func (Strict FA2 backend) ---
+            # Reformating tensors to (batch_size, seq_len, num_heads, head_dim)
+            q_fa = query_states.transpose(1, 2)
+            k_fa = key_states.transpose(1, 2)
+            v_fa = value_states.transpose(1, 2)
+            
+            # Using original un-repeated k_fa and v_fa takes advantage of FA2's native GQA support
+            attn_output = flash_attn_func(
+                q_fa, 
+                k_fa, 
+                v_fa, 
+                dropout_p=0.0, 
+                softmax_scale=1.0 / math.sqrt(self.head_dim),
+                causal=True
+            )
+            # Reformat back to (batch_size, num_heads, seq_len, head_dim) for downstream compatibility
+            attn_output = attn_output.transpose(1, 2)
             
             attn_weights_return = None
 

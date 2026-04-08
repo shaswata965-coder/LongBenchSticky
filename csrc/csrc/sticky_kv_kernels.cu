@@ -259,6 +259,9 @@ torch::Tensor window_score_reduce(
               "scores must be 2D [num_heads, num_tokens]");
   TORCH_CHECK(num_windows >= 0, "num_windows must be non-negative");
   TORCH_CHECK(omega > 0, "omega must be positive");
+  TORCH_CHECK(num_windows * omega <= scores.size(1),
+              "num_windows * omega (", num_windows * omega,
+              ") exceeds num_tokens (", scores.size(1), ")");
 
   const int num_heads = scores.size(0);
   const int num_tokens = scores.size(1);

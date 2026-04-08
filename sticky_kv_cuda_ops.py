@@ -131,20 +131,13 @@ def vote_accumulate(running_votes, new_scores, seq_len):
     if _HAS_CUDA_EXT and running_votes.is_cuda:
         # Ensure float32 and contiguity
         new_f32 = new_scores[:, :seq_len].to(torch.float32).contiguous()
-        # Pad to match seq_len if needed (new_scores might be a slice)
-        if new_f32.shape[1] < seq_len:
-            # This shouldn't happen in normal operation, but handle it safely
-            pad = torch.zeros(
-                (new_f32.shape[0], seq_len - new_f32.shape[1]),
-                dtype=torch.float32, device=new_f32.device
-            )
-            new_f32 = torch.cat([new_f32, pad], dim=1)
 
-        rv = running_votes.contiguous()
-        _sticky_kv_cuda.vote_accumulate(rv, new_f32, seq_len)
-        # If contiguous() made a copy, we need to copy back
-        if rv.data_ptr() != running_votes.data_ptr():
-            running_votes.copy_(rv)
+        # running_votes is a registered buffer allocated via torch.zeros(),
+        # so it is always contiguous. Assert rather than silently copy back.
+        assert running_votes.is_contiguous(), (
+            "running_votes must be contiguous for in-place CUDA kernel"
+        )
+        _sticky_kv_cuda.vote_accumulate(running_votes, new_f32, seq_len)
     else:
         _vote_accumulate_pytorch(running_votes, new_scores, seq_len)
 

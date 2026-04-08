@@ -2,6 +2,7 @@ import torch
 from torch import nn
 import math
 from transformers.models.llama.modeling_llama import rotate_half
+from sticky_kv_cuda_ops import per_head_kv_gather, window_score_reduce, vote_accumulate
 
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -189,8 +190,8 @@ class STICKYKVCache_LayerWise(nn.Module):
                 if num_windows > 0:
                     # FIX: Use full NxN prefill attention (all seq_len queries) instead of only last OMEGA
                     scores_slice = attn_score_cache[0, :, :seq_len, self.sink_tokens:actual_review_end]
-                    obs_sum = scores_slice.sum(dim=1)
-                    win_scores = obs_sum.view(self.num_heads, num_windows, self.omega).sum(dim=2).to(dtype=torch.float32)
+                    obs_sum = scores_slice.sum(dim=1)  # [num_heads, review_tokens]
+                    win_scores = window_score_reduce(obs_sum, num_windows, self.omega)
 
                     idx = torch.arange(num_windows, device=self.window_scores.device).unsqueeze(0).expand(self.num_heads, -1)
                     self.window_scores[self.head_indices.unsqueeze(1), idx, 0] = win_scores
@@ -208,12 +209,8 @@ class STICKYKVCache_LayerWise(nn.Module):
 
                 if total_prompt_windows > 0:
                     full_scores_slice = attn_score_cache[0, :, :seq_len, self.sink_tokens:actual_full_review]
-                    full_obs_sum = full_scores_slice.sum(dim=1)
-                    full_win_scores = (
-                        full_obs_sum.view(self.num_heads, total_prompt_windows, self.omega)
-                        .sum(dim=2)
-                        .to(dtype=torch.float32)
-                    )
+                    full_obs_sum = full_scores_slice.sum(dim=1)  # [num_heads, review_tokens]
+                    full_win_scores = window_score_reduce(full_obs_sum, total_prompt_windows, self.omega)
                     idx_full = torch.arange(
                         total_prompt_windows, device=self.local_history.device, dtype=torch.long
                     )
@@ -234,8 +231,9 @@ class STICKYKVCache_LayerWise(nn.Module):
         else:  # Generation Stage
             device = self.window_scores.device
             
-            # 1. ACCUMULATE VOTES
-            self.running_attention_votes[:, :seq_len] += attn_score_cache[0, :, 0, :seq_len]
+            # 1. ACCUMULATE VOTES (CUDA-accelerated or PyTorch fallback)
+            _new_scores = attn_score_cache[0, :, 0, :seq_len].float().contiguous()
+            vote_accumulate(self.running_attention_votes, _new_scores, seq_len)
             self.tokens_since_last_review += 1
             
             # 2. PERIODIC EVALUATION
@@ -249,8 +247,8 @@ class STICKYKVCache_LayerWise(nn.Module):
                 actual_review_end = self.sink_tokens + num_competing_windows * self.omega
                 
                 if num_competing_windows > 0:
-                    scores_slice = self.running_attention_votes[:, self.sink_tokens:actual_review_end]
-                    win_scores = scores_slice.view(self.num_heads, num_competing_windows, self.omega).sum(dim=2).to(dtype=torch.float32)
+                    scores_slice = self.running_attention_votes[:, self.sink_tokens:actual_review_end].contiguous()
+                    win_scores = window_score_reduce(scores_slice, num_competing_windows, self.omega)
                 
                 num_old_windows = num_competing_windows - 1
                 valid_old_windows = min(self.k_windows, num_old_windows)
@@ -344,12 +342,12 @@ class STICKYKVCache_LayerWise(nn.Module):
                 
                 all_indices = torch.cat([sinks, head_win_tokens, local_tokens], dim=1)
                 
-                # Gather physical KV cache
-                head_dim = past_key_values[0].shape[-1]
-                gather_idx = torch.clamp(all_indices, 0, seq_len - 1).unsqueeze(-1).expand(-1, -1, head_dim)
-                k_kept = torch.gather(past_key_values[0][0], 1, gather_idx).unsqueeze(0)
-                v_kept = torch.gather(past_key_values[1][0], 1, gather_idx).unsqueeze(0)
-                updated_kv = (k_kept, v_kept)
+                # Gather physical KV cache (CUDA-accelerated or PyTorch fallback)
+                clamped_indices = torch.clamp(all_indices, 0, seq_len - 1)
+                k_kept, v_kept = per_head_kv_gather(
+                    past_key_values[0][0], past_key_values[1][0], clamped_indices
+                )
+                updated_kv = (k_kept.unsqueeze(0), v_kept.unsqueeze(0))
 
                 # Reset accumulator
                 self.running_attention_votes.zero_()
@@ -495,14 +493,13 @@ class STICKYKVCache_LayerWise(nn.Module):
             
         final_indices = torch.stack(padded_indices, dim=0) # [heads, max_len]
         
-        gather_idx = (
-            final_indices
-            .unsqueeze(-1)
-            .expand(-1, -1, head_dim)
+        # Gather using CUDA-accelerated or PyTorch fallback
+        k_kept, v_kept = per_head_kv_gather(
+            past_key_values[0][0], past_key_values[1][0], final_indices
         )
         return (
-            torch.gather(past_key_values[0][0], 1, gather_idx).unsqueeze(0),
-            torch.gather(past_key_values[1][0], 1, gather_idx).unsqueeze(0),
+            k_kept.unsqueeze(0),
+            v_kept.unsqueeze(0),
         ), final_indices
     def _update_k_win_and_local_num(self, new_tokens, max_tokens):
         total_w = (

@@ -1,0 +1,132 @@
+================================================================================
+  CUDA Kernel Infusion — Build & Run Guide
+  Sticky KV Cache (Fast Attention)
+================================================================================
+
+PREREQUISITES
+-------------
+- Linux HPC node with NVIDIA Ampere+ GPU (A6000, A100, etc.)
+- CUDA toolkit installed (nvcc available)
+- Python >= 3.8
+- Llama 3.2 model weights downloaded locally
+
+
+STEP 1 — SSH INTO HPC / CUDA NODE
+----------------------------------
+Log into your HPC node that has a CUDA-capable GPU.
+
+
+STEP 2 — CLONE THE cuda-feature BRANCH
+---------------------------------------
+    git clone -b cuda-feature https://github.com/shaswata965-coder/LongBenchSticky.git
+    cd LongBenchSticky
+
+
+STEP 3 — SET UP PYTHON ENVIRONMENT
+-----------------------------------
+    python -m venv venv
+    source venv/bin/activate
+    pip install -r requirements.txt
+
+    # flash-attn is required by the fast attention module
+    pip install flash-attn --no-build-isolation
+
+
+STEP 4 — BUILD THE CUDA EXTENSION
+----------------------------------
+    cd csrc
+    pip install -e .
+
+Or equivalently:
+
+    cd csrc
+    make
+
+Verify it built successfully:
+
+    python -c "import sticky_kv_cuda; print('CUDA extension loaded successfully')"
+
+You should see: "CUDA extension loaded successfully"
+If it fails, you'll get an ImportError — check that nvcc is on your PATH
+and that torch.cuda.is_available() returns True.
+
+
+STEP 5 — (OPTIONAL) RUN KERNEL UNIT TESTS
+------------------------------------------
+    cd csrc
+    python test_kernels.py
+
+Expected output: "ALL TESTS PASSED"
+
+This validates all three kernels against PyTorch reference implementations:
+  1. per_head_kv_gather  — fused KV cache eviction gather
+  2. window_score_reduce — window-level attention score reduction
+  3. vote_accumulate     — generation-step vote accumulation
+
+
+STEP 6 — UPDATE MODEL PATH
+---------------------------
+Edit BOTH of these files to point to your local Llama 3.2 weights:
+
+  1. sticky_config.py  (line 3):
+     MODEL_PATH = "/path/to/your/llama-3.2/weights"
+
+  2. main.py  (line 9):
+     model_path = "/path/to/your/llama-3.2/weights"
+
+
+STEP 7 — RUN main.py
+---------------------
+    cd ..        # back to LongBenchSticky/ root
+    python main.py
+
+
+WHAT HAPPENS AT RUNTIME
+------------------------
+1. On import, you'll see one of:
+   "[sticky_kv_cuda_ops] CUDA extension loaded — using accelerated kernels"
+       -> CUDA kernels are active (Step 4 succeeded)
+
+   "[sticky_kv_cuda_ops] CUDA extension not found — using PyTorch fallback"
+       -> Fallback mode (Step 4 failed; functionally identical, just slower)
+
+2. main.py loads the model and replaces all attention layers with
+   STICKYLlamaAttention (which uses the CUDA-accelerated cache ops).
+
+3. During PREFILL:
+   - window_score_reduce: scores attention windows for eviction ranking
+   - per_head_kv_gather:  physically compacts the KV cache
+
+4. During GENERATION (every OMEGA=5 tokens):
+   - vote_accumulate:     accumulates per-step attention votes (in-place)
+   - window_score_reduce: evaluates accumulated window scores
+   - per_head_kv_gather:  evicts losing windows from the physical cache
+
+
+KEY CONFIGURATION (sticky_config.py)
+-------------------------------------
+  MODEL_PATH          = path to Llama 3.2 weights
+  R_RATIO             = 50     (total KV cache budget as % of sequence)
+  LOCAL_NUM_TOKENS    = 0      (fixed number of protected local tokens)
+  OMEGA               = 5      (window size for KV cache grouping)
+  SINK_TOKENS         = 0      (permanently protected sink tokens)
+  max_new_tokens      = 256    (generation length, inside GENERATION_CONFIG)
+
+
+TROUBLESHOOTING
+---------------
+Q: "nvcc not found" during build
+A: Load the CUDA module on your HPC:  module load cuda/11.8  (or similar)
+
+Q: "flash_attn not found" at runtime
+A: Install it:  pip install flash-attn --no-build-isolation
+
+Q: Build fails with "unsupported gpu architecture"
+A: Edit csrc/build.py lines 35-38 to match your GPU's compute capability.
+   sm_80 = A100, sm_86 = A6000, sm_90 = H100
+
+Q: Runtime falls back to PyTorch despite building successfully
+A: Make sure you run main.py from the project root (not from csrc/).
+   The extension installs as "sticky_kv_cuda" in your Python environment.
+
+================================================================================

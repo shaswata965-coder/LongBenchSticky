@@ -247,7 +247,7 @@ def main():
                 layer_step_data = {}
                 layer_ws_data_inner = {}
                 for head_idx in TRACKED_HEADS:
-                    layer_step_data[str(head_idx)] = all_scores[head_idx].tolist()
+                    layer_step_data[str(head_idx)] = token_ledger_scores[layer_idx][head_idx, :current_seq_len].tolist()
                     if num_windows > 0:
                         layer_ws_data_inner[str(head_idx)] = np.stack([win_scores[head_idx], win_ids], axis=1).tolist()
                     else:

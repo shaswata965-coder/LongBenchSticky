@@ -152,7 +152,7 @@ def main():
 
             # FIX ISSUE 4: Capture true entire prefill attention
             q_importance = layer_attn[0, :, :current_seq_len, :].sum(dim=1).float()
-            kv_importance = q_importance.view(NUM_KV_HEADS, GROUP_SIZE, -1).mean(dim=1).cpu().numpy()
+            kv_importance = q_importance.view(config.NUM_KV_HEADS, GROUP_SIZE, -1).mean(dim=1).cpu().numpy()
             
             # Build output dicts — window scores are already batched in ws[head]
             layer_data = {}
@@ -204,9 +204,9 @@ def main():
                 live_indices = torch.where(live_mask)[0].cpu().numpy()
                 
                 # Batch extract scores for ALL heads: columns [3, 3+1, ..., 3+7]
-                all_full_rows = np.zeros((NUM_KV_HEADS, total_tokens), dtype=np.float32)
+                all_full_rows = np.zeros((config.NUM_KV_HEADS, total_tokens), dtype=np.float32)
                 if len(live_indices) > 0:
-                    score_cols = [3 + h for h in TRACKED_HEADS]
+                    score_cols = [2 + config.NUM_KV_HEADS + h for h in TRACKED_HEADS]
                     all_live_scores = ledger[live_indices][:, score_cols].cpu().numpy()  # [num_live, 8]
                     all_full_rows[:, live_indices] = all_live_scores.T  # [8, total_tokens]
                 
@@ -231,14 +231,14 @@ def main():
             for layer_idx in TRACKED_LAYERS:
                 layer_attn = gen_attentions[layer_idx]  # [1, 32, 1, seq_len]
                 per_head = layer_attn[0, :, 0, :].float()  # [32, seq_len]
-                per_kv_head = per_head.view(NUM_KV_HEADS, GROUP_SIZE, -1).mean(dim=1).cpu().numpy()
+                per_kv_head = per_head.view(config.NUM_KV_HEADS, GROUP_SIZE, -1).mean(dim=1).cpu().numpy()
                 
                 # Batch fresh attention: compute window scores for ALL heads at once
                 evictable_all = per_kv_head[:, SINK_TOKENS:]  # [8, evictable_len]
                 num_complete_windows = evictable_all.shape[1] // OMEGA
                 
                 if num_complete_windows > 0:
-                    windowed = evictable_all[:, :num_complete_windows * OMEGA].reshape(NUM_KV_HEADS, num_complete_windows, OMEGA)
+                    windowed = evictable_all[:, :num_complete_windows * OMEGA].reshape(config.NUM_KV_HEADS, num_complete_windows, OMEGA)
                     win_mags_all = windowed.sum(axis=2)  # [8, num_complete_windows]
                     win_ids = np.arange(num_complete_windows, dtype=np.float32)
                 

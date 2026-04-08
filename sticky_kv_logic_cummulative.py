@@ -175,7 +175,7 @@ class STICKYKVCache_LayerWise(nn.Module):
                     if g_id < self.token_ledger.shape[0]:
                         self.token_ledger[g_id, 0] = float(g_id)
                         self.token_ledger[g_id, 1] = float(self.layer_idx)
-                        phys_idx = float((seq_len if past_key_values else 0) + i)
+                        phys_idx = float(seq_len - q_len + i)
                         self.token_ledger[g_id, 2:2+self.num_heads] = phys_idx
         else:
             self.global_token_counter += 1
@@ -186,6 +186,8 @@ class STICKYKVCache_LayerWise(nn.Module):
                     self.token_ledger[g_id, 1] = float(self.layer_idx)
                     phys_idx = float(seq_len - 1)
                     self.token_ledger[g_id, 2:2+self.num_heads] = phys_idx
+                    self.token_ledger[g_id, 2+self.num_heads:2+2*self.num_heads] = 0.0
+                    self.global_score_history[g_id, :] = 0.0
         
         if past_key_values is None:
             return past_key_values
@@ -280,20 +282,7 @@ class STICKYKVCache_LayerWise(nn.Module):
                 raw_matrix = full_scores_ref[0].detach().cpu()
                 num_q_heads_total = raw_matrix.shape[0]
                 group_size = num_q_heads_total // self.num_heads  
-                sparse_matrix = torch.zeros_like(raw_matrix)
-                
-                try:
-                    for kv_h in range(self.num_heads):
-                        kv_survivors = survivor_ids[kv_h].cpu().long()
-                        kv_survivors = torch.unique(torch.clamp(kv_survivors, 0, seq_len - 1))
-                        q_start = kv_h * group_size
-                        q_end = q_start + group_size
-                        sparse_matrix[q_start:q_end, :, kv_survivors] = raw_matrix[q_start:q_end, :, kv_survivors]
-                except IndexError as e:
-                    print(f"IndexError details ---> raw_matrix: {raw_matrix.shape}, sparse_matrix: {sparse_matrix.shape}")
-                    raise e
-                
-                self.prefill_attention_matrix = sparse_matrix
+                self.prefill_attention_matrix = raw_matrix
                 full_importance = attn_score_cache[0, :, :seq_len, :].sum(dim=1)
                 self.token_ledger[:, 2:2+self.num_heads] = -1.0  
                 
@@ -328,10 +317,10 @@ class STICKYKVCache_LayerWise(nn.Module):
                     valid_phys = phys_indices[valid_mask]
                     valid_g_ids = live_g_ids[valid_mask]
                     
-                    if len(valid_phys) > 0 and valid_phys.max() < seq_len:
+                    if len(valid_phys) > 0 and valid_phys.max() < attn_score_cache.size(-1):
                         head_scores = attn_score_cache[0, head_idx, 0, valid_phys]
-                        self.token_ledger[valid_g_ids, 2 + self.num_heads + head_idx] = head_scores.float()
-                        self.global_score_history[valid_g_ids, head_idx] = head_scores.float()
+                        self.token_ledger[valid_g_ids, 2 + self.num_heads + head_idx] += head_scores.float()
+                        self.global_score_history[valid_g_ids, head_idx] += head_scores.float()
             
             # 2. PERIODIC EVALUATION
             if self.tokens_since_last_review == self.omega:
@@ -447,13 +436,25 @@ class STICKYKVCache_LayerWise(nn.Module):
                 updated_kv = (k_kept, v_kept)
                 
                 if self.tracking_flag:
-                    # Universal ledger shift for generic tools - Shift correctly per head
+                    # Universal ledger shift for generic tools - Rebuild the exact physical mapping using the gathered indices array
                     for head_idx in range(self.num_heads):
                         phys_col = 2 + head_idx
-                        mask_evict = (self.token_ledger[:, phys_col] >= local_start - self.omega) & (self.token_ledger[:, phys_col] < local_start)
-                        mask_shift = self.token_ledger[:, phys_col] >= local_start
-                        self.token_ledger[mask_evict, phys_col] = -1.0
-                        self.token_ledger[mask_shift, phys_col] -= self.omega
+                        
+                        live_mask = self.token_ledger[:, 2] >= 0
+                        g_ids = torch.where(live_mask)[0]
+                        old_phys = self.token_ledger[g_ids, phys_col].long()
+                        
+                        kept_phys = all_indices[head_idx]
+                        
+                        mapping = torch.full((seq_len,), -1.0, device=device)
+                        mapping[kept_phys] = torch.arange(len(kept_phys), device=device, dtype=torch.float32)
+                        
+                        valid_old = (old_phys >= 0) & (old_phys < seq_len)
+                        valid_old_phys = old_phys[valid_old]
+                        valid_g_ids = g_ids[valid_old]
+                        
+                        new_phys = mapping[valid_old_phys]
+                        self.token_ledger[valid_g_ids, phys_col] = new_phys
 
                 # Reset accumulator
                 self.running_attention_votes.zero_()

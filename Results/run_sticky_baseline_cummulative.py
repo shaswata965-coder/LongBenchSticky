@@ -165,16 +165,31 @@ def main():
             
             current_seq_len = prefill_tensor.shape[-1]
             
-
             # FIX ISSUE 4: Capture true entire prefill attention, aligning bfloat16 fp-commutation perfectly with Vanilla!
             prefill_tensor_view = prefill_tensor[:, :current_seq_len, :].view(num_kv_heads, group_size, current_seq_len, -1)
             scores_for_cache = prefill_tensor_view.mean(dim=1).contiguous()
             kv_importance_val = scores_for_cache.sum(dim=1).float().cpu().numpy()
             
+            # --- APPLY PREFILL LEDGER MASK ---
+            kv_cache = layer_module.self_attn.kv_cache
+            total_tokens = int(kv_cache.global_token_counter.item())
+            ledger_np = kv_cache.token_ledger[:total_tokens].detach().cpu().numpy()
+            
             layer_data = {}
             layer_ws_data = {}
             for kv_head_idx in tracked_heads:
-                layer_data[str(kv_head_idx)] = kv_importance_val[kv_head_idx].tolist()
+                phys_col = 2 + kv_head_idx
+                head_importance = kv_importance_val[kv_head_idx].copy()
+                
+                # Zero out indices explicitly evicted by Sticky during prefill grouping
+                live_mask = ledger_np[:, phys_col] >= 0
+                dead_mask = ~live_mask
+                valid_dead = np.where(dead_mask)[0]
+                valid_dead = valid_dead[valid_dead < current_seq_len]
+                
+                head_importance[valid_dead] = 0.0
+                
+                layer_data[str(kv_head_idx)] = head_importance.tolist()
                 
                 head_ws = ws[kv_head_idx]
                 valid_mask = ~np.isnan(head_ws[:, 1])
@@ -183,6 +198,21 @@ def main():
             
             prefill_data[str(layer_idx)] = layer_data
             prefill_window_scores[str(layer_idx)] = layer_ws_data
+
+        # --- Initialize cumulative score accumulators seeded from prefill ---
+        # This ensures generation attention is exported as total score accumulated
+        # up until that point (prefill + all gen steps so far), just like Jaccard.
+        max_total_tokens = prefill_len + num_gt_tokens
+        cumulative_gen_scores = {}
+        for layer_idx in tracked_layers:
+            cumulative_gen_scores[layer_idx] = np.zeros((num_kv_heads, max_total_tokens), dtype=np.float32)
+            # Seed with prefill cumulative scores
+            pre_layer = prefill_data.get(str(layer_idx), {})
+            for kv_head_idx in tracked_heads:
+                pre_head = pre_layer.get(str(kv_head_idx), [])
+                if len(pre_head) > 0:
+                    pre_arr = np.array(pre_head, dtype=np.float32)
+                    cumulative_gen_scores[layer_idx][kv_head_idx, :len(pre_arr)] = pre_arr
 
         # === STEP 2: TEACHER-FORCING GENERATION — Feed GT tokens one at a time ===
         print(f"  Running teacher-forcing generation ({num_gt_tokens} steps)...")
@@ -197,6 +227,14 @@ def main():
             next_token_id = gt_token_ids[step]
             next_token_tensor = torch.tensor([[next_token_id]], dtype=torch.long, device=model.device)
             
+            # --- CAPTURE PRE-EVICTION LEDGER FOR ACCURATE ATTENTION ALIGNMENT ---
+            pre_step_ledgers = {}
+            for layer_idx in tracked_layers:
+                kv_cache = model.model.layers[layer_idx].self_attn.kv_cache
+                tot_toks = int(kv_cache.global_token_counter.item())
+                # Copy required to prevent tensor view permutation during compaction
+                pre_step_ledgers[layer_idx] = kv_cache.token_ledger[:tot_toks].detach().cpu().numpy().copy()
+            
             with torch.no_grad():
                 gen_output = model(
                     input_ids=next_token_tensor,
@@ -208,44 +246,60 @@ def main():
             
             generated_token_ids.append(next_token_id)
             
-            # Cache attention outputs for fresh-attention extraction
             gen_attentions = gen_output.attentions
             
-            # --- Snapshot Ledger & Window Scores ---
-            # Single bulk GPU→CPU transfer per layer.
             step_data = {}
             step_ws_data = {}
             
             for layer_idx in tracked_layers:
                 layer_module = model.model.layers[layer_idx]
                 kv_cache = layer_module.self_attn.kv_cache
+                
+                layer_attn = gen_attentions[layer_idx]
+                q_importance = layer_attn[0, :, 0, :].float()
+                # Group average
+                group_size = q_importance.shape[0] // model_config.num_key_value_heads
+                kv_importance = q_importance.view(model_config.num_key_value_heads, group_size, -1).mean(dim=1).cpu().numpy()
+                
                 total_tokens = int(kv_cache.global_token_counter.item())
                 num_kv_heads_cache = kv_cache.num_heads
                 
-                # === OPTIMIZATION: Single bulk GPU→CPU transfer per layer ===
-                # (Previously: 8+ per-head GPU reads for ledger + 2 redundant ws reads)
-                ledger_np = kv_cache.token_ledger[:total_tokens].detach().cpu().numpy()
                 ws_np = kv_cache.window_scores.detach().cpu().numpy()
+                pre_ledger_np = pre_step_ledgers[layer_idx]
                 
-                # Pre-allocate output arrays for all heads
-                all_full_rows = np.zeros((num_kv_heads, total_tokens), dtype=np.float32)
+                all_full_rows = np.zeros((num_kv_heads_cache, total_tokens), dtype=np.float32)
                 
                 layer_step_data = {}
                 layer_ws_data_inner = {}
                 
                 for head_idx in tracked_heads:
                     phys_col = 2 + head_idx
-                    score_col = 2 + num_kv_heads_cache + head_idx
                     
-                    # --- Ledger snapshot: CPU-only numpy ops (no GPU sync) ---
-                    live_mask = ledger_np[:, phys_col] >= 0
+                    # 1. Map all existing tokens natively using PRE-EVICTION coordinates
+                    live_mask = pre_ledger_np[:, phys_col] >= 0
                     live_indices = np.where(live_mask)[0]
                     if len(live_indices) > 0:
-                        all_full_rows[head_idx, live_indices] = ledger_np[live_indices, score_col]
+                        phys_indices = pre_ledger_np[live_indices, phys_col].astype(int)
+                        valid_bounds = phys_indices < kv_importance.shape[1]
+                        all_full_rows[head_idx, live_indices[valid_bounds]] = kv_importance[head_idx, phys_indices[valid_bounds]]
                     
-                    layer_step_data[str(head_idx)] = all_full_rows[head_idx].copy()
+                    # 2. Map the newly generated token identically to the trailing boundary
+                    new_global_id = pre_ledger_np.shape[0]
+                    new_phys_idx = kv_importance.shape[1] - 1
+                    if new_global_id < total_tokens and new_phys_idx >= 0:
+                        all_full_rows[head_idx, new_global_id] = kv_importance[head_idx, new_phys_idx]
                     
-                    # --- Window scores (read once, used for both ledger and fresh) ---
+                    # 3. Accumulate into cumulative scores and export cumulative
+                    cumulative_gen_scores[layer_idx][head_idx, :total_tokens] += all_full_rows[head_idx]
+                    # Zero out evicted positions in the cumulative snapshot
+                    evicted_mask = pre_ledger_np[:, phys_col] < 0
+                    evicted_indices = np.where(evicted_mask)[0]
+                    evicted_indices = evicted_indices[evicted_indices < total_tokens]
+                    cumulative_snapshot = cumulative_gen_scores[layer_idx][head_idx, :total_tokens].copy()
+                    cumulative_snapshot[evicted_indices] = 0.0
+                    layer_step_data[str(head_idx)] = cumulative_snapshot
+                    
+                    # Window scores read post-step cleanly
                     head_ws = ws_np[head_idx]
                     valid_ws_mask = ~np.isnan(head_ws[:, 1])
                     valid_ws = head_ws[valid_ws_mask]

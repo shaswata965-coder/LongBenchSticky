@@ -1,35 +1,29 @@
 import json
 import os
-import argparse
 import numpy as np
 import sys
 from collections import defaultdict
 
-sys.path.append(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "Results"))
 from npz_io import load_results_npz
-from sticky_config import OMEGA, LOCAL_NUM_TOKENS
+from sticky_config import OMEGA, LOCAL_NUM_TOKENS, SINK_TOKENS
 
 VANILLA_PATH = "pure_vanilla_baseline_results.npz"
 STICKY_PATH = "sticky_baseline_results.npz"
 DETAILED_OUTPUT_PATH = "detailed_jaccard_results.json"
 K_TOP = 10
 
-def calculate_jaccard(v_ws, s_ws, k, seq_len, prefill_seq_len, v_gen_tokens, s_gen_tokens, sink_tokens=5, local_tokens=LOCAL_NUM_TOKENS, omega=OMEGA, debug_info=None, gen_diag=None):
+def calculate_jaccard(v_ws, s_ws, k, seq_len, prefill_seq_len, v_gen_tokens, s_gen_tokens, omega=OMEGA, debug_info=None, gen_diag=None):
     """
     Option 2: Direct set comparison.
     - Sticky: ALL surviving window IDs are used directly (no re-ranking).
       These are already the RRF-selected survivors.
     - Vanilla: Ranked by score (column 0 = RRF score), top-K selected.
     """
-    # Sinks are always the first 5 tokens
-    # Local window boundary starts at seq_len - local_tokens
-    local_start_token = max(sink_tokens, seq_len - local_tokens)
-    
     # window_scores stores logical ID. ID 0 = Token 5. ID 1 = Token 6. (when omega=1)
-    # So a window ID maps to token position: ID * omega + sink_tokens
+    # So a window ID maps to token position: ID * omega + 5
     
-    valid_v_ws = [x for x in v_ws if (int(x[1]) * omega + sink_tokens) < local_start_token]
-    valid_s_ws = [x for x in s_ws if (int(x[1]) * omega + sink_tokens) < local_start_token]
+    valid_v_ws = v_ws
+    valid_s_ws = s_ws
     
     if len(valid_v_ws) == 0 or len(valid_s_ws) == 0:
         if gen_diag is not None:
@@ -61,7 +55,7 @@ def calculate_jaccard(v_ws, s_ws, k, seq_len, prefill_seq_len, v_gen_tokens, s_g
     union = len(union_set)
     
     for wid in v_top_k_ids.intersection(s_top_k_ids):
-        start_pos = wid * omega + sink_tokens
+        start_pos = wid * omega + SINK_TOKENS
         if start_pos >= prefill_seq_len:
             gen_idx = int(start_pos - prefill_seq_len)
             v_toks = v_gen_tokens[gen_idx : gen_idx + omega]

@@ -5,26 +5,17 @@ import sys
 from scipy.spatial.distance import cosine
 from scipy.stats import entropy
 import argparse
-
-sys.path.append(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "Results"))
 from npz_io import load_results_npz
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from sticky_config import SINK_TOKENS as _SINK, LOCAL_NUM_TOKENS as _LOCAL
 
-def calculate_attention_mass_retention(vanilla_attn, sticky_attn, sink_tokens=_SINK, local_tokens=_LOCAL):
+def calculate_attention_mass_retention(vanilla_attn, sticky_attn):
     """
-    Calculates Attention Mass Retention (AMR) on the "middle" tokens only.
+    Calculates Attention Mass Retention (AMR) on all tokens.
     What percentage of the vanilla attention sum is retained by the active tokens in sticky?
     """
     v = np.array(vanilla_attn)
     s = np.array(sticky_attn)
-    
-    seq_len = len(v)
-    if seq_len > sink_tokens:
-        end_idx = max(sink_tokens, seq_len - local_tokens)
-        v = v[sink_tokens:end_idx]
-        s = s[sink_tokens:end_idx]
     
     # Active tokens in sticky (where the ledger score > 0, assuming -1 or 0 for inactive)
     # Sticky code sets inactive tokens to 0 in full_row when it reconstructs the vector
@@ -40,18 +31,12 @@ def calculate_attention_mass_retention(vanilla_attn, sticky_attn, sink_tokens=_S
         return 0.0
     return retained_mass / total_mass
 
-def calculate_cosine_similarity(vanilla_attn, sticky_attn, sink_tokens=_SINK, local_tokens=_LOCAL):
+def calculate_cosine_similarity(vanilla_attn, sticky_attn):
     """
-    Calculates Cosine Similarity between the middle vanilla and sticky attention vectors.
+    Calculates Cosine Similarity between the vanilla and sticky attention vectors.
     """
     v = np.array(vanilla_attn)
     s = np.array(sticky_attn)
-    
-    seq_len = len(v)
-    if seq_len > sink_tokens:
-        end_idx = max(sink_tokens, seq_len - local_tokens)
-        v = v[sink_tokens:end_idx]
-        s = s[sink_tokens:end_idx]
         
     if np.sum(v) == 0 or np.sum(s) == 0 or len(v) == 0:
         return 0.0
@@ -59,20 +44,14 @@ def calculate_cosine_similarity(vanilla_attn, sticky_attn, sink_tokens=_SINK, lo
     # cosine() function from scipy returns distance, so 1 - dist = similarity
     return 1 - cosine(v, s)
 
-def calculate_kl_divergence(vanilla_attn, sticky_attn, sink_tokens=_SINK, local_tokens=_LOCAL):
+def calculate_kl_divergence(vanilla_attn, sticky_attn):
     """
-    Calculates KL Divergence: KL(Vanilla || Sticky) for middle tokens.
+    Calculates KL Divergence: KL(Vanilla || Sticky) for all tokens.
     Since Sticky has zeros (evicted tokens), we add epsilon to avoid log(0) or div/0.
     Returns inverted KL, scaled between 0 and 1, where 1 is identical.
     """
     v = np.array(vanilla_attn)
     s = np.array(sticky_attn)
-    
-    seq_len = len(v)
-    if seq_len > sink_tokens:
-        end_idx = max(sink_tokens, seq_len - local_tokens)
-        v = v[sink_tokens:end_idx]
-        s = s[sink_tokens:end_idx]
         
     if len(v) == 0:
         return 1.0 # Perfect similarity on an empty set
@@ -93,10 +72,10 @@ def calculate_kl_divergence(vanilla_attn, sticky_attn, sink_tokens=_SINK, local_
     # y = 1 / (1 + x) transforms [0, infinity) -> (1, 0]
     return 1 / (1 + kl_div)
 
-def calculate_missed_mass_drift(vanilla_attn, sticky_attn, sink_tokens=_SINK, local_tokens=_LOCAL):
+def calculate_missed_mass_drift(vanilla_attn, sticky_attn):
     """
-    Calculates Attention Drift via Missed Mass for middle tokens.
-    This looks at the middle tokens the Sticky cache explicitly dropped/evicted
+    Calculates Attention Drift via Missed Mass for all tokens.
+    This looks at the tokens the Sticky cache explicitly dropped/evicted
     (where Sticky attention == 0) and sums up the attention the Vanilla 
     model gave to those EXACT same tokens. 
     It measures what portion of the 'attention pie' slipped through the cracks.
@@ -112,12 +91,6 @@ def calculate_missed_mass_drift(vanilla_attn, sticky_attn, sink_tokens=_SINK, lo
     v = v[:min_len]
     s = s[:min_len]
         
-    seq_len = len(v)
-    if seq_len > sink_tokens:
-        end_idx = max(sink_tokens, seq_len - local_tokens)
-        v = v[sink_tokens:end_idx]
-        s = s[sink_tokens:end_idx]
-        
     # Identify tokens explicitly evicted by sticky (or missing entirely)
     evicted_mask = (s <= 0.0)
     
@@ -130,16 +103,11 @@ def calculate_missed_mass_drift(vanilla_attn, sticky_attn, sink_tokens=_SINK, lo
         
     return missed_mass / total_mass
 
-def calculate_sparsity(sticky_attn, sink_tokens=_SINK, local_tokens=_LOCAL):
+def calculate_sparsity(sticky_attn):
     """
-    Calculates sparsity: what percentage of middle tokens were evicted (set to 0)?
+    Calculates sparsity: what percentage of total tokens were evicted (set to 0)?
     """
     s = np.array(sticky_attn)
-    
-    seq_len = len(s)
-    if seq_len > sink_tokens:
-        end_idx = max(sink_tokens, seq_len - local_tokens)
-        s = s[sink_tokens:end_idx]
         
     if len(s) == 0:
         return 0.0
@@ -289,13 +257,8 @@ def main():
                     hd["missed_mass"].append(missed_mass)
                     hd["global_lir"].append(glir)
 
-        # --- GENERATION ---
-        if "generation_attention_fresh" in v_sample and "generation_attention_fresh" in s_sample:
-            v_gen = v_sample["generation_attention_fresh"]
-            s_gen = s_sample["generation_attention_fresh"]
-        else:
-            v_gen = v_sample.get("generation_attention", [])
-            s_gen = s_sample.get("generation_attention", [])
+        v_gen = v_sample.get("generation_attention", [])
+        s_gen = s_sample.get("generation_attention", [])
         
         # Ensure we only compare matching generation steps
         num_steps = min(len(v_gen), len(s_gen))

@@ -81,7 +81,7 @@ def extract_answer_span(prediction: str, references: List[str]) -> str:
     return prediction
 
 # UPDATED: Added 'task' argument
-def generate(prompt, model, tokenizer, device, refs=None, task=None, **kwargs):
+def generate(prompt, model, tokenizer, device, refs=None, task=None, max_tokens=None, **kwargs):
     messages = [{"role": "user", "content": prompt}]
     formatted_prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
@@ -107,11 +107,15 @@ def generate(prompt, model, tokenizer, device, refs=None, task=None, **kwargs):
         torch.cuda.reset_peak_memory_stats() # <--- CRITICAL: Reset stats here
         start_mem = torch.cuda.memory_allocated()
 
+    generation_kwargs = config.GENERATION_CONFIG.copy()
+    if max_tokens is not None:
+        generation_kwargs["max_new_tokens"] = max_tokens
+
     start = time.perf_counter()
     with torch.no_grad():
         out = model.generate(
             **inputs,
-            **config.GENERATION_CONFIG,
+            **generation_kwargs,
             pad_token_id=tokenizer.eos_token_id,
             **kwargs
         )
@@ -157,7 +161,7 @@ def generate(prompt, model, tokenizer, device, refs=None, task=None, **kwargs):
         "peak_mem": peak_mem
     }
 
-def evaluate_dataset(name, dataset, seed, model, tokenizer, device):
+def evaluate_dataset(name, dataset, seed, model, tokenizer, device, max_tokens=None):
     torch.manual_seed(seed)
     np.random.seed(seed)
 
@@ -178,7 +182,7 @@ def evaluate_dataset(name, dataset, seed, model, tokenizer, device):
             continue
 
         # Pass refs and task to generate for task-specific cleaning
-        gen = generate(prompt, model, tokenizer, device, refs=refs, task=name, use_cache=True)
+        gen = generate(prompt, model, tokenizer, device, refs=refs, task=name, max_tokens=max_tokens, use_cache=True)
         
         # ── Metric Routing (Official LongBench dataset2metric) ────
         if name in ROUGE_TASKS:

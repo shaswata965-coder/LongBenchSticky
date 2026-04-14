@@ -64,6 +64,10 @@ def main():
     
     for task_name, dataset in datasets.items():
         print(f"\nEvaluating dataset: {task_name}")
+        
+        # Fetch dataset specific max token limit
+        task_max_tokens = data_loader.max_new_tokens.get(task_name, 128)
+        
         for seed in config.SEEDS:
             # We don't need to manually clear the cache here because engine.py
             # has been updated with automatic scrubbing inside pre-generation cleanup.
@@ -73,7 +77,8 @@ def main():
                 seed=seed,
                 model=model,
                 tokenizer=tokenizer,
-                device="cuda"
+                device="cuda",
+                max_tokens=task_max_tokens
             )
             
             # Aggregate or store the result

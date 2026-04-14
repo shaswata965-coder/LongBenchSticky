@@ -5,7 +5,24 @@ import sys
 from collections import defaultdict
 
 from npz_io import load_results_npz
-from sticky_config import OMEGA, LOCAL_NUM_TOKENS, SINK_TOKENS
+from sticky_config import OMEGA, SINK_TOKENS
+
+try:
+    from sticky_config import LOCAL_NUM_TOKENS
+    use_fixed_local_tokens = True
+    P_RATIO = None
+except ImportError:
+    from sticky_config import P_RATIO
+    use_fixed_local_tokens = False
+    LOCAL_NUM_TOKENS = None
+
+def get_local_num(new_tokens, max_tokens=100, total_cache_ratio=20):
+    total_token_budget = (new_tokens + max_tokens) * total_cache_ratio // 100
+    if use_fixed_local_tokens:
+        target_local_tokens = LOCAL_NUM_TOKENS
+    else:
+        target_local_tokens = (total_token_budget * P_RATIO) // 100
+    return min(target_local_tokens, total_token_budget)
 
 VANILLA_PATH = "pure_vanilla_baseline_results.npz"
 STICKY_PATH = "sticky_baseline_results.npz"

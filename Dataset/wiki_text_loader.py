@@ -1,3 +1,4 @@
+%%writefile wiki_text_loader.py
 import hashlib
 import json
 import random

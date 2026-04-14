@@ -1,3 +1,4 @@
+%%writefile pg19_loader.py
 import hashlib
 import json
 import random

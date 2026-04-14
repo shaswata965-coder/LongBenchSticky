@@ -1,3 +1,4 @@
+%%writefile sticky_llama_attention.py
 import torch
 from torch import nn
 import math

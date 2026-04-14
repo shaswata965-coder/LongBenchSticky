@@ -1,3 +1,4 @@
+import re
 from collections import Counter
 from typing import Dict, List
 import difflib
@@ -10,7 +11,7 @@ rouge = rouge_scorer.RougeScorer(["rouge1", "rouge2", "rougeL"], use_stemmer=Tru
 def qa_metrics(pred: str, refs: List[str]) -> Dict[str, float]:
     """
     Standard QA metrics: Exact Match (EM) and F1 Score.
-    Used for: 2wikimqa, musique, narrativeqa, qasper
+    Used for: narrativeqa, qasper, multifieldqa_en, hotpotqa, 2wikimqa, musique, triviaqa
     """
     pred_tokens = utils.normalize(pred)
     best_f1 = 0.0
@@ -35,8 +36,8 @@ def qa_metrics(pred: str, refs: List[str]) -> Dict[str, float]:
 
 def rouge_metrics(pred: str, ref: str) -> Dict[str, float]:
     """
-    Summarization metrics.
-    Used for: qmsum
+    Summarization metrics: ROUGE-1, ROUGE-2, ROUGE-L.
+    Used for: gov_report, qmsum, multi_news, samsum
     """
     scores = rouge.score(ref, pred)
     return {k: v.fmeasure for k, v in scores.items()}
@@ -44,7 +45,7 @@ def rouge_metrics(pred: str, ref: str) -> Dict[str, float]:
 def code_sim_score(pred: str, ref: str) -> float:
     """
     Edit Similarity for code generation.
-    Used for: lcc
+    Used for: lcc, repobench-p
     Calculates the Levenshtein edit similarity normalized by the length of the longer string.
     """
     # Standard LongBench implementation uses strict character matching without tokenization
@@ -56,3 +57,68 @@ def code_sim_score(pred: str, ref: str) -> float:
         
     matcher = difflib.SequenceMatcher(None, pred, ref)
     return matcher.ratio()
+
+
+# ── Few-shot / Synthetic Metrics (Official THUDM Implementations) ────────
+
+def classification_score(prediction: str, ground_truth: str, all_classes: List[str]) -> float:
+    """
+    Classification accuracy for few-shot classification tasks.
+    Used for: trec
+
+    Checks which class labels appear in the prediction. If the ground truth
+    label is among them, scores 1/N where N = number of matched classes
+    (penalizes ambiguous predictions that match multiple classes).
+    """
+    em_match_list = []
+    for class_name in all_classes:
+        if class_name in prediction:
+            em_match_list.append(class_name)
+    # Remove partial/substring matches that are NOT the ground truth
+    for match_term in list(em_match_list):
+        if match_term in ground_truth and match_term != ground_truth:
+            em_match_list.remove(match_term)
+    if ground_truth in em_match_list:
+        score = 1.0 / len(em_match_list)
+    else:
+        score = 0.0
+    return score
+
+
+def count_score(prediction: str, ground_truth: str) -> float:
+    """
+    Counting accuracy for synthetic paragraph-counting tasks.
+    Used for: passage_count
+
+    Extracts all numbers from the prediction and checks what fraction
+    of them match the ground truth number.
+    """
+    numbers = re.findall(r"\d+", prediction)
+    right_num = 0
+    for number in numbers:
+        if str(number) == str(ground_truth):
+            right_num += 1
+    final_score = 0.0 if len(numbers) == 0 else right_num / len(numbers)
+    return float(final_score)
+
+
+def retrieval_score(prediction: str, ground_truth: str) -> float:
+    """
+    Retrieval accuracy for synthetic paragraph-retrieval tasks.
+    Used for: passage_retrieval_en
+
+    Extracts the paragraph ID from the ground truth ("Paragraph X"),
+    then checks what fraction of numbers in the prediction match it.
+    """
+    pattern = r'Paragraph (\d+)'
+    matches = re.findall(pattern, ground_truth)
+    if not matches:
+        return 0.0
+    ground_truth_id = matches[0]
+    numbers = re.findall(r"\d+", prediction)
+    right_num = 0
+    for number in numbers:
+        if str(number) == str(ground_truth_id):
+            right_num += 1
+    final_score = 0.0 if len(numbers) == 0 else right_num / len(numbers)
+    return float(final_score)

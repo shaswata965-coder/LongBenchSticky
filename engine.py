@@ -10,35 +10,41 @@ import metrics
 import data_loader
 import utils
 
+# ── Task Category Sets (for routing) ─────────────────────────────────────
+QA_TASKS = {"narrativeqa", "qasper", "multifieldqa_en", "hotpotqa", "2wikimqa", "musique", "triviaqa"}
+ROUGE_TASKS = {"gov_report", "qmsum", "multi_news", "samsum"}
+CODE_TASKS = {"lcc", "repobench-p"}
+CLASSIFICATION_TASKS = {"trec"}
+COUNT_TASKS = {"passage_count"}
+RETRIEVAL_TASKS = {"passage_retrieval_en"}
+
 def get_ground_truth(ex: Dict[str, Any], task: str) -> List[str]:
     """
-    Robust extraction of ground truth references.
+    Robust extraction of ground truth references for all 16 LongBench datasets.
+    LongBench standardizes all datasets to have an 'answers' field (list of strings).
+    Task-specific fallbacks handle edge cases.
     """
-    # 1. NarrativeQA: Answer is often in 'answer' or 'answers'
-    if task == "narrativeqa":
-        if "answer" in ex: return [ex["answer"]]
-        if "answers" in ex: return ex["answers"]
-
-    # 2. QMSum: Summary is in 'summary' or 'targets'
-    if task == "qmsum":
-        if "summary" in ex: return [ex["summary"]]
-        if "targets" in ex: return ex["targets"]
-
-    # 3. LCC / Code: The key is inconsistent. Check ALL variations.
-    if task == "lcc":
-        # Priority list of keys to check
+    # ── Code tasks: key is inconsistent across sources ────────────────
+    if task in CODE_TASKS:
         possible_keys = ["answers", "answer", "target", "output", "reference", "completion"]
         for key in possible_keys:
             if key in ex:
                 val = ex[key]
-                # If it's a non-empty list, return it
                 if isinstance(val, list) and val:
                     return val
-                # If it's a non-empty string, wrap in list
                 if isinstance(val, str) and val.strip():
                     return [val]
 
-    # 4. Standard Fallback (2Wiki, MuSiQue, Hotpot, etc.)
+    # ── Summarization: may use 'summary' or 'targets' ────────────────
+    if task in ROUGE_TASKS:
+        if "answers" in ex:
+            return ex["answers"]
+        if "summary" in ex:
+            return [ex["summary"]]
+        if "targets" in ex:
+            return ex["targets"]
+
+    # ── Standard Fallback (QA, Classification, Synthetic, etc.) ──────
     if "answers" in ex:
         return ex["answers"]
     if "answer" in ex:
@@ -119,17 +125,22 @@ def generate(prompt, model, tokenizer, device, refs=None, task=None, **kwargs):
     raw_text = tokenizer.decode(out[0][input_len:], skip_special_tokens=True)
     
     # ---------------------------------------------------------
-    # CRITICAL FIX: Dataset-Specific Cleaning Logic
+    # Dataset-Specific Cleaning Logic
     # ---------------------------------------------------------
-    if task == "lcc":
-        # For Code, we MUST strip markdown and chatty prefixes
-
+    if task in CODE_TASKS:
+        # For Code tasks, strip markdown fences and chatty prefixes
         clean_text = utils.clean_code_output(raw_text)
-    elif refs:
-        # For QA, we try to extract the specific answer span
+    elif task in QA_TASKS and refs:
+        # For QA tasks, try to extract the specific answer span
         clean_text = extract_answer_span(raw_text, refs)
+    elif task in ROUGE_TASKS:
+        # For Summarization, strip chatty preamble before ROUGE scoring
+        clean_text = utils.clean_summary_output(raw_text)
+    elif task in CLASSIFICATION_TASKS:
+        # For Classification (TREC), strip preamble for label matching
+        clean_text = utils.clean_classification_output(raw_text)
     else:
-        # Default fallback
+        # Synthetic (passage_count, passage_retrieval_en) — use raw output
         clean_text = raw_text
     # ---------------------------------------------------------
 
@@ -166,17 +177,33 @@ def evaluate_dataset(name, dataset, seed, model, tokenizer, device):
         if not refs:
             continue
 
-        # Pass refs to generate for the inclusion check
-        gen = generate(prompt, model, tokenizer, device, refs=refs, use_cache= True)
+        # Pass refs and task to generate for task-specific cleaning
+        gen = generate(prompt, model, tokenizer, device, refs=refs, task=name, use_cache=True)
         
-        if name == "qmsum":
+        # ── Metric Routing (Official LongBench dataset2metric) ────
+        if name in ROUGE_TASKS:
             ref_text = refs[0] if refs else ""
             m = metrics.rouge_metrics(gen["text"], ref_text)
-        elif name == "lcc":
+        elif name in CODE_TASKS:
             ref_text = refs[0] if refs else ""
             score = metrics.code_sim_score(gen["text"], ref_text)
             m = {"edit_sim": score}
+        elif name in CLASSIFICATION_TASKS:
+            # TREC: all_classes is stored per-example in the dataset
+            all_classes = ex.get("all_classes", [])
+            ref_text = refs[0] if refs else ""
+            score = metrics.classification_score(gen["text"], ref_text, all_classes)
+            m = {"cls_acc": score}
+        elif name in COUNT_TASKS:
+            ref_text = refs[0] if refs else ""
+            score = metrics.count_score(gen["text"], ref_text)
+            m = {"count_acc": score}
+        elif name in RETRIEVAL_TASKS:
+            ref_text = refs[0] if refs else ""
+            score = metrics.retrieval_score(gen["text"], ref_text)
+            m = {"retrieval_acc": score}
         else:
+            # Default: QA F1 (narrativeqa, qasper, multifieldqa_en, hotpotqa, 2wikimqa, musique, triviaqa)
             m = metrics.qa_metrics(gen["text"], refs)
 
         if gen["tokens"] == 0:

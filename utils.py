@@ -25,15 +25,11 @@ def normalize_answer(s: str) -> str:
 
     def lower(text):
         return text.lower()
-    
-
     return white_space_fix(remove_articles(remove_punc(lower(s))))
 
 def normalize(text: str) -> List[str]:
     """Wrapper that returns tokens for the QA metric function."""
     return normalize_answer(text).split()
-
-import re
 
 def clean_code_output(text: str) -> str:
     """
@@ -104,3 +100,57 @@ def clean_code_output(text: str) -> str:
         return "\n".join(lines[i:]).strip()
         
     return text
+
+
+def clean_summary_output(text: str) -> str:
+    """
+    Strip conversational preamble from summarization outputs.
+    Models often echo the instruction or add chatty prefixes before
+    the actual summary, which hurts ROUGE scores.
+    Used for: gov_report, multi_news, samsum
+    """
+    text = text.strip()
+    
+    # Strip common chatty prefixes line-by-line
+    lines = text.split('\n')
+    start_idx = 0
+    for i, line in enumerate(lines):
+        stripped = line.strip().lower()
+        if stripped.startswith((
+            "here is", "here's", "sure", "below is", "certainly",
+            "the summary", "summary:", "a summary", "in summary",
+            "i have", "let me", "based on", "the following",
+        )):
+            start_idx = i + 1
+            continue
+        # Stop at the first real content line
+        break
+    
+    return '\n'.join(lines[start_idx:]).strip()
+
+
+def clean_classification_output(text: str) -> str:
+    """
+    Strip conversational preamble from classification outputs.
+    For TREC, the model should output just the class label, but often
+    adds preamble like 'The type of question is...' or 'Sure, the answer is...'
+    We strip common prefixes so substring matching against class labels works.
+    Used for: trec
+    """
+    text = text.strip()
+    
+    # Remove common preamble patterns
+    preamble_patterns = [
+        r'^(?:the\s+)?(?:type|category|class|answer|classification)\s+(?:of\s+(?:the\s+)?(?:question|this)\s+)?is\s*:?\s*',
+        r'^(?:sure|certainly|of course)[,!.]?\s*(?:the\s+)?(?:type|answer|category)\s+is\s*:?\s*',
+        r'^(?:this|it)\s+(?:is|belongs to)\s+(?:a\s+|the\s+)?',
+    ]
+    for pattern in preamble_patterns:
+        text = re.sub(pattern, '', text, flags=re.IGNORECASE).strip()
+    
+    # Take only the first line (class label should be short)
+    first_line = text.split('\n')[0].strip()
+    # Remove trailing period/punctuation
+    first_line = first_line.rstrip('.,:;!')
+    
+    return first_line

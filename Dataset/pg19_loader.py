@@ -35,8 +35,8 @@ def get_pg19_blocks(
         
         # Fast heuristic: 1 token ~ max 5 characters for English text.
         # We grab enough raw characters to guarantee we have `min_tokens + 50` tokens.
-        target_tokens = min_tokens + 50
-        raw_chunk = text[:target_tokens * 6]
+        target_tokens = min_tokens
+        raw_chunk = text[:target_tokens * 5]
         
         # Tokenize the chunk to precisely cut the text to the target token length
         tokens = tokenizer(

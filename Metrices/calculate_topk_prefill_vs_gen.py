@@ -18,10 +18,18 @@ import json
 import numpy as np
 import os
 import sys
+import sys
+import os
+import argparse
+import glob
+
+repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.append(repo_root)
+sys.path.append(os.path.join(repo_root, "Results"))
+
 from scipy.stats import spearmanr
 from npz_io import load_results_npz
-import sys
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 try:
     import sticky_config as config
     OMEGA = getattr(config, "OMEGA", 1)
@@ -81,20 +89,15 @@ def extract_topk_windows(window_list, k):
     return topk_ids, score_dict
 
 
-def main():
-    if not os.path.exists(INPUT_PATH):
-        print(f"Error: Missing NPZ result file at {INPUT_PATH}. Please run the baseline first.")
-        sys.exit(1)
-
-    if os.path.exists(OUTPUT_PATH):
-        print(f"Removing existing {OUTPUT_PATH} to prevent appending bugs...")
-        os.remove(OUTPUT_PATH)
-
-    print(f"Loading results from: {INPUT_PATH} (Skipping massive attention matrices!)")
-    data = load_results_npz(INPUT_PATH, skip_attention=True)
-
-    K = K_TOP
-    print(f"Extracting Top-{K} WINDOWS at Prefill End vs Generation End...")
+def process_file(file_path, is_directory, K):
+    print(f"\n{'=' * 80}")
+    print(f"Processing File: {file_path}")
+    print(f"{'=' * 80}")
+    try:
+        data = load_results_npz(file_path, skip_attention=True)
+    except Exception as e:
+        print(f"  Failed to load {file_path}: {e}")
+        return
 
     all_samples = []
     aggregate = {}
@@ -111,11 +114,12 @@ def main():
             print(f"  Sample {sample_idx}: No generation steps, skipping.")
             continue
 
-        last_step_ws = gen_ws_list[-1]  # Last generation step (cumulative)
-
-        target_steps = list(range(0, num_gen_steps, OMEGA))
-        if (num_gen_steps - 1) not in target_steps:
-             target_steps.append(num_gen_steps - 1)
+        target_steps = [s for s, ws in enumerate(gen_ws_list) if ws]
+        if not target_steps:
+            print(f"  Sample {sample_idx}: No populated window scores, skipping.")
+            continue
+            
+        last_step_ws = gen_ws_list[target_steps[-1]]  # Last generation step with data
 
         sample_result = {
             "sample_index": sample_idx,
@@ -203,14 +207,33 @@ def main():
                     aggregate[layer_str][head_str] = {
                         "jaccard": [], "spearman": [],
                         "generation_origin_count": [], "prefill_origin_count": [],
-                        "total_windows": []
+                        "total_windows": [],
+                        "all_steps": {
+                            "jaccard": [], "spearman": [],
+                            "generation_origin_count": [], "prefill_origin_count": []
+                        }
                     }
+                
                 agg = aggregate[layer_str][head_str]
                 agg["jaccard"].append(jaccard)
                 agg["spearman"].append(spearman)
                 agg["generation_origin_count"].append(len(gen_only))
                 agg["prefill_origin_count"].append(len(shared))
                 agg["total_windows"].append(len(p_list))
+                
+                # Accumulate averages across the timeline
+                agg_all = agg["all_steps"]
+                if timeline:
+                    agg_all["jaccard"].append(float(np.mean([t["jaccard_overlap"] for t in timeline])))
+                    agg_all["spearman"].append(float(np.mean([t["spearman_rank_corr"] for t in timeline])))
+                    agg_all["generation_origin_count"].append(float(np.mean([t["generation_origin"] for t in timeline])))
+                    agg_all["prefill_origin_count"].append(float(np.mean([t["prefill_origin"] for t in timeline])))
+                else:
+                    agg_all["jaccard"].append(0.0)
+                    agg_all["spearman"].append(0.0)
+                    agg_all["generation_origin_count"].append(0.0)
+                    agg_all["prefill_origin_count"].append(0.0)
+
 
             sample_result["layers"][layer_str] = layer_result
 
@@ -219,6 +242,8 @@ def main():
     # Build aggregate summary
     summary_per_head = {}
     summary_per_layer = {}
+    summary_per_head_all_steps = {}
+    summary_per_layer_all_steps = {}
 
     for layer_str in sorted(aggregate.keys(), key=int):
         layer_jaccards = []
@@ -226,10 +251,20 @@ def main():
         layer_generation_origin = []
         layer_prefill_origin = []
         layer_total_windows = []
+        
+        layer_jaccards_all = []
+        layer_spearmans_all = []
+        layer_generation_origin_all = []
+        layer_prefill_origin_all = []
 
         summary_per_head[layer_str] = {}
+        summary_per_head_all_steps[layer_str] = {}
+        
         for head_str in sorted(aggregate[layer_str].keys(), key=int):
             agg = aggregate[layer_str][head_str]
+            agg_all = agg["all_steps"]
+            
+            # --- LAST STEP CALCS ---
             j_mean = float(np.mean(agg["jaccard"]))
             s_mean = float(np.mean(agg["spearman"]))
             go_mean = float(np.mean(agg["generation_origin_count"]))
@@ -250,7 +285,28 @@ def main():
             layer_generation_origin.extend(agg["generation_origin_count"])
             layer_prefill_origin.extend(agg["prefill_origin_count"])
             layer_total_windows.extend(agg["total_windows"])
+            
+            # --- ALL STEPS CALCS ---
+            j_mean_all = float(np.mean(agg_all["jaccard"]))
+            s_mean_all = float(np.mean(agg_all["spearman"]))
+            go_mean_all = float(np.mean(agg_all["generation_origin_count"]))
+            po_mean_all = float(np.mean(agg_all["prefill_origin_count"]))
 
+            summary_per_head_all_steps[layer_str][head_str] = {
+                "jaccard_mean": round(j_mean_all, 4),
+                "spearman_mean": round(s_mean_all, 4),
+                "avg_generation_origin": round(go_mean_all, 2),
+                "avg_prefill_origin": round(po_mean_all, 2),
+                "avg_total_windows": round(tw_mean, 1),
+                "data_points": len(agg_all["jaccard"])
+            }
+            
+            layer_jaccards_all.extend(agg_all["jaccard"])
+            layer_spearmans_all.extend(agg_all["spearman"])
+            layer_generation_origin_all.extend(agg_all["generation_origin_count"])
+            layer_prefill_origin_all.extend(agg_all["prefill_origin_count"])
+
+        # Layer roll-up (LAST STEP)
         summary_per_layer[layer_str] = {
             "jaccard_mean": round(float(np.mean(layer_jaccards)), 4) if layer_jaccards else 0.0,
             "spearman_mean": round(float(np.mean(layer_spearmans)), 4) if layer_spearmans else 0.0,
@@ -258,8 +314,17 @@ def main():
             "avg_prefill_origin": round(float(np.mean(layer_prefill_origin)), 2) if layer_prefill_origin else 0.0,
             "avg_total_windows": round(float(np.mean(layer_total_windows)), 1) if layer_total_windows else 0.0,
         }
+        
+        # Layer roll-up (ALL STEPS)
+        summary_per_layer_all_steps[layer_str] = {
+            "jaccard_mean": round(float(np.mean(layer_jaccards_all)), 4) if layer_jaccards_all else 0.0,
+            "spearman_mean": round(float(np.mean(layer_spearmans_all)), 4) if layer_spearmans_all else 0.0,
+            "avg_generation_origin": round(float(np.mean(layer_generation_origin_all)), 2) if layer_generation_origin_all else 0.0,
+            "avg_prefill_origin": round(float(np.mean(layer_prefill_origin_all)), 2) if layer_prefill_origin_all else 0.0,
+            "avg_total_windows": round(float(np.mean(layer_total_windows)), 1) if layer_total_windows else 0.0,
+        }
 
-    # Print summary table
+    # Print summary table (LAST STEP)
     print("\n" + "=" * 128)
     print(f"TOP-{K} WINDOWS: PREFILL vs GENERATION — PER-LAYER SUMMARY")
     print("=" * 144)
@@ -298,22 +363,102 @@ def main():
 
     print("=" * 128)
 
+    # Print summary table (ALL STEPS)
+    print("\n" + "=" * 128)
+    print(f"TOP-{K} WINDOWS: PREFILL vs ALL GENERATION STEPS (AVG) — PER-LAYER SUMMARY")
+    print("=" * 144)
+    print(f"| {'Layer':<6} | {'Pool Size':<10} | {'Jaccard':<10} | {'Spearman':<10} | {'Prefill-Origin':<15} | {'Generation-Origin':<18} | {'Bias':<20} |")
+    print("-" * 144)
+
+    for layer_str in sorted(summary_per_layer_all_steps.keys(), key=int):
+        s = summary_per_layer_all_steps[layer_str]
+        j = s["jaccard_mean"]
+        sp = s["spearman_mean"]
+        pre_orig = s["avg_prefill_origin"]
+        gen_orig = s["avg_generation_origin"]
+        tw = s["avg_total_windows"]
+
+        if pre_orig > gen_orig * 1.5:
+            bias = "⇐ Prefill-biased"
+        elif gen_orig > pre_orig * 1.5:
+            bias = "⇒ Gen-biased"
+        else:
+            bias = "≈ Balanced"
+
+        print(f"| {layer_str:<6} | {tw:<10.1f} | {j:<10.4f} | {sp:<10.4f} | {pre_orig:<15.1f} | {gen_orig:<18.1f} | {bias:<20} |")
+
+    print("=" * 144)
+
+    print(f"\n{'=' * 144}")
+    print(f"TOP-{K} WINDOWS: PREFILL vs ALL GENERATION STEPS (AVG) — PER-HEAD DETAIL")
+    print(f"{'=' * 144}")
+    print(f"| {'Layer':<6} | {'Head':<6} | {'Pool Size':<10} | {'Jaccard':<10} | {'Spearman':<10} | {'Prefill-Origin':<15} | {'Generation-Origin':<18} |")
+    print("-" * 144)
+
+    for layer_str in sorted(summary_per_head_all_steps.keys(), key=int):
+        for head_str in sorted(summary_per_head_all_steps[layer_str].keys(), key=int):
+            h = summary_per_head_all_steps[layer_str][head_str]
+            print(f"| {layer_str:<6} | {head_str:<6} | {h['avg_total_windows']:<10.1f} | {h['jaccard_mean']:<10.4f} | {h['spearman_mean']:<10.4f} | {h['avg_prefill_origin']:<15.1f} | {h['avg_generation_origin']:<18.1f} |")
+
+    print("=" * 128)
+
     # Write output
     output = {
         "config": {
             "k": K,
-            "input_file": INPUT_PATH,
+            "input_file": file_path,
             "num_samples": len(all_samples),
         },
         "summary_per_layer": summary_per_layer,
         "summary_per_head": summary_per_head,
+        "summary_per_layer_all_steps": summary_per_layer_all_steps,
+        "summary_per_head_all_steps": summary_per_head_all_steps,
         "per_sample_detail": all_samples,
     }
 
-    with open(OUTPUT_PATH, "w") as f:
+    if is_directory:
+        base_name = os.path.basename(file_path)
+        name_without_ext = os.path.splitext(base_name)[0]
+        out_path = os.path.join(INPUT_PATH, f"topk_prefill_vs_gen_{name_without_ext}.json")
+    else:
+        out_path = OUTPUT_PATH
+
+    with open(out_path, "w") as f:
         json.dump(output, f, indent=2)
 
-    print(f"\nSaved results to {OUTPUT_PATH}")
+    print(f"\nSaved results to {out_path}")
+
+
+def main():
+    if os.path.isdir(INPUT_PATH):
+        input_files = glob.glob(os.path.join(INPUT_PATH, "*.npz"))
+        if not input_files:
+            print(f"Error: No .npz files found in directory {INPUT_PATH}")
+            sys.exit(1)
+        is_directory = True
+    elif os.path.exists(INPUT_PATH):
+        input_files = [INPUT_PATH]
+        is_directory = False
+    else:
+        print(f"Error: Missing NPZ result file or directory at {INPUT_PATH}.")
+        sys.exit(1)
+
+    K = K_TOP
+    print(f"Extracting Top-{K} WINDOWS at Prefill End vs Generation End across {len(input_files)} file(s)...")
+
+    for file_path in input_files:
+        process_file(file_path, is_directory, K)
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Prefill vs Last-Gen-Step Top-K Comparison")
+    parser.add_argument("--input-path", type=str, default=INPUT_PATH, help="Path to input .npz file or directory")
+    parser.add_argument("--output-path", type=str, default=OUTPUT_PATH, help="Path to output JSON file (used only if input is a single file)")
+    parser.add_argument("--k", type=int, default=K_TOP, help="Top-K size")
+    args = parser.parse_args()
+
+    # Update globals
+    INPUT_PATH = args.input_path
+    OUTPUT_PATH = args.output_path
+    K_TOP = args.k
+
     main()

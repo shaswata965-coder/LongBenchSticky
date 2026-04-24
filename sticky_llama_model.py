@@ -1,7 +1,7 @@
-%%writefile sticky_llama_model.pyfrom transformers.models.llama.modeling_llama import LlamaForCausalLM
+import torch
+import copy
+from transformers.models.llama.modeling_llama import LlamaForCausalLM
 from sticky_llama_attention_fast_attention import STICKYLlamaAttention
-
-import copy # ensure copy is imported if not already
 
 class STICKYLlamaForCausalLM(LlamaForCausalLM):
     def __init__(self, config, **kwargs):

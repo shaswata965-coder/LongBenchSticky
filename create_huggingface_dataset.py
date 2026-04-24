@@ -1,8 +1,5 @@
-import os
-import json
-from typing import Dict, Any
-from datasets import Dataset
-
+from datasets import Dataset, load_dataset
+import pandas as pd
 
 context_prompt = {
     "narrativeqa": "You are given a story, which can be either a novel or a movie script, and a question. Answer the question asconcisely as you can, using a single phrase if possible. Do not provide any explanation.\n\nStory: {context}\n\n",
@@ -52,6 +49,7 @@ question_prompt = {
     "repobench-p": "{input}Next line of code:\n"
 }
 
+
 max_new_tokens = {
     "narrativeqa": 128,
     "qasper": 128,
@@ -76,38 +74,36 @@ max_new_tokens = {
     "repobench-p": 64
 }
 
-# CONFIG: Context length is now unrestricted for standardized LongBench testing.
 
-def load_jsonl(path: str) -> Dataset:
-    records = []
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            if line.strip():
-                records.append(json.loads(line))
-    return Dataset.from_list(records)
+datasets = [
+            "qasper", "narrativeqa", "multifieldqa_en", # single doc
+            "hotpotqa", "2wikimqa", "musique",          # multi doc
+            "trec", "triviaqa", "samsum",               # few-shot
+            "gov_report", "qmsum", "multi_news",        # sum
+            "passage_count", "passage_retrieval_en",    # Synthetic
+            "lcc", "repobench-p",                       # code
+            ]
 
-def load_datasets(root: str) -> Dict[str, Dataset]:
-    names = ["2wikimqa", "qasper", "qmsum", "musique", "multifieldqa_en", "lcc"]
-    out = {}
-    for n in names:
-        p = os.path.join(root, f"{n}.jsonl")
-        try:
-            ds = load_jsonl(p)
-            assert len(ds) > 0
-            out[n] = ds
-            print(f"✓ Loaded {n} ({len(ds)})")
-        except Exception as e:
-            print(f"✗ Skipping {n}: {e}")
-    if not out:
-        raise RuntimeError("No datasets loaded.")
-    return out
+dfs = []
+for task in datasets:
+    df = load_dataset("THUDM/LongBench", task, split='test').to_pandas()
 
-def build_prompt(example: Dict[str, Any], task: str) -> str:
-    # 1. Fetch raw content
-    ctx = example.get("context") or example.get("document") or ""
-    inp = example.get("input") or example.get("question") or ""
+    df["context"] = df["context"].apply(lambda x: context_prompt[task].format(context=x))
+    df["question"] = df["input"].apply(lambda x: question_prompt[task].format(input=x))
 
-    if task not in context_prompt or task not in question_prompt:
-        raise ValueError(f"Unknown task: {task}")
 
-    return context_prompt[task].format(context=ctx) + question_prompt[task].format(input=inp)
+    df["answer"] = df["answers"]
+    df["answer_prefix"] = ""
+    # df = df[["context", "question", "answer_prefix", "answer"]]
+    df["task"] = task
+    df["max_new_tokens"] = max_new_tokens[task]
+
+
+    dfs.append(df)
+
+
+
+dataset = Dataset.from_pandas(pd.concat(dfs))
+dataset.save_to_disk(f"./longbench")
+
+

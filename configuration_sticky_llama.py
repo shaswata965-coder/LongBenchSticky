@@ -1,4 +1,4 @@
-%%writefile configuration_sticky_llama.py
+
 from transformers.configuration_utils import PretrainedConfig
 
 class LlamaConfig(PretrainedConfig):

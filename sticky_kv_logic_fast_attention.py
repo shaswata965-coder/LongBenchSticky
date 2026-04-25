@@ -972,4 +972,4 @@ class STICKYKVCache_LayerWise(nn.Module):
         # window_id values restart from 0 for every new document, so stale
         # entries from previous documents will falsely match new windows with
         # the same ID, applying incorrect float16 scale/zp to their quantization.
-        self.q_retired_meta = []
+        self.q_retired_meta = {}

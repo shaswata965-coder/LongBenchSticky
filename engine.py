@@ -1,11 +1,12 @@
 import time
+import sticky_config as config
 import torch
 import gc
 import re
 import numpy as np
 from typing import Dict, Any, List
 
-import sticky_config as config
+
 import metrics
 import data_loader
 
@@ -232,13 +233,15 @@ def generate(prompt, model, tokenizer, device, refs=None, task=None, **kwargs):
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()   # CRITICAL: reset before timing
 
+    gen_kwargs = {**config.GENERATION_CONFIG}
+    gen_kwargs.update(kwargs)
+    gen_kwargs.setdefault("pad_token_id", tokenizer.eos_token_id)
+
     start = time.perf_counter()
     with torch.no_grad():
         out = model.generate(
             **inputs,
-            **config.GENERATION_CONFIG,
-            pad_token_id=tokenizer.eos_token_id,
-            **kwargs,
+            **gen_kwargs
         )
     if device == "cuda":
         torch.cuda.synchronize()
@@ -300,7 +303,9 @@ def evaluate_dataset(name, dataset, seed, model, tokenizer, device):
     np.random.seed(seed)
 
     results = []
-    sample_size = min(getattr(config, "LONGBENCH_SAMPLES", 100), len(dataset))
+    sample_size = min(getattr(config, "LONGBENCH_SAMPLES", 1), len(dataset))
+    print(config.Longbench_SAMPLES)
+
 
     for i in range(sample_size):
         ex = dataset[i]

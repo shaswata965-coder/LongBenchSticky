@@ -152,7 +152,7 @@ class STICKYKVCache_LayerWise(nn.Module):
         self.q_cache_v_zp = None          # [H, W, omega, 1] float16
         self.q_cache_ids = None
         self.q_cache_scores = None
-        self.q_retired_meta = []
+        self.q_retired_meta = {}
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -531,12 +531,15 @@ class STICKYKVCache_LayerWise(nn.Module):
                 promoted_q_data_k = {}
                 promoted_q_data_v = {}
                 if self.q_cache_ids is not None:
+                    q_cache_ids_np = self.q_cache_ids.cpu().numpy()
+                    final_ids_np = final_ids.cpu().numpy()
                     for h in range(self.num_heads):
                         promoted_q_data_k[h] = []
                         promoted_q_data_v[h] = []
+                        final_ids_set = set(final_ids_np[h])
                         for qi in range(self.q_cache_ids.shape[1]):
-                            q_wid = self.q_cache_ids[h, qi]
-                            if torch.isin(q_wid, final_ids[h]).item():
+                            q_wid_val = float(q_cache_ids_np[h, qi])
+                            if q_wid_val in final_ids_set:
                                 k_deq = self._dequantize_from_int8(
                                     self.q_cache_k_int8[h:h+1, qi:qi+1],
                                     self.q_cache_k_scale[h:h+1, qi:qi+1],
@@ -545,15 +548,14 @@ class STICKYKVCache_LayerWise(nn.Module):
                                     self.q_cache_v_int8[h:h+1, qi:qi+1],
                                     self.q_cache_v_scale[h:h+1, qi:qi+1],
                                     self.q_cache_v_zp[h:h+1, qi:qi+1])
-                                promoted_q_data_k[h].append((q_wid.item(), k_deq.squeeze(0).squeeze(0)))
-                                promoted_q_data_v[h].append((q_wid.item(), v_deq.squeeze(0).squeeze(0)))
-                                self.q_retired_meta.append({
-                                    'window_id': q_wid.item(), 'head': h,
+                                promoted_q_data_k[h].append((q_wid_val, k_deq.squeeze(0).squeeze(0)))
+                                promoted_q_data_v[h].append((q_wid_val, v_deq.squeeze(0).squeeze(0)))
+                                self.q_retired_meta[(q_wid_val, h)] = {
                                     'k_scale': self.q_cache_k_scale[h, qi].detach().clone(),
                                     'k_zp': self.q_cache_k_zp[h, qi].detach().clone(),
                                     'v_scale': self.q_cache_v_scale[h, qi].detach().clone(),
                                     'v_zp': self.q_cache_v_zp[h, qi].detach().clone(),
-                                })
+                                }
 
                 self.window_scores.fill_(float("nan"))
                 self.window_scores[:, :curr_k, 0] = final_v
@@ -603,14 +605,21 @@ class STICKYKVCache_LayerWise(nn.Module):
                     new_v_scale = torch.zeros(self.num_heads, new_q_count, self.omega, 1, device=device, dtype=dtype_fp)
                     new_v_zp = torch.zeros(self.num_heads, new_q_count, self.omega, 1, device=device, dtype=dtype_fp)
                     
+                    q_loser_ids_np = new_q_loser_ids.cpu().numpy()
+                    if self.q_cache_ids is not None:
+                        q_cache_ids_np = self.q_cache_ids.cpu().numpy()
+                    else:
+                        q_cache_ids_np = None
+                    logical_id_map_np = self.logical_id_map.cpu().numpy()
+                    
                     for qi in range(new_q_count):
                         for h in range(self.num_heads):
-                            wid = new_q_loser_ids[h, qi]
+                            wid_val = float(q_loser_ids_np[h, qi])
                             retained = False
-                            if self.q_cache_ids is not None:
-                                q_match = (self.q_cache_ids[h] == wid).nonzero(as_tuple=True)[0]
+                            if q_cache_ids_np is not None:
+                                q_match = (q_cache_ids_np[h] == wid_val).nonzero()[0]
                                 if len(q_match) > 0:
-                                    old_qi = q_match[0].item()
+                                    old_qi = q_match[0]
                                     new_k_int8[h, qi] = self.q_cache_k_int8[h, old_qi]
                                     new_v_int8[h, qi] = self.q_cache_v_int8[h, old_qi]
                                     new_k_scale[h, qi] = self.q_cache_k_scale[h, old_qi]
@@ -619,34 +628,32 @@ class STICKYKVCache_LayerWise(nn.Module):
                                     new_v_zp[h, qi] = self.q_cache_v_zp[h, old_qi]
                                     retained = True
                             if not retained:
-                                phys_mask = (self.logical_id_map[h] == wid.item())
-                                phys_positions = phys_mask.nonzero(as_tuple=True)[0]
+                                phys_positions = (logical_id_map_np[h] == wid_val).nonzero()[0]
                                 if len(phys_positions) >= self.omega:
                                     phys_positions = phys_positions[:self.omega]
-                                    phys_positions = torch.clamp(phys_positions, 0, seq_len - 1)
-                                    k_fp = past_key_values[0][0, h, phys_positions]
-                                    v_fp = past_key_values[1][0, h, phys_positions]
+                                    phys_positions = phys_positions.clip(0, seq_len - 1)
+                                    phys_idx = torch.from_numpy(phys_positions).to(device)
+                                    k_fp = past_key_values[0][0, h, phys_idx]
+                                    v_fp = past_key_values[1][0, h, phys_idx]
                                 else:
                                     k_fp = torch.zeros(self.omega, head_dim, device=device, dtype=dtype_fp)
                                     v_fp = torch.zeros(self.omega, head_dim, device=device, dtype=dtype_fp)
-                                archived = False
-                                for meta in self.q_retired_meta:
-                                    if meta['window_id'] == wid.item() and meta['head'] == h:
-                                        ks = meta['k_scale'].to(device)
-                                        kz = meta['k_zp'].to(device)
-                                        k_q = torch.round((k_fp.unsqueeze(0) - kz) / ks).clamp(0, 255).to(torch.uint8)
-                                        new_k_int8[h, qi] = k_q.squeeze(0)
-                                        new_k_scale[h, qi, 0] = ks.squeeze(0)
-                                        new_k_zp[h, qi, 0] = kz.squeeze(0)
-                                        vs = meta['v_scale'].to(device)
-                                        vz = meta['v_zp'].to(device)
-                                        v_q = torch.round((v_fp.unsqueeze(0) - vz) / vs).clamp(0, 255).to(torch.uint8)
-                                        new_v_int8[h, qi] = v_q.squeeze(0)
-                                        new_v_scale[h, qi] = vs.squeeze(0)
-                                        new_v_zp[h, qi] = vz.squeeze(0)
-                                        archived = True
-                                        break
-                                if not archived:
+                                
+                                meta = self.q_retired_meta.get((wid_val, h))
+                                if meta is not None:
+                                    ks = meta['k_scale'].to(device)
+                                    kz = meta['k_zp'].to(device)
+                                    k_q = torch.round((k_fp.unsqueeze(0) - kz) / ks).clamp(0, 255).to(torch.uint8)
+                                    new_k_int8[h, qi] = k_q.squeeze(0)
+                                    new_k_scale[h, qi, 0] = ks.squeeze(0)
+                                    new_k_zp[h, qi, 0] = kz.squeeze(0)
+                                    vs = meta['v_scale'].to(device)
+                                    vz = meta['v_zp'].to(device)
+                                    v_q = torch.round((v_fp.unsqueeze(0) - vz) / vs).clamp(0, 255).to(torch.uint8)
+                                    new_v_int8[h, qi] = v_q.squeeze(0)
+                                    new_v_scale[h, qi] = vs.squeeze(0)
+                                    new_v_zp[h, qi] = vz.squeeze(0)
+                                else:
                                     k_4d = k_fp.unsqueeze(0).unsqueeze(0)
                                     v_4d = v_fp.unsqueeze(0).unsqueeze(0)
                                     kq, ks, kz = self._quantize_k_per_window(k_4d)
@@ -693,6 +700,9 @@ class STICKYKVCache_LayerWise(nn.Module):
                 new_v = torch.zeros(1, self.num_heads, new_seq_len, head_dim, device=device, dtype=dtype_fp)
                 new_logical_id_map = torch.zeros(self.num_heads, new_seq_len, device=device, dtype=torch.float32)
                 
+                logical_id_map_np = self.logical_id_map.cpu().numpy()
+                final_ids_np = final_ids.cpu().numpy()
+                
                 for h in range(self.num_heads):
                     # 1. Sinks
                     new_k[0, h, :self.sink_tokens] = past_key_values[0][0, h, :self.sink_tokens]
@@ -701,26 +711,25 @@ class STICKYKVCache_LayerWise(nn.Module):
                     
                     # 2. Sticky Zone (final_ids are sorted chronologically)
                     for i in range(curr_k):
-                        wid = final_ids[h, i].item()
+                        wid_val = float(final_ids_np[h, i])
                         new_pos = self.sink_tokens + i * self.omega
                         
                         # Check if it was in old main cache
-                        old_phys_mask = (self.logical_id_map[h] == wid)
-                        old_phys_indices = old_phys_mask.nonzero(as_tuple=True)[0]
+                        old_phys_indices = (logical_id_map_np[h] == wid_val).nonzero()[0]
                         
                         if len(old_phys_indices) >= self.omega:
                             # From main cache
-                            old_pos = old_phys_indices[0].item()
+                            old_pos = old_phys_indices[0]
                             new_k[0, h, new_pos:new_pos+self.omega] = past_key_values[0][0, h, old_pos:old_pos+self.omega]
                             new_v[0, h, new_pos:new_pos+self.omega] = past_key_values[1][0, h, old_pos:old_pos+self.omega]
-                            new_logical_id_map[h, new_pos:new_pos+self.omega] = float(wid)
+                            new_logical_id_map[h, new_pos:new_pos+self.omega] = float(wid_val)
                         else:
                             # From q_cache (promoted)
-                            p_k = [k for w, k in promoted_q_data_k[h] if w == wid][0]
-                            p_v = [v for w, v in promoted_q_data_v[h] if w == wid][0]
+                            p_k = [k for w, k in promoted_q_data_k[h] if w == wid_val][0]
+                            p_v = [v for w, v in promoted_q_data_v[h] if w == wid_val][0]
                             new_k[0, h, new_pos:new_pos+self.omega] = p_k
                             new_v[0, h, new_pos:new_pos+self.omega] = p_v
-                            new_logical_id_map[h, new_pos:new_pos+self.omega] = float(wid)
+                            new_logical_id_map[h, new_pos:new_pos+self.omega] = float(wid_val)
                     
                     # 3. Local Zone
                     if local_tokens_count > 0:

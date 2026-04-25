@@ -1,5 +1,5 @@
 
-import torch
+# import torch
 
 MODEL_PATH = "/kaggle/input/llama-3.2/transformers/1b-instruct/1"
 
@@ -41,6 +41,9 @@ GENERATION_CONFIG = {
     "do_sample": False,
     "temperature": 1.0,
 }
+
+DATA_DIR = "/kaggle/input/datasets/shaswatabhattacharya/longbench-12/1LongBenchData"
+
 
 # --- EVALUATION SCRIPT CONFIGURATIONS ---
 NUM_SAMPLES = 10

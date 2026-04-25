@@ -5,25 +5,13 @@ import math
 from typing import Optional, Tuple
 import torch.nn.functional as F
 from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding
-from sticky_kv_logic import (
+from sticky_kv_logic_cummulative import (
     repeat_kv,
     _make_causal_mask,
     apply_rotary_pos_emb_single,
     STICKYKVCache_LayerWise
 )
 
-import torch
-from torch import nn
-import math
-from typing import Optional, Tuple
-import torch.nn.functional as F
-from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding
-from sticky_kv_logic import (
-    repeat_kv,
-    _make_causal_mask,
-    apply_rotary_pos_emb_single,
-    STICKYKVCache_LayerWise
-)
 
 class Llama3RotaryEmbedding(nn.Module):
     def __init__(self, dim, max_position_embeddings=None, base=None, device=None, scaling_factor=None, low_freq_factor=None, high_freq_factor=None, original_max_position_embeddings=None):

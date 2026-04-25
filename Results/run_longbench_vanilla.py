@@ -40,7 +40,7 @@ def main():
     print("Model and Tokenizer loaded successfully.")
 
     # Load LongBench datasets
-    data_dir = "1LongBenchData"
+    data_dir = getattr(config, "DATA_DIR", "1LongBenchData")
     print(f"Loading datasets from {data_dir}...")
     datasets = data_loader.load_datasets(data_dir)
 

@@ -19,7 +19,7 @@ Q_RATIO = 10  # Set to e.g. 10 for 10% of total budget allocated to quantized ev
 # To use a fixed number of tokens for local windows, set LOCAL_NUM_TOKENS (e.g., 256) and comment out P_RATIO
 # LOCAL_NUM_TOKENS = 32
 
-OMEGA = 1  # Window size for KV cache grouping
+OMEGA = 8  # Window size for KV cache grouping
 SINK_TOKENS = 4  # Number of permanently protected sink tokens
 tracking_flag = 1
 dataset_tracker = 1

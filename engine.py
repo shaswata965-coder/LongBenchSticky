@@ -304,7 +304,7 @@ def evaluate_dataset(name, dataset, seed, model, tokenizer, device):
 
     results = []
     sample_size = min(getattr(config, "LONGBENCH_SAMPLES", 1), len(dataset))
-    print(config.Longbench_SAMPLES)
+    print(f"Running {sample_size} samples from {config.LONGBENCH_SAMPLES} configured (dataset size: {len(dataset)})")
 
 
     for i in range(sample_size):

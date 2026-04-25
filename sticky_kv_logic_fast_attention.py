@@ -423,12 +423,13 @@ class STICKYKVCache_LayerWise(nn.Module):
                 # them because logical_id_map doesn't include them yet. Without this, their
                 # votes are permanently lost when running_attention_votes is zeroed at cycle end.
                 if seq_len > compressed_len:
+                    n_new = seq_len - compressed_len
                     new_tok_votes = self.running_attention_votes[:, compressed_len:seq_len]
-                    for j in range(seq_len - compressed_len):
-                        global_pos = self.num_of_tokens_without_eviction - self.omega + j
-                        new_lid = max(0, (global_pos - self.sink_tokens) // self.omega)
-                        if new_lid < scoreboard.shape[1]:
-                            scoreboard[:, new_lid] += new_tok_votes[:, j]
+                    js = torch.arange(n_new, device=device, dtype=torch.long)
+                    new_lids = ((self.num_of_tokens_without_eviction - self.omega + js - self.sink_tokens) // self.omega).clamp(min=0)
+                    valid_new = new_lids < scoreboard.shape[1]
+                    if valid_new.any():
+                        scoreboard.scatter_add_(1, new_lids[valid_new].unsqueeze(0).expand(self.num_heads, -1), new_tok_votes[:, valid_new])
                 
                 # Determine current valid old competitors
                 valid_mask = ~torch.isnan(self.window_scores[:, :, 1])
@@ -702,6 +703,31 @@ class STICKYKVCache_LayerWise(nn.Module):
                 
                 logical_id_map_np = self.logical_id_map.cpu().numpy()
                 final_ids_np = final_ids.cpu().numpy()
+
+                # Pre-build O(1) lookup: (head, wid_float) → first physical position
+                _phys_first = {}
+                for _h in range(self.num_heads):
+                    _counts = {}
+                    _first_pos = {}
+                    for _p, _w in enumerate(logical_id_map_np[_h].tolist()):
+                        if _w >= 0:
+                            if _w not in _counts:
+                                _counts[_w] = 0
+                                _first_pos[_w] = _p
+                            _counts[_w] += 1
+                    for _w, _cnt in _counts.items():
+                        if _cnt >= self.omega:
+                            _phys_first[(_h, _w)] = _first_pos[_w]
+
+                # Pre-build promoted data lookup: (head, wid_float) → tensor
+                _prom_k = {(_h, float(w)): k for _h in range(self.num_heads) for w, k in promoted_q_data_k[_h]}
+                _prom_v = {(_h, float(w)): v for _h in range(self.num_heads) for w, v in promoted_q_data_v[_h]}
+
+                # Precompute local logical IDs vector (same for all heads)
+                _local_lids = None
+                if local_tokens_count > 0:
+                    _offsets = torch.arange(local_tokens_count, device=device, dtype=torch.float32)
+                    _local_lids = float(last_id_val + 1) + (_offsets // self.omega)
                 
                 for h in range(self.num_heads):
                     # 1. Sinks
@@ -709,26 +735,24 @@ class STICKYKVCache_LayerWise(nn.Module):
                     new_v[0, h, :self.sink_tokens] = past_key_values[1][0, h, :self.sink_tokens]
                     new_logical_id_map[h, :self.sink_tokens] = self.logical_id_map[h, :self.sink_tokens]
                     
-                    # 2. Sticky Zone (final_ids are sorted chronologically)
+                    # 2. Sticky Zone — O(1) dict lookup replaces per-window nonzero scan
                     for i in range(curr_k):
                         wid_val = float(final_ids_np[h, i])
                         new_pos = self.sink_tokens + i * self.omega
-                        
-                        # Check if it was in old main cache
-                        old_phys_indices = (logical_id_map_np[h] == wid_val).nonzero()[0]
-                        
-                        if len(old_phys_indices) >= self.omega:
+
+                        old_pos = _phys_first.get((h, wid_val))
+                        if old_pos is not None:
                             # From main cache
-                            old_pos = old_phys_indices[0]
                             new_k[0, h, new_pos:new_pos+self.omega] = past_key_values[0][0, h, old_pos:old_pos+self.omega]
                             new_v[0, h, new_pos:new_pos+self.omega] = past_key_values[1][0, h, old_pos:old_pos+self.omega]
                             new_logical_id_map[h, new_pos:new_pos+self.omega] = float(wid_val)
                         else:
-                            # From q_cache (promoted)
-                            p_k = [k for w, k in promoted_q_data_k[h] if w == wid_val][0]
-                            p_v = [v for w, v in promoted_q_data_v[h] if w == wid_val][0]
-                            new_k[0, h, new_pos:new_pos+self.omega] = p_k
-                            new_v[0, h, new_pos:new_pos+self.omega] = p_v
+                            # From q_cache (promoted) — O(1) dict lookup
+                            p_k = _prom_k.get((h, wid_val))
+                            p_v = _prom_v.get((h, wid_val))
+                            if p_k is not None:
+                                new_k[0, h, new_pos:new_pos+self.omega] = p_k
+                                new_v[0, h, new_pos:new_pos+self.omega] = p_v
                             new_logical_id_map[h, new_pos:new_pos+self.omega] = float(wid_val)
                     
                     # 3. Local Zone
@@ -744,8 +768,8 @@ class STICKYKVCache_LayerWise(nn.Module):
                         new_k[0, h, new_local_start:] = past_key_values[0][0, h, old_local_start:old_local_start+local_tokens_count]
                         new_v[0, h, new_local_start:] = past_key_values[1][0, h, old_local_start:old_local_start+local_tokens_count]
                         
-                        for offset in range(local_tokens_count):
-                            new_logical_id_map[h, new_local_start + offset] = (last_id_val + 1) + (offset // self.omega)
+                        if _local_lids is not None:
+                            new_logical_id_map[h, new_local_start:new_local_start + local_tokens_count] = _local_lids
                 
                 self.logical_id_map = new_logical_id_map
                 updated_kv = (new_k, new_v)

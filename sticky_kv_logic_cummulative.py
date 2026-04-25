@@ -118,7 +118,7 @@ class STICKYKVCache_LayerWise(nn.Module):
         
         # Retired metadata store — scale/zp from promoted windows (never deleted)
         # Each entry: {window_id, head, k_scale[1,1,D], k_zp[1,1,D], v_scale[1,omega,1], v_zp[1,omega,1]}
-        self.q_retired_meta = []
+        self.q_retired_meta = {}  # keyed by (window_id_float, head_int) → O(1) lookup
         
         try:
             from sticky_config import P_RATIO
@@ -510,12 +510,13 @@ class STICKYKVCache_LayerWise(nn.Module):
                 # them because logical_id_map doesn't include them yet. Without this, their
                 # votes are permanently lost when running_attention_votes is zeroed at cycle end.
                 if seq_len > compressed_len:
+                    n_new = seq_len - compressed_len
                     new_tok_votes = self.running_attention_votes[:, compressed_len:seq_len]
-                    for j in range(seq_len - compressed_len):
-                        global_pos = self.num_of_tokens_without_eviction - self.omega + j
-                        new_lid = max(0, (global_pos - self.sink_tokens) // self.omega)
-                        if new_lid < scoreboard.shape[1]:
-                            scoreboard[:, new_lid] += new_tok_votes[:, j]
+                    js = torch.arange(n_new, device=device, dtype=torch.long)
+                    new_lids = ((self.num_of_tokens_without_eviction - self.omega + js - self.sink_tokens) // self.omega).clamp(min=0)
+                    valid_new = new_lids < scoreboard.shape[1]
+                    if valid_new.any():
+                        scoreboard.scatter_add_(1, new_lids[valid_new].unsqueeze(0).expand(self.num_heads, -1), new_tok_votes[:, valid_new])
                 
                 # Determine current valid old competitors
                 valid_mask = ~torch.isnan(self.window_scores[:, :, 1])
@@ -640,14 +641,12 @@ class STICKYKVCache_LayerWise(nn.Module):
                                 promoted_q_data_k[h].append((q_wid.item(), k_deq.squeeze(0).squeeze(0)))
                                 promoted_q_data_v[h].append((q_wid.item(), v_deq.squeeze(0).squeeze(0)))
                                 # Archive per-window scale/zp (never deleted)
-                                self.q_retired_meta.append({
-                                    'window_id': q_wid.item(),
-                                    'head': h,
+                                self.q_retired_meta[(q_wid.item(), h)] = {
                                     'k_scale': self.q_cache_k_scale[h, qi].detach().clone(),
                                     'k_zp': self.q_cache_k_zp[h, qi].detach().clone(),
                                     'v_scale': self.q_cache_v_scale[h, qi].detach().clone(),
                                     'v_zp': self.q_cache_v_zp[h, qi].detach().clone(),
-                                })
+                                }
 
                 self.window_scores.fill_(float("nan"))
                 self.window_scores[:, :curr_k, 0] = final_v
@@ -730,26 +729,23 @@ class STICKYKVCache_LayerWise(nn.Module):
                                     k_fp = torch.zeros(self.omega, head_dim, device=device, dtype=dtype_fp)
                                     v_fp = torch.zeros(self.omega, head_dim, device=device, dtype=dtype_fp)
                                 
-                                # Path B: Check q_retired_meta for archived scales
+                                # Path B: O(1) dict lookup for archived scales
                                 archived = False
-                                for meta in self.q_retired_meta:
-                                    if meta['window_id'] == wid.item() and meta['head'] == h:
-                                        # Re-quantize using archived scale/zp — no new error
-                                        ks = meta['k_scale'].to(device)  # [1, D]
-                                        kz = meta['k_zp'].to(device)
-                                        k_q = torch.round((k_fp.unsqueeze(0) - kz) / ks).clamp(0, 255).to(torch.uint8)
-                                        new_k_int8[h, qi] = k_q.squeeze(0)
-                                        new_k_scale[h, qi, 0] = ks.squeeze(0)
-                                        new_k_zp[h, qi, 0] = kz.squeeze(0)
-                                        
-                                        vs = meta['v_scale'].to(device)  # [omega, 1]
-                                        vz = meta['v_zp'].to(device)
-                                        v_q = torch.round((v_fp.unsqueeze(0) - vz) / vs).clamp(0, 255).to(torch.uint8)
-                                        new_v_int8[h, qi] = v_q.squeeze(0)
-                                        new_v_scale[h, qi] = vs.squeeze(0)
-                                        new_v_zp[h, qi] = vz.squeeze(0)
-                                        archived = True
-                                        break
+                                meta = self.q_retired_meta.get((wid.item(), h))
+                                if meta is not None:
+                                    ks = meta['k_scale'].to(device)
+                                    kz = meta['k_zp'].to(device)
+                                    k_q = torch.round((k_fp.unsqueeze(0) - kz) / ks).clamp(0, 255).to(torch.uint8)
+                                    new_k_int8[h, qi] = k_q.squeeze(0)
+                                    new_k_scale[h, qi, 0] = ks.squeeze(0)
+                                    new_k_zp[h, qi, 0] = kz.squeeze(0)
+                                    vs = meta['v_scale'].to(device)
+                                    vz = meta['v_zp'].to(device)
+                                    v_q = torch.round((v_fp.unsqueeze(0) - vz) / vs).clamp(0, 255).to(torch.uint8)
+                                    new_v_int8[h, qi] = v_q.squeeze(0)
+                                    new_v_scale[h, qi] = vs.squeeze(0)
+                                    new_v_zp[h, qi] = vz.squeeze(0)
+                                    archived = True
                                 
                                 if not archived:
                                     # Path C: FRESH — compute new per-window quantization
@@ -798,10 +794,39 @@ class STICKYKVCache_LayerWise(nn.Module):
                 new_k = torch.zeros(1, self.num_heads, new_seq_len, head_dim, device=device, dtype=dtype_fp)
                 new_v = torch.zeros(1, self.num_heads, new_seq_len, head_dim, device=device, dtype=dtype_fp)
                 new_logical_id_map = torch.zeros(self.num_heads, new_seq_len, device=device, dtype=torch.float32)
-                
+
                 # To support token ledger:
                 mapping = torch.full((self.num_heads, seq_len), -1.0, device=device, dtype=torch.float32)
-                
+
+                # Pre-build O(1) lookup: (head, wid_float) → first physical position
+                # Replicates the old (logical_id_map[h] == wid).nonzero() scan but built once.
+                _lid_list = self.logical_id_map.cpu().tolist()
+                _phys_first = {}
+                for _h in range(self.num_heads):
+                    _counts = {}
+                    _first_pos = {}
+                    for _p, _w in enumerate(_lid_list[_h]):
+                        if _w >= 0:
+                            if _w not in _counts:
+                                _counts[_w] = 0
+                                _first_pos[_w] = _p
+                            _counts[_w] += 1
+                    for _w, _cnt in _counts.items():
+                        if _cnt >= self.omega:
+                            _phys_first[(_h, _w)] = _first_pos[_w]
+
+                # Pre-build promoted data lookup: (head, wid_float) → tensor
+                _prom_k = {(_h, float(w)): k for _h in range(self.num_heads) for w, k in promoted_q_data_k[_h]}
+                _prom_v = {(_h, float(w)): v for _h in range(self.num_heads) for w, v in promoted_q_data_v[_h]}
+
+                # Precompute local logical IDs vector (same for all heads)
+                _local_lids = None
+                if local_tokens_count > 0:
+                    _offsets = torch.arange(local_tokens_count, device=device, dtype=torch.float32)
+                    _local_lids = float(last_id_val + 1) + (_offsets // self.omega)
+
+                final_ids_list = final_ids.tolist()
+
                 for h in range(self.num_heads):
                     # 1. Sinks
                     new_k[0, h, :self.sink_tokens] = past_key_values[0][0, h, :self.sink_tokens]
@@ -809,29 +834,26 @@ class STICKYKVCache_LayerWise(nn.Module):
                     new_logical_id_map[h, :self.sink_tokens] = self.logical_id_map[h, :self.sink_tokens]
                     mapping[h, :self.sink_tokens] = torch.arange(self.sink_tokens, device=device, dtype=torch.float32)
                     
-                    # 2. Sticky Zone (final_ids are sorted chronologically)
+                    # 2. Sticky Zone — O(1) dict lookup replaces per-window nonzero scan
                     for i in range(curr_k):
-                        wid = final_ids[h, i].item()
+                        wid = float(final_ids_list[h][i])
                         new_pos = self.sink_tokens + i * self.omega
-                        
-                        # Check if it was in old main cache
-                        old_phys_mask = (self.logical_id_map[h] == wid)
-                        old_phys_indices = old_phys_mask.nonzero(as_tuple=True)[0]
-                        
-                        if len(old_phys_indices) >= self.omega:
+
+                        old_pos = _phys_first.get((h, wid))
+                        if old_pos is not None:
                             # From main cache
-                            old_pos = old_phys_indices[0].item()
                             new_k[0, h, new_pos:new_pos+self.omega] = past_key_values[0][0, h, old_pos:old_pos+self.omega]
                             new_v[0, h, new_pos:new_pos+self.omega] = past_key_values[1][0, h, old_pos:old_pos+self.omega]
-                            new_logical_id_map[h, new_pos:new_pos+self.omega] = float(wid)
+                            new_logical_id_map[h, new_pos:new_pos+self.omega] = wid
                             mapping[h, old_pos:old_pos+self.omega] = torch.arange(new_pos, new_pos+self.omega, device=device, dtype=torch.float32)
                         else:
-                            # From q_cache (promoted)
-                            p_k = [k for w, k in promoted_q_data_k[h] if w == wid][0]
-                            p_v = [v for w, v in promoted_q_data_v[h] if w == wid][0]
-                            new_k[0, h, new_pos:new_pos+self.omega] = p_k
-                            new_v[0, h, new_pos:new_pos+self.omega] = p_v
-                            new_logical_id_map[h, new_pos:new_pos+self.omega] = float(wid)
+                            # From q_cache (promoted) — O(1) dict lookup
+                            p_k = _prom_k.get((h, wid))
+                            p_v = _prom_v.get((h, wid))
+                            if p_k is not None:
+                                new_k[0, h, new_pos:new_pos+self.omega] = p_k
+                                new_v[0, h, new_pos:new_pos+self.omega] = p_v
+                            new_logical_id_map[h, new_pos:new_pos+self.omega] = wid
                             # Promoted tokens didn't have an old_phys position in the main cache, so no mapping needed
                     
                     # 3. Local Zone
@@ -847,8 +869,8 @@ class STICKYKVCache_LayerWise(nn.Module):
                         new_k[0, h, new_local_start:] = past_key_values[0][0, h, old_local_start:old_local_start+local_tokens_count]
                         new_v[0, h, new_local_start:] = past_key_values[1][0, h, old_local_start:old_local_start+local_tokens_count]
                         
-                        for offset in range(local_tokens_count):
-                            new_logical_id_map[h, new_local_start + offset] = (last_id_val + 1) + (offset // self.omega)
+                        if _local_lids is not None:
+                            new_logical_id_map[h, new_local_start:new_local_start + local_tokens_count] = _local_lids
                             
                         mapping[h, old_local_start:old_local_start+local_tokens_count] = torch.arange(new_local_start, new_local_start+local_tokens_count, device=device, dtype=torch.float32)
                 
@@ -1091,4 +1113,4 @@ class STICKYKVCache_LayerWise(nn.Module):
         # window_id values restart from 0 for every new document, so stale
         # entries from previous documents will falsely match new windows with
         # the same ID, applying incorrect float16 scale/zp to their quantization.
-        self.q_retired_meta = []
+        self.q_retired_meta = {}

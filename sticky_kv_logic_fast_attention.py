@@ -532,31 +532,32 @@ class STICKYKVCache_LayerWise(nn.Module):
                 promoted_q_data_k = {}
                 promoted_q_data_v = {}
                 if self.q_cache_ids is not None:
-                    q_cache_ids_np = self.q_cache_ids.cpu().numpy()
-                    final_ids_np = final_ids.cpu().numpy()
+                    # OPT (Change 2): Replace .cpu().numpy() set comparison with torch.isin on GPU
+                    # Semantically identical: checks which q_cache windows survived into final_ids
+                    promo_mask = torch.isin(self.q_cache_ids.long(), final_ids.long())  # [H, q_windows]
                     for h in range(self.num_heads):
                         promoted_q_data_k[h] = []
                         promoted_q_data_v[h] = []
-                        final_ids_set = set(final_ids_np[h])
-                        for qi in range(self.q_cache_ids.shape[1]):
-                            q_wid_val = float(q_cache_ids_np[h, qi])
-                            if q_wid_val in final_ids_set:
-                                k_deq = self._dequantize_from_int8(
-                                    self.q_cache_k_int8[h:h+1, qi:qi+1],
-                                    self.q_cache_k_scale[h:h+1, qi:qi+1],
-                                    self.q_cache_k_zp[h:h+1, qi:qi+1])
-                                v_deq = self._dequantize_from_int8(
-                                    self.q_cache_v_int8[h:h+1, qi:qi+1],
-                                    self.q_cache_v_scale[h:h+1, qi:qi+1],
-                                    self.q_cache_v_zp[h:h+1, qi:qi+1])
-                                promoted_q_data_k[h].append((q_wid_val, k_deq.squeeze(0).squeeze(0)))
-                                promoted_q_data_v[h].append((q_wid_val, v_deq.squeeze(0).squeeze(0)))
-                                self.q_retired_meta[(q_wid_val, h)] = {
-                                    'k_scale': self.q_cache_k_scale[h, qi].detach().clone(),
-                                    'k_zp': self.q_cache_k_zp[h, qi].detach().clone(),
-                                    'v_scale': self.q_cache_v_scale[h, qi].detach().clone(),
-                                    'v_zp': self.q_cache_v_zp[h, qi].detach().clone(),
-                                }
+                        # Only iterate over the few promoted slots (typically 0-3)
+                        promoted_qi_indices = promo_mask[h].nonzero(as_tuple=True)[0]
+                        for qi in promoted_qi_indices.tolist():
+                            q_wid_val = float(self.q_cache_ids[h, qi].item())
+                            k_deq = self._dequantize_from_int8(
+                                self.q_cache_k_int8[h:h+1, qi:qi+1],
+                                self.q_cache_k_scale[h:h+1, qi:qi+1],
+                                self.q_cache_k_zp[h:h+1, qi:qi+1])
+                            v_deq = self._dequantize_from_int8(
+                                self.q_cache_v_int8[h:h+1, qi:qi+1],
+                                self.q_cache_v_scale[h:h+1, qi:qi+1],
+                                self.q_cache_v_zp[h:h+1, qi:qi+1])
+                            promoted_q_data_k[h].append((q_wid_val, k_deq.squeeze(0).squeeze(0)))
+                            promoted_q_data_v[h].append((q_wid_val, v_deq.squeeze(0).squeeze(0)))
+                            self.q_retired_meta[(q_wid_val, h)] = {
+                                'k_scale': self.q_cache_k_scale[h, qi].detach().clone(),
+                                'k_zp': self.q_cache_k_zp[h, qi].detach().clone(),
+                                'v_scale': self.q_cache_v_scale[h, qi].detach().clone(),
+                                'v_zp': self.q_cache_v_zp[h, qi].detach().clone(),
+                            }
 
                 self.window_scores.fill_(float("nan"))
                 self.window_scores[:, :curr_k, 0] = final_v
@@ -606,21 +607,16 @@ class STICKYKVCache_LayerWise(nn.Module):
                     new_v_scale = torch.zeros(self.num_heads, new_q_count, self.omega, 1, device=device, dtype=dtype_fp)
                     new_v_zp = torch.zeros(self.num_heads, new_q_count, self.omega, 1, device=device, dtype=dtype_fp)
                     
-                    q_loser_ids_np = new_q_loser_ids.cpu().numpy()
-                    if self.q_cache_ids is not None:
-                        q_cache_ids_np = self.q_cache_ids.cpu().numpy()
-                    else:
-                        q_cache_ids_np = None
-                    logical_id_map_np = self.logical_id_map.cpu().numpy()
-                    
+                    # OPT (Change 3): Replace .cpu().numpy() comparisons with GPU-native operations
+                    # Semantically identical: same retained/not-retained routing, just stays on GPU
                     for qi in range(new_q_count):
                         for h in range(self.num_heads):
-                            wid_val = float(q_loser_ids_np[h, qi])
+                            wid_val = float(new_q_loser_ids[h, qi].item())
                             retained = False
-                            if q_cache_ids_np is not None:
-                                q_match = (q_cache_ids_np[h] == wid_val).nonzero()[0]
+                            if self.q_cache_ids is not None:
+                                q_match = (self.q_cache_ids[h] == wid_val).nonzero(as_tuple=True)[0]
                                 if len(q_match) > 0:
-                                    old_qi = q_match[0]
+                                    old_qi = q_match[0].item()
                                     new_k_int8[h, qi] = self.q_cache_k_int8[h, old_qi]
                                     new_v_int8[h, qi] = self.q_cache_v_int8[h, old_qi]
                                     new_k_scale[h, qi] = self.q_cache_k_scale[h, old_qi]
@@ -629,11 +625,10 @@ class STICKYKVCache_LayerWise(nn.Module):
                                     new_v_zp[h, qi] = self.q_cache_v_zp[h, old_qi]
                                     retained = True
                             if not retained:
-                                phys_positions = (logical_id_map_np[h] == wid_val).nonzero()[0]
+                                phys_positions = (self.logical_id_map[h] == wid_val).nonzero(as_tuple=True)[0]
                                 if len(phys_positions) >= self.omega:
                                     phys_positions = phys_positions[:self.omega]
-                                    phys_positions = phys_positions.clip(0, seq_len - 1)
-                                    phys_idx = torch.from_numpy(phys_positions).to(device)
+                                    phys_idx = phys_positions.clamp(0, seq_len - 1)
                                     k_fp = past_key_values[0][0, h, phys_idx]
                                     v_fp = past_key_values[1][0, h, phys_idx]
                                 else:
@@ -701,23 +696,32 @@ class STICKYKVCache_LayerWise(nn.Module):
                 new_v = torch.zeros(1, self.num_heads, new_seq_len, head_dim, device=device, dtype=dtype_fp)
                 new_logical_id_map = torch.zeros(self.num_heads, new_seq_len, device=device, dtype=torch.long)
                 
-                logical_id_map_np = self.logical_id_map.cpu().numpy()
-                final_ids_np = final_ids.cpu().numpy()
-
-                # Pre-build O(1) lookup: (head, wid_float) → first physical position
-                _phys_first = {}
-                for _h in range(self.num_heads):
-                    _counts = {}
-                    _first_pos = {}
-                    for _p, _w in enumerate(logical_id_map_np[_h].tolist()):
-                        if _w >= 0:
-                            if _w not in _counts:
-                                _counts[_w] = 0
-                                _first_pos[_w] = _p
-                            _counts[_w] += 1
-                    for _w, _cnt in _counts.items():
-                        if _cnt >= self.omega:
-                            _phys_first[(_h, _w)] = _first_pos[_w]
+                # OPT (Change 1): Replace CPU-bound _phys_first dict builder with
+                # block-boundary arithmetic on GPU. Instead of iterating over every
+                # token in logical_id_map (seq_len * num_heads iterations), we sample
+                # only block start positions (num_old_blocks elements) to find each
+                # window's logical ID, then do a tiny [H, curr_k, num_old_blocks]
+                # broadcast match. Zero logic change — same windows, same positions.
+                compressed_len = self.logical_id_map.shape[1]
+                num_old_blocks = max(0, (compressed_len - self.sink_tokens - local_tokens_count) // self.omega)
+                
+                if num_old_blocks > 0:
+                    # Read the logical ID at the first token of each contiguous block
+                    block_start_positions = self.sink_tokens + torch.arange(
+                        num_old_blocks, device=device, dtype=torch.long
+                    ) * self.omega
+                    # block_wids: [num_heads, num_old_blocks] — logical ID of each old block
+                    block_wids = self.logical_id_map[:, block_start_positions]
+                    
+                    # Match final_ids against block_wids: [H, curr_k, num_old_blocks]
+                    # This tensor is tiny: num_heads * curr_k * num_old_blocks (e.g. 8*30*30 = 7200)
+                    match = (block_wids.unsqueeze(1) == final_ids.unsqueeze(2))
+                    found_in_main = match.any(dim=2)        # [H, curr_k] — is window in main cache?
+                    slot_idx = match.to(torch.uint8).argmax(dim=2)  # [H, curr_k] — which old block?
+                    first_phys = self.sink_tokens + slot_idx * self.omega  # physical start position
+                else:
+                    found_in_main = torch.zeros(self.num_heads, curr_k, device=device, dtype=torch.bool)
+                    first_phys = torch.zeros(self.num_heads, curr_k, device=device, dtype=torch.long)
 
                 # Pre-build promoted data lookup: (head, wid_float) → tensor
                 _prom_k = {(_h, int(w)): k for _h in range(self.num_heads) for w, k in promoted_q_data_k[_h]}
@@ -735,14 +739,14 @@ class STICKYKVCache_LayerWise(nn.Module):
                     new_v[0, h, :self.sink_tokens] = past_key_values[1][0, h, :self.sink_tokens]
                     new_logical_id_map[h, :self.sink_tokens] = self.logical_id_map[h, :self.sink_tokens]
                     
-                    # 2. Sticky Zone — O(1) dict lookup replaces per-window nonzero scan
+                    # 2. Sticky Zone — block-boundary lookup replaces per-token iteration
                     for i in range(curr_k):
-                        wid_val = int(final_ids_np[h, i])
+                        wid_val = int(final_ids[h, i].item())
                         new_pos = self.sink_tokens + i * self.omega
 
-                        old_pos = _phys_first.get((h, wid_val))
-                        if old_pos is not None:
-                            # From main cache
+                        if found_in_main[h, i].item():
+                            # From main cache — old_pos computed via block-boundary arithmetic
+                            old_pos = first_phys[h, i].item()
                             new_k[0, h, new_pos:new_pos+self.omega] = past_key_values[0][0, h, old_pos:old_pos+self.omega]
                             new_v[0, h, new_pos:new_pos+self.omega] = past_key_values[1][0, h, old_pos:old_pos+self.omega]
                             new_logical_id_map[h, new_pos:new_pos+self.omega] = int(wid_val)

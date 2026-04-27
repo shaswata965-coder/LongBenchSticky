@@ -3,34 +3,77 @@ import json
 from typing import Dict, Any
 from datasets import Dataset
 
-# Standardized Prompts
-PROMPT_TEMPLATES = {
-    "qa": (
-        "Answer the question directly on the context below. Do NOT explain your reasoning. "
-        "Do NOT say 'According to the text'. Keep the answer under 10 words.\n\n"
-        "Context:\n{context}\n\n"
-        "Question: {input}\n\n"
-        "Answer:"
-    ),
-    "summary": (
-        "You are a helpful assistant. Summarize the following text efficiently.\n\n"
-        "Text:\n{input}\n\n"
-        "Summary:"
-    ),
-    "qmsum": (
-        "You are a helpful assistant. Read the meeting transcript below and write a detailed summary "
-        "specifically answering the following query.\n\n"
-        "Meeting Transcript:\n{context}\n\n"
-        "Query: {input}\n\n"
-        "Summary:"
-    ),
-    "code": (
-        "You are a code completion engine. Continue the code provided below. "
-        "Output ONLY the code continuation. "
-        "Do NOT output markdown backticks (```). "
-        "Do NOT add any explanations or conversational text.\n\n"
-        "{input}"
-    )
+
+context_prompt = {
+    "narrativeqa": "You are given a story, which can be either a novel or a movie script, and a question. Answer the question asconcisely as you can, using a single phrase if possible. Do not provide any explanation.\n\nStory: {context}\n\n",
+    "qasper": "You are given a scientific article and a question. Answer the question as concisely as you can, using a single phrase or sentence if possible. If the question cannot be answered based on the information in the article, write \"unanswerable\". If the question is a yes/no question, answer \"yes\", \"no\", or \"unanswerable\". Do not provide any explanation.\n\nArticle: {context}\n\n",
+    "multifieldqa_en": "Read the following text and answer briefly.\n\n{context}\n\n",
+    "multifieldqa_zh": "阅读以下文字并用中文简短回答：\n\n{context}\n\n",
+    "hotpotqa": "Answer the question based on the given passages. Only give me the answer and do not output any other words.\n\nThe following are given passages.\n{context}\n\n",
+    "2wikimqa": "Answer the question based on the given passages. Only give me the answer and do not output any other words.\n\nThe following are given passages.\n{context}\n\n",
+    "musique": "Answer the question based on the given passages. Only give me the answer and do not output any other words.\n\nThe following are given passages.\n{context}\n\n",
+    "dureader": "请基于给定的文章回答下述问题。\n\n文章：{context}\n\n",
+    "gov_report": "You are given a report by a government agency. Write a one-page summary of the report.\n\nReport:\n{context}\n\n",
+    "qmsum": "You are given a meeting transcript and a query containing a question or instruction. Answer the query in one or more sentences.\n\nTranscript:\n{context}\n\n",
+    "multi_news": "You are given several news passages. Write a one-page summary of all news. \n\nNews:\n{context}\n\n",
+    "vcsum": "下面有一段会议记录，请你阅读后，写一段总结，总结会议的内容。\n会议记录：\n{context}\n\n",
+    "trec": "Please determine the type of the question below. Here are some examples of questions.\n\n{context}\n",
+    "triviaqa": "Answer the question based on the given passage. Only give me the answer and do not output any other words. The following are some examples.\n\n{context}\n\n",
+    "samsum": "Summarize the dialogue into a few short sentences. The following are some examples.\n\n{context}\n\n",
+    "lsht": "请判断给定新闻的类别，下面是一些例子。\n\n{context}\n",
+    "passage_count": "There are some paragraphs below sourced from Wikipedia. Some of them may be duplicates. Please carefully read these paragraphs and determine how many unique paragraphs there are after removing duplicates. In other words, how many non-repeating paragraphs are there in total?\n\n{context}\n\n",
+    "passage_retrieval_en": "Here are 30 paragraphs from Wikipedia, along with an abstract. Please determine which paragraph the abstract is from.\n\n{context}\n\n",
+    "passage_retrieval_zh": "以下是若干段落文字，以及其中一个段落的摘要。请确定给定的摘要出自哪一段。\n\n{context}\n\n",
+    "lcc": "Please complete the code given below. \n{context}",
+    "repobench-p": "Please complete the code given below. \n{context}",
+}
+
+question_prompt = {
+    "narrativeqa": "Now, answer the question based on the story asconcisely as you can, using a single phrase if possible. Do not provide any explanation.\n\nQuestion: {input}\n\nAnswer:",
+    "qasper": "Answer the question based on the above article as concisely as you can, using a single phrase or sentence if possible. If the question cannot be answered based on the information in the article, write \"unanswerable\". If the question is a yes/no question, answer \"yes\", \"no\", or \"unanswerable\". Do not provide any explanation.\n\nQuestion: {input}\n\nAnswer:",
+    "multifieldqa_en": "Now, answer the following question based on the above text, only give me the answer and do not output any other words.\n\nQuestion: {input}\nAnswer:",
+    "multifieldqa_zh": "现在请基于上面的文章回答下面的问题，只告诉我答案，不要输出任何其他字词。\n\n问题：{input}\n回答：",
+    "hotpotqa": "Answer the question based on the given passages. Only give me the answer and do not output any other words.\n\nQuestion: {input}\nAnswer:",
+    "2wikimqa": "Answer the question based on the given passages. Only give me the answer and do not output any other words.\n\nQuestion: {input}\nAnswer:",
+    "musique": "Answer the question based on the given passages. Only give me the answer and do not output any other words.\n\nQuestion: {input}\nAnswer:",
+    "dureader": "请基于上述文章回答下面的问题。\n\n问题：{input}\n回答：",
+    "gov_report": "Now, write a one-page summary of the report.\n\nSummary:",
+    "qmsum": "Now, answer the query based on the above meeting transcript in one or more sentences.\n\nQuery: {input}\nAnswer:",
+    "multi_news": "Now, write a one-page summary of all the news.\n\nSummary:",
+    "vcsum": "会议总结：",
+    "trec": "{input}",
+    "triviaqa": "{input}",
+    "samsum": "{input}",
+    "lsht": "{input}",
+    "passage_count": "Please enter the final count of unique paragraphs after removing duplicates. The output format should only contain the number, such as 1, 2, 3, and so on.\n\nThe final answer is: ",
+    "passage_retrieval_en": "The following is an abstract.\n\n{input}\n\nPlease enter the number of the paragraph that the abstract is from. The answer format must be like \"Paragraph 1\", \"Paragraph 2\", etc.\n\nThe answer is: ",
+    "passage_retrieval_zh": "下面是一个摘要\n\n{input}\n\n请输入摘要所属段落的编号。答案格式必须是\"段落1\"，\"段落2\"等格式\n\n答案是：",
+    "lcc": "Next line of code:\n",
+    "repobench-p": "{input}Next line of code:\n"
+}
+
+max_new_tokens = {
+    "narrativeqa": 128,
+    "qasper": 128,
+    "multifieldqa_en": 64,
+    "multifieldqa_zh": 64,
+    "hotpotqa": 32,
+    "2wikimqa": 32,
+    "musique": 32,
+    "dureader": 128,
+    "gov_report": 512,
+    "qmsum": 512,
+    "multi_news": 512,
+    "vcsum": 512,
+    "trec": 64,
+    "triviaqa": 32,
+    "samsum": 128,
+    "lsht": 64,
+    "passage_count": 32,
+    "passage_retrieval_en": 32,
+    "passage_retrieval_zh": 32,
+    "lcc": 64,
+    "repobench-p": 64
 }
 
 # CONFIG: Context length is now unrestricted for standardized LongBench testing.
@@ -44,7 +87,20 @@ def load_jsonl(path: str) -> Dataset:
     return Dataset.from_list(records)
 
 def load_datasets(root: str) -> Dict[str, Dataset]:
-    names = ["2wikimqa", "qasper", "qmsum", "musique", "multifieldqa_en", "lcc"]
+    names = [
+        # Single-doc QA
+        "narrativeqa", "qasper", "multifieldqa_en", "multifieldqa_zh",
+        # Multi-doc QA
+        "hotpotqa", "2wikimqa", "musique", "dureader",
+        # Summarisation
+        "gov_report", "qmsum", "multi_news", "vcsum",
+        # Few-shot / classification
+        "trec", "triviaqa", "samsum", "lsht",
+        # Synthetic / retrieval
+        "passage_count", "passage_retrieval_en", "passage_retrieval_zh",
+        # Code completion
+        "lcc", "repobench-p",
+    ]
     out = {}
     for n in names:
         p = os.path.join(root, f"{n}.jsonl")
@@ -64,21 +120,7 @@ def build_prompt(example: Dict[str, Any], task: str) -> str:
     ctx = example.get("context") or example.get("document") or ""
     inp = example.get("input") or example.get("question") or ""
 
+    if task not in context_prompt or task not in question_prompt:
+        raise ValueError(f"Unknown task: {task}")
 
-    # 3. Apply Templates
-    if task in ["2wikimqa", "musique", "multifieldqa_en", "qasper", "hotpotqa"]:
-        return PROMPT_TEMPLATES["qa"].format(context=ctx, input=inp)
-    
-    if task == "qmsum":
-        # FIX: Pass BOTH context (transcript) and input (query)
-        return PROMPT_TEMPLATES["qmsum"].format(context=ctx, input=inp)
-        
-    if task == "lcc":
-        # CRITICAL FIX: LCC stores the code in 'context', not 'input'.
-        # We must use 'ctx' as the source for the prompt.
-        code_source = ctx if ctx else inp
-        
-            
-        return PROMPT_TEMPLATES["code"].format(input=code_source)
-
-    raise ValueError(f"Unknown task: {task}")
+    return context_prompt[task].format(context=ctx) + question_prompt[task].format(input=inp)

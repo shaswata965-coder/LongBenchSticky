@@ -190,7 +190,9 @@ class STICKYLlamaAttention(nn.Module):
 
         # 3. Causal Masking
         past_len = past_key_value[0].shape[-2] if past_key_value is not None else 0
-        attention_mask = _make_causal_mask(bsz, q_len, past_len, query_states.dtype, query_states.device)
+        attention_mask = None
+        if q_len == 1:
+            attention_mask = _make_causal_mask(bsz, q_len, past_len, query_states.dtype, query_states.device)
 
         # 4. Rotary Positional Embeddings
         kv_seq_len = key_states.shape[-2] + past_len
@@ -211,7 +213,14 @@ class STICKYLlamaAttention(nn.Module):
 
         # Calculate raw scores (logits) for main cache
         main_logits = torch.matmul(query_states, key_states_rep.transpose(2, 3)) / math.sqrt(self.head_dim)
-        main_logits = main_logits + attention_mask
+        if attention_mask is not None:
+            main_logits = main_logits + attention_mask
+        elif q_len > 1:
+            # Apply causal mask in-place to avoid materializing O(N^2) mask tensor
+            mask_val = torch.finfo(main_logits.dtype).min
+            i_idx = torch.arange(q_len, device=main_logits.device).unsqueeze(1)
+            j_idx = torch.arange(q_len + past_len, device=main_logits.device).unsqueeze(0)
+            main_logits.masked_fill_(i_idx + past_len < j_idx, mask_val)
 
         # --- INT8 Q-CACHE: Joint softmax with dequantized quantized cache ---
         q_scores_for_cache = None

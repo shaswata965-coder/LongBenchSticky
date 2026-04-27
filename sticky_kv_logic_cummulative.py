@@ -608,7 +608,7 @@ class STICKYKVCache_LayerWise(nn.Module):
                 if self.q_windows_count > 0:
                     remaining_scores = competing_scores.clone()
                     remaining_scores.scatter_(1, top_i, float("-inf"))
-                    num_remaining = int((remaining_scores > float("-inf")).sum(dim=1).max().item())
+                    num_remaining = int((remaining_scores > float("-inf")).sum(dim=1).min().item())
                     if num_remaining > 0:
                         q_count = min(self.q_windows_count, num_remaining)
                         q_top_v, q_top_i = torch.topk(remaining_scores, q_count, dim=1, largest=True)
@@ -664,7 +664,7 @@ class STICKYKVCache_LayerWise(nn.Module):
                 # preserved in local_history instead of being wiped by zero_().
                 local_windows = (local_tokens_count + self.omega - 1) // self.omega
 
-                if local_windows > 0:
+                if local_windows > 0 and has_challenger:
                     local_id_start = last_id_val + 1
                     ids = torch.arange(local_id_start, local_id_start + local_windows, device=device, dtype=torch.long)
 
@@ -793,7 +793,7 @@ class STICKYKVCache_LayerWise(nn.Module):
                 
                 new_k = torch.zeros(1, self.num_heads, new_seq_len, head_dim, device=device, dtype=dtype_fp)
                 new_v = torch.zeros(1, self.num_heads, new_seq_len, head_dim, device=device, dtype=dtype_fp)
-                new_logical_id_map = torch.zeros(self.num_heads, new_seq_len, device=device, dtype=torch.float32)
+                new_logical_id_map = torch.zeros(self.num_heads, new_seq_len, device=device, dtype=torch.long)
 
                 # To support token ledger:
                 mapping = torch.full((self.num_heads, seq_len), -1.0, device=device, dtype=torch.float32)
@@ -816,14 +816,14 @@ class STICKYKVCache_LayerWise(nn.Module):
                             _phys_first[(_h, _w)] = _first_pos[_w]
 
                 # Pre-build promoted data lookup: (head, wid_float) → tensor
-                _prom_k = {(_h, float(w)): k for _h in range(self.num_heads) for w, k in promoted_q_data_k[_h]}
-                _prom_v = {(_h, float(w)): v for _h in range(self.num_heads) for w, v in promoted_q_data_v[_h]}
+                _prom_k = {(_h, int(w)): k for _h in range(self.num_heads) for w, k in promoted_q_data_k[_h]}
+                _prom_v = {(_h, int(w)): v for _h in range(self.num_heads) for w, v in promoted_q_data_v[_h]}
 
                 # Precompute local logical IDs vector (same for all heads)
                 _local_lids = None
-                if local_tokens_count > 0:
-                    _offsets = torch.arange(local_tokens_count, device=device, dtype=torch.float32)
-                    _local_lids = float(last_id_val + 1) + (_offsets // self.omega)
+                if local_tokens_count > 0 and has_challenger:
+                    _offsets = torch.arange(local_tokens_count, device=device, dtype=torch.long)
+                    _local_lids = (last_id_val + 1) + (_offsets // self.omega)
 
                 final_ids_list = final_ids.tolist()
 
@@ -836,7 +836,7 @@ class STICKYKVCache_LayerWise(nn.Module):
                     
                     # 2. Sticky Zone — O(1) dict lookup replaces per-window nonzero scan
                     for i in range(curr_k):
-                        wid = float(final_ids_list[h][i])
+                        wid = int(final_ids_list[h][i])
                         new_pos = self.sink_tokens + i * self.omega
 
                         old_pos = _phys_first.get((h, wid))
@@ -993,7 +993,7 @@ class STICKYKVCache_LayerWise(nn.Module):
         q_loser_ids = None
         q_loser_scores = None
         if self.q_windows_count > 0:
-            total_valid = int(valid_mask.sum(dim=1).max().item())
+            total_valid = int(valid_mask.sum(dim=1).min().item())
             num_losers = total_valid - curr_k
             if num_losers > 0:
                 loser_scores = scores.clone()
@@ -1020,10 +1020,15 @@ class STICKYKVCache_LayerWise(nn.Module):
         
         sinks = self.sink_indices.unsqueeze(0).expand(self.num_heads, -1)
         
-        sticky_w = torch.nan_to_num(
-            self.window_scores[:, : self.k_windows, 1], nan=0.0
-        ).long()
-        window_tokens = self.window_to_token_map[sticky_w].view(self.num_heads, -1)
+        # FIX (Bug 1): Only map genuinely valid (non-NaN) window score entries.
+        # NaN→0 conversion previously resurrected evicted window-0 tokens.
+        raw_w = self.window_scores[:, :self.k_windows, 1]
+        valid_w_mask = ~torch.isnan(raw_w)
+        sticky_w = torch.where(valid_w_mask, raw_w.long(), torch.zeros_like(raw_w, dtype=torch.long))
+        all_window_tokens = self.window_to_token_map[sticky_w]  # [H, k_windows, omega]
+        # Zero out tokens from invalid (NaN) slots so they don't enter the survivor set
+        all_window_tokens = all_window_tokens * valid_w_mask.unsqueeze(-1).long()
+        window_tokens = all_window_tokens.view(self.num_heads, -1)
         
         local_start = local_start_idx
         if local_start < seq_len:
@@ -1072,10 +1077,12 @@ class STICKYKVCache_LayerWise(nn.Module):
         # Reserve a portion of the total budget for int8-quantized evicted tokens
         self.q_num = (total_token_budget * self.q_ratio) // 100
         
-        # Int8 compression: ~2x more windows fit in the same memory budget
-        fp16_bytes = 4 * self.head_dim
-        int8_bytes = 2 * self.head_dim + 4  # +4 for V per-token scale/zp
-        compression_ratio = fp16_bytes / int8_bytes
+        # Int8 compression: ~2x more windows fit
+        # FIX (Bug 3): omega is a token-count, not a byte overhead.
+        # INT8 uses 1 byte per element vs bf16's 2 bytes per element.
+        bf16_bytes = 2 * self.head_dim
+        int8_bytes = self.head_dim  # 1 byte per element for INT8
+        compression_ratio = bf16_bytes / int8_bytes
         effective_q_tokens = int(self.q_num * compression_ratio)
         self.q_windows_count = effective_q_tokens // self.omega
         

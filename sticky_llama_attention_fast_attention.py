@@ -293,7 +293,7 @@ class STICKYLlamaAttention(nn.Module):
             main_logits = main_logits + attention_mask
 
             q_scores_for_cache = None
-            if hasattr(self.kv_cache, 'q_cache_k_int8') and self.kv_cache.q_cache_k_int8 is not None:
+            if q_len == 1 and hasattr(self.kv_cache, 'q_cache_k_int8') and self.kv_cache.q_cache_k_int8 is not None:
                 # Dequantize on the fly — q-cache is [H, W, omega, D]
                 q_k = self.kv_cache._dequantize_from_int8(
                     self.kv_cache.q_cache_k_int8, self.kv_cache.q_cache_k_scale, self.kv_cache.q_cache_k_zp)

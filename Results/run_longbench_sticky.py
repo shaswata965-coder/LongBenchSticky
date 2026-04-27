@@ -14,7 +14,7 @@ from sticky_llama_model import STICKYLlamaForCausalLM
 from configuration_sticky_llama import LlamaConfig
 
 def main():
-    print(f"Loading StickyLlama (Custom Cumulative Logic) from {config.MODEL_PATH}...")
+    print(f"Loading StickyLlama (Fast Attention v2) from {config.MODEL_PATH}...")
     
     # Load Sticky LLaMA
     try:

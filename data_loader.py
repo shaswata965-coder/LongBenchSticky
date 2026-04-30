@@ -87,7 +87,20 @@ def load_jsonl(path: str) -> Dataset:
     return Dataset.from_list(records)
 
 def load_datasets(root: str) -> Dict[str, Dataset]:
-    names = ["2wikimqa", "qasper", "qmsum", "musique", "multifieldqa_en", "lcc"]
+    names = [
+        # Single-doc QA
+        "narrativeqa", "qasper", "multifieldqa_en", "multifieldqa_zh",
+        # Multi-doc QA
+        "hotpotqa", "2wikimqa", "musique", "dureader",
+        # Summarisation
+        "gov_report", "qmsum", "multi_news", "vcsum",
+        # Few-shot / classification
+        "trec", "triviaqa", "samsum", "lsht",
+        # Synthetic / retrieval
+        "passage_count", "passage_retrieval_en", "passage_retrieval_zh",
+        # Code completion
+        "lcc", "repobench-p",
+    ]
     out = {}
     for n in names:
         p = os.path.join(root, f"{n}.jsonl")

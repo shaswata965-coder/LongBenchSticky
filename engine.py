@@ -2,7 +2,6 @@ import time
 import sticky_config as config
 import torch
 import gc
-import re
 import numpy as np
 from typing import Dict, Any, List
 
@@ -40,6 +39,10 @@ dataset2metric = {
 
 # Tasks where the model tends to generate multi-line chat; score only line 0.
 _FIRST_LINE_TASKS = {"trec", "triviaqa", "samsum", "lsht"}
+
+# Tasks that need raw completion (no chat template, no BOS token) -- matches DefensiveKV
+_RAW_COMPLETION_TASKS = {"trec", "triviaqa", "samsum", "lsht", "lcc", "repobench-p"}
+
 
 
 # =============================================================================
@@ -84,28 +87,6 @@ def get_all_classes(ex: Dict[str, Any]) -> Any:
     return ex.get("all_classes", None)
 
 
-# =============================================================================
-# Answer-span extraction  (QA chattiness mitigation)
-# =============================================================================
-
-def extract_answer_span(prediction: str, references: List[str]) -> str:
-    """
-    'Answer Inclusion' heuristic:
-    If the normalised reference appears within the normalised prediction we
-    return the reference verbatim so the metric awards full credit.
-    If no reference is found we return the full prediction so the metric can
-    penalise the wrong answer.
-    """
-    pred_norm = metrics.normalize_answer(prediction)
-
-    for ref in references:
-        ref_norm = metrics.normalize_answer(ref)
-        if len(ref_norm) < 3:          # skip trivially short / empty answers
-            continue
-        if ref_norm in pred_norm:
-            return ref                 # model found the right answer
-
-    return prediction                  # model is wrong — let the metric penalise it
 
 
 # =============================================================================
@@ -202,17 +183,20 @@ def generate(prompt, model, tokenizer, device, refs=None, task=None, **kwargs):
     """
     Run one forward pass through the model and return the decoded text plus
     performance counters (token count, wall-clock time, peak VRAM).
-
-    Applies dataset-specific post-processing before returning:
-      • lcc          → strip Markdown fences / chatty prefixes from code
-      • QA tasks     → extract the answer span (answer-inclusion heuristic)
-      • everything else → raw decoded text
+    No output post-processing -- raw decoded text is returned directly,
+    matching DefensiveKV's pipeline.
     """
-    messages = [{"role": "user", "content": prompt}]
-    formatted_prompt = tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True
-    )
-    inputs = tokenizer(formatted_prompt, return_tensors="pt").to(device)
+    if task in _RAW_COMPLETION_TASKS:
+        old_bos = tokenizer.bos_token
+        tokenizer.bos_token = ""
+        inputs = tokenizer(prompt, return_tensors="pt").to(device)
+        tokenizer.bos_token = old_bos
+    else:
+        messages = [{"role": "user", "content": prompt}]
+        formatted_prompt = tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+        inputs = tokenizer(formatted_prompt, return_tensors="pt").to(device)
 
     if device == "cuda":
         torch.cuda.reset_peak_memory_stats()
@@ -237,6 +221,11 @@ def generate(prompt, model, tokenizer, device, refs=None, task=None, **kwargs):
     gen_kwargs.update(kwargs)
     gen_kwargs.setdefault("pad_token_id", tokenizer.eos_token_id)
 
+    # DefensiveKV-style: stop samsum generation at newline (single-line summary)
+    if task == "samsum":
+        nl_token_id = tokenizer.encode("\n", add_special_tokens=False)[-1]
+        gen_kwargs["eos_token_id"] = [tokenizer.eos_token_id, nl_token_id]
+
     start = time.perf_counter()
     with torch.no_grad():
         out = model.generate(
@@ -252,18 +241,7 @@ def generate(prompt, model, tokenizer, device, refs=None, task=None, **kwargs):
     gen_tokens = out.shape[1] - input_len
     raw_text   = tokenizer.decode(out[0][input_len:], skip_special_tokens=True)
 
-    # ------------------------------------------------------------------
-    # Dataset-specific post-processing
-    # ------------------------------------------------------------------
-    if task == "lcc":
-        # Strip Markdown fences and chatty prefixes from generated code
-        clean_text = metrics.clean_code_output(raw_text)
-    elif refs:
-        # QA: attempt to extract the exact answer span
-        clean_text = extract_answer_span(raw_text, refs)
-    else:
-        clean_text = raw_text
-    # ------------------------------------------------------------------
+    clean_text = raw_text
 
     peak_mem = torch.cuda.max_memory_allocated() if device == "cuda" else 0
 

@@ -22,10 +22,18 @@ from scipy import stats
 from collections import Counter
 from typing import Dict, List
 
-import jieba
 from fuzzywuzzy import fuzz
 from rouge import Rouge
-from rouge_score import rouge_scorer as _rouge_scorer
+
+try:
+    import jieba
+except ImportError:
+    jieba = None
+
+try:
+    from rouge_score import rouge_scorer as _rouge_scorer
+except ImportError:
+    _rouge_scorer = None
 
 # =============================================================================
 # 2. Text Normalisation  (identical to official LongBench)
@@ -123,7 +131,7 @@ def rouge_zh_score(prediction, ground_truth, **kwargs):
 
 def classification_score(prediction, ground_truth, **kwargs):
     em_match_list = []
-    all_classes = kwargs["all_classes"]
+    all_classes = kwargs.get("all_classes") or []
     for class_name in all_classes:
         if class_name in prediction:
             em_match_list.append(class_name)
@@ -175,15 +183,16 @@ def count_score(prediction, ground_truth, **kwargs):
 
 def code_sim_score(prediction, ground_truth, **kwargs):
     """
-    Edit Similarity for code generation (lcc / repobench-p).
-    Uses difflib.SequenceMatcher for strict character-level sensitivity.
+    Code similarity for lcc / repobench-p.
+    Matches DefensiveKV: extract first non-comment/non-backtick line, then fuzz.ratio.
     """
-    if not prediction and not ground_truth:
-        return 1.0
-    if not prediction or not ground_truth:
-        return 0.0
-    matcher = difflib.SequenceMatcher(None, prediction, ground_truth)
-    return matcher.ratio()
+    all_lines = prediction.lstrip('\n').split('\n')
+    prediction = ""
+    for line in all_lines:
+        if ('`' not in line) and ('#' not in line) and ('//' not in line):
+            prediction = line
+            break
+    return fuzz.ratio(prediction, ground_truth) / 100
 
 
 # =============================================================================
@@ -191,7 +200,7 @@ def code_sim_score(prediction, ground_truth, **kwargs):
 # =============================================================================
 
 # Initialise the multi-metric ROUGE scorer once at module load.
-_rouge_multi = _rouge_scorer.RougeScorer(["rouge1", "rouge2", "rougeL"], use_stemmer=True)
+_rouge_multi = _rouge_scorer.RougeScorer(["rouge1", "rouge2", "rougeL"], use_stemmer=True) if _rouge_scorer else None
 
 
 def qa_metrics(pred: str, refs: List[str]) -> Dict[str, float]:

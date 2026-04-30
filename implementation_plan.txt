@@ -1,0 +1,64 @@
+# Diagnosis: Few-Shot Learning Degradation in Sticky Cumulative Logic
+
+## 1. The Root Cause: Causal Prefill Accumulation Bias
+
+The performance degradation in few-shot learning tasks (e.g., TREC, TriviaQA) is caused by a strict mathematical bias in how the **Cumulative Attention Score** is calculated during the prefill stage. 
+
+Because the model uses a causal attention mask (`_make_causal_mask`), tokens appearing earlier in the sequence naturally have a massively larger pool of future queries that attend to them compared to tokens appearing later. The cumulative logic directly sums these attention probabilities, heavily inflating the scores of early tokens.
+
+## 2. Code Evidence
+
+In `sticky_kv_logic_cummulative.py`, during the prefill phase, the absolute sum of attention is calculated across the query dimension (`dim=1`):
+
+```python
+# Lines 362-368 in sticky_kv_logic_cummulative.py
+full_scores_slice = attn_score_cache[0, :, :seq_len, self.sink_tokens:actual_full_review]
+full_obs_sum = full_scores_slice.sum(dim=1)
+full_win_scores = (
+    full_obs_sum.view(self.num_heads, total_prompt_windows, self.omega)
+    .sum(dim=2)
+    .to(dtype=torch.float32)
+)
+```
+
+**The Mathematical Reality:**
+- `attn_score_cache[0, h, i, j]` is `0` for any query `i < j` due to the causal mask.
+- Therefore, the sum for a token at position `j` is exactly: \sum_{i=j}^{seq\_len-1} \text{Attn}(i \to j).
+- For an early token (`j \approx 0`), this sum includes up to `seq_len` terms.
+- For a late token (`j \approx seq\_len - 1`), this sum includes only `1` term.
+
+## 3. Why This Breaks Few-Shot Learning Specifically
+
+In a few-shot prompt, independent examples are concatenated sequentially:
+`[Shot 1] ... [Shot K-1] [Shot K] [Target Query]`
+
+1. **Massive Score for Shot 1:** Tokens in `Shot 1` are attended to by all subsequent shots. Their `window_scores` become permanently inflated.
+2. **Tiny Score for Shot K:** Tokens in the most recent (and contextually most relevant) examples like `Shot K` are only attended to by the target query. Their prefill score stored in `local_history` is mathematically minuscule.
+3. **The Eviction Slaughter:** When generation progresses and `Shot K` exits the local protected zone, it becomes the `Challenger`. It enters the Top-K competition against `Shot 1`:
+   ```python
+   # Line 584: Competing a tiny Challenger against a massive Old Window
+   competing_scores = torch.cat([old_scores, new_w_total_scores.unsqueeze(1)], dim=1)
+   ```
+   Because `Shot K` has a fraction of the cumulative history of `Shot 1`, it is immediately evicted. 
+
+**Result:** The cache systematically purges the recent few-shot examples that demonstrate the exact format needed for the target query, effectively reducing the prompt to a 1-shot scenario containing only the oldest, least relevant example. (In standard Single-Doc QA, this bias actually *helps* by anchoring the core document, which is why other LongBench tasks perform well).
+
+---
+
+## Open Questions & Proposed Fixes
+
+To resolve this, we need to alter how scores are tracked so that early tokens do not have a permanent, insurmountable mathematical advantage. 
+
+Please review the following architectural options and let me know which path you prefer to implement:
+
+### Option A: Causal Score Normalization (Safest / Simplest)
+We normalize the prefill attention sum by the number of queries that were actually mathematically capable of attending to the token. 
+- **Implementation:** Multiply the raw prefill scores by a scaling factor proportional to the causal disadvantage, or divide by `(seq_len - j)`. This levels the playing field so `Shot K` and `Shot 1` start with comparable baseline importance before generation votes accumulate.
+
+### Option B: Exponential Moving Average / Leaky Accumulator (Dynamic)
+Instead of infinite accumulation (`old_scores = old_scores_hist + old_w_gen_scores`), we decay the historical scores slightly at each eviction cycle (e.g., `old_scores = (old_scores_hist * 0.9) + old_w_gen_scores`).
+- **Implementation:** This ensures that ancient tokens must continue to prove their worth during generation, allowing recent highly-relevant context to survive.
+
+### Option C: Fixed Observation Window
+Stop accumulating all historical prefill. Instead, score windows based *only* on the attention they received from the last N tokens (e.g., the last 1024 tokens).
+- **Implementation:** Requires a rolling buffer of attention matrices, shifting the definition of "Sticky" from "All-time High Score" to "Currently Trending".

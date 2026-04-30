@@ -42,9 +42,6 @@ class Llama3RotaryEmbedding(nn.Module):
         self.max_seq_len_cached = seq_len
         t = torch.arange(self.max_seq_len_cached, device=device, dtype=self.inv_freq.dtype)
 
-        low_freq_wavelen = self.original_max_position_embeddings / self.low_freq_factor
-        high_freq_wavelen = self.original_max_position_embeddings / self.high_freq_factor
-
         inv_freq = self.inv_freq
         
         # Calculate wavelengths
@@ -205,10 +202,6 @@ class STICKYLlamaAttention(nn.Module):
 
         past_key_value = (key_states, value_states) if use_cache else None
 
-        # 6. Multi-Head / Grouped-Query Attention
-        key_states_rep = repeat_kv(key_states, self.num_key_value_groups)
-        value_states_rep = repeat_kv(value_states, self.num_key_value_groups)
-
         if q_len > 1:
             # --- EXPLICIT FLASH ATTENTION V2.0 FOR PREFILL (PROMPT) ---
             
@@ -233,8 +226,11 @@ class STICKYLlamaAttention(nn.Module):
             attn_weights_return = None
 
             # --- 2. Chunked Tracking Scores for Cache Eviction ---
+            # FIX A+E+F: Use un-repeated key_states with grouped matmul to avoid
+            # materializing key_states_rep (~134MB/layer). Reuse attn_chunk variable
+            # to prevent simultaneous attn_chunk + attn_probs allocation.
             chunk_size = 512
-            kv_seq_len_full = key_states_rep.shape[-2]
+            kv_seq_len_full = key_states.shape[-2]
             
             # Accumulated scores format: [bsz, num_key_value_heads, kv_seq_len]
             accumulated_scores = torch.zeros(
@@ -246,6 +242,9 @@ class STICKYLlamaAttention(nn.Module):
             # Pre-generate key indices for dynamic mask chunking
             k_indices = torch.arange(kv_seq_len_full, device=query_states.device).unsqueeze(0)  # [1, kv_seq_len]
 
+            # Pre-transpose keys once: [bsz, kv_heads, head_dim, kv_seq_len]
+            key_states_t = key_states.transpose(-2, -1)
+
             for i in range(0, q_len, chunk_size):
                 chunk_len = min(chunk_size, q_len - i)
                 q_chunk = query_states[:, :, i:i+chunk_len, :]
@@ -253,33 +252,47 @@ class STICKYLlamaAttention(nn.Module):
                 # Dynamically construct the causal mask block for this specific chunk (O(N) memory rather than O(N^2))
                 q_indices = torch.arange(i, i + chunk_len, device=query_states.device).unsqueeze(1)  # [chunk_len, 1]
                 # mask_chunk is causal: valid where key_idx <= query_idx + past_len
-                mask_chunk = torch.where(
-                    k_indices <= (q_indices + past_len),
-                    0.0,
-                    torch.finfo(query_states.dtype).min
-                ).to(query_states.dtype)
+                mask_chunk = torch.full(
+                    (chunk_len, kv_seq_len_full), torch.finfo(query_states.dtype).min,
+                    device=query_states.device, dtype=query_states.dtype
+                )
+                mask_chunk.masked_fill_(k_indices <= (q_indices + past_len), 0.0)
                 
                 # Expand mask to match attention chunk [1, 1, chunk_len, kv_seq_len]
                 mask_chunk = mask_chunk.unsqueeze(0).unsqueeze(0)
                 
-                # Raw scores for chunk
-                attn_chunk = torch.matmul(q_chunk, key_states_rep.transpose(2, 3)) / math.sqrt(self.head_dim)
-                attn_chunk = attn_chunk + mask_chunk
-                
-                # Softmax
-                attn_probs = torch.softmax(attn_chunk.to(torch.float32), dim=-1).to(query_states.dtype)
-                
-                # Memory Optimization: Grouped-Query Aggregation
+                # FIX A+E+F: Grouped matmul with un-repeated keys.
+                # Reshape queries [bsz, num_heads, chunk, D] → [bsz, kv_heads, groups, chunk, D]
+                # Matmul broadcasts key_states_t over the group dim (no copy).
+                # Softmax is per-row so group-then-softmax == softmax-then-group.
                 if self.num_heads != self.num_key_value_heads:
-                    scores_for_cache_chunk = attn_probs.view(
-                        bsz, self.num_key_value_heads, self.num_key_value_groups, q_chunk.size(2), -1
-                    ).mean(dim=2)
+                    q_grouped = q_chunk.view(
+                        bsz, self.num_key_value_heads, self.num_key_value_groups,
+                        chunk_len, self.head_dim
+                    )
+                    # [bsz, kv_heads, groups, chunk, D] x [bsz, kv_heads, 1, D, kv_len]
+                    # → [bsz, kv_heads, groups, chunk, kv_len]
+                    attn_chunk = torch.matmul(
+                        q_grouped, key_states_t.unsqueeze(2)
+                    ) / math.sqrt(self.head_dim)
+                    attn_chunk = attn_chunk + mask_chunk
+                    # Softmax per-head per-query position (dim=-1 = kv_seq_len)
+                    attn_chunk = torch.softmax(attn_chunk.to(torch.float32), dim=-1).to(query_states.dtype)
+                    # Average across query head groups → [bsz, kv_heads, chunk, kv_len]
+                    scores_for_cache_chunk = attn_chunk.mean(dim=2)
                 else:
-                    scores_for_cache_chunk = attn_probs
+                    attn_chunk = torch.matmul(
+                        q_chunk, key_states_t
+                    ) / math.sqrt(self.head_dim)
+                    attn_chunk = attn_chunk + mask_chunk
+                    attn_chunk = torch.softmax(attn_chunk.to(torch.float32), dim=-1).to(query_states.dtype)
+                    scores_for_cache_chunk = attn_chunk
                 
                 # We need the sum over the q_len (which is dim=2 for scores_for_cache_chunk)
                 accumulated_scores += scores_for_cache_chunk.sum(dim=2).to(torch.float32)
+                del attn_chunk, scores_for_cache_chunk
 
+            del key_states_t
             # Re-expand accumulation back to [bsz, heads, 1, kv_seq_len] so logic doesn't crash on dim count
             # since historically it expects a 4D tensor where dim=2 is q_len. Here q_len acts as "1" accumulated metric.
             accumulated_scores = accumulated_scores.unsqueeze(2)
@@ -289,6 +302,10 @@ class STICKYLlamaAttention(nn.Module):
             
         else:
             # --- STANDARD ATTENTION FOR GENERATION (DECODING) ---
+            # 6. Multi-Head / Grouped-Query Attention (only needed for generation)
+            key_states_rep = repeat_kv(key_states, self.num_key_value_groups)
+            value_states_rep = repeat_kv(value_states, self.num_key_value_groups)
+
             main_logits = torch.matmul(query_states, key_states_rep.transpose(2, 3)) / math.sqrt(self.head_dim)
             main_logits = main_logits + attention_mask
 

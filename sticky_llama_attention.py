@@ -44,9 +44,6 @@ class Llama3RotaryEmbedding(nn.Module):
         self.max_seq_len_cached = seq_len
         t = torch.arange(self.max_seq_len_cached, device=device, dtype=self.inv_freq.dtype)
 
-        low_freq_wavelen = self.original_max_position_embeddings / self.low_freq_factor
-        high_freq_wavelen = self.original_max_position_embeddings / self.high_freq_factor
-
         inv_freq = self.inv_freq
         
         # Calculate wavelengths

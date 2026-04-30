@@ -314,7 +314,7 @@ class STICKYKVCache_LayerWise(nn.Module):
             # Seed local_history from full prefill attention (cumulative scores so far).
             # Everything currently in the "Local Zone" will at some point roll over to the "Evictable Zone"
             # It inherently needs the mass of the prompt to be fair for eviction decisions.
-            self.local_history.zero_()
+            # local_history is already zeroed by _clean_scores between documents
             total_prompt_windows = max(0, (seq_len - self.sink_tokens) // self.omega)
             if total_prompt_windows > 0:
                 full_review_end = self.sink_tokens + total_prompt_windows * self.omega
@@ -386,7 +386,7 @@ class STICKYKVCache_LayerWise(nn.Module):
             self.tokens_since_last_review += 1
             
             # Accumulate q-cache attention scores from joint softmax
-            if q_attn_scores is not None and self.q_cache_scores is not None:
+            if q_attn_scores is not None and self.q_cache_scores is not None and self.q_cache_ids is not None:
                 q_per_token = q_attn_scores[0, :, 0, :]
                 q_tokens_total = self.q_cache_ids.shape[1] * self.omega
                 if q_per_token.shape[1] >= q_tokens_total:
@@ -607,35 +607,69 @@ class STICKYKVCache_LayerWise(nn.Module):
                     new_v_scale = torch.zeros(self.num_heads, new_q_count, self.omega, 1, device=device, dtype=dtype_fp)
                     new_v_zp = torch.zeros(self.num_heads, new_q_count, self.omega, 1, device=device, dtype=dtype_fp)
                     
-                    # OPT (Change 3): Replace .cpu().numpy() comparisons with GPU-native operations
-                    # Semantically identical: same retained/not-retained routing, just stays on GPU
-                    for qi in range(new_q_count):
-                        for h in range(self.num_heads):
-                            wid_val = float(new_q_loser_ids[h, qi].item())
-                            retained = False
-                            if self.q_cache_ids is not None:
-                                q_match = (self.q_cache_ids[h] == wid_val).nonzero(as_tuple=True)[0]
-                                if len(q_match) > 0:
-                                    old_qi = q_match[0].item()
-                                    new_k_int8[h, qi] = self.q_cache_k_int8[h, old_qi]
-                                    new_v_int8[h, qi] = self.q_cache_v_int8[h, old_qi]
-                                    new_k_scale[h, qi] = self.q_cache_k_scale[h, old_qi]
-                                    new_k_zp[h, qi] = self.q_cache_k_zp[h, old_qi]
-                                    new_v_scale[h, qi] = self.q_cache_v_scale[h, old_qi]
-                                    new_v_zp[h, qi] = self.q_cache_v_zp[h, old_qi]
-                                    retained = True
-                            if not retained:
-                                phys_positions = (self.logical_id_map[h] == wid_val).nonzero(as_tuple=True)[0]
-                                if len(phys_positions) >= self.omega:
-                                    phys_positions = phys_positions[:self.omega]
-                                    phys_idx = phys_positions.clamp(0, seq_len - 1)
-                                    k_fp = past_key_values[0][0, h, phys_idx]
-                                    v_fp = past_key_values[1][0, h, phys_idx]
+                    # FIX B: Vectorized q-cache rebuild — eliminates O(H × q_count) Python
+                    # loop and .item() CPU syncs. Three routing paths preserved:
+                    # A) RETAINED: was in old q-cache, copy raw int8 directly
+                    # B) FRESH from main cache: gather via block-boundary arithmetic
+                    # C) ARCHIVED meta: per-element fallback (rare, typically 0-3 items)
+                    
+                    # --- Path A: Batch-identify retained windows ---
+                    if self.q_cache_ids is not None:
+                        # retained_mask: [H, new_q_count, old_q_count] — True where IDs match
+                        retained_match = (new_q_loser_ids.unsqueeze(2) == self.q_cache_ids.unsqueeze(1))  # [H, new, old]
+                        retained_any = retained_match.any(dim=2)  # [H, new_q_count] — is this slot retained?
+                        # For retained slots, find which old slot they came from
+                        retained_old_idx = retained_match.to(torch.uint8).argmax(dim=2)  # [H, new_q_count]
+                        
+                        # Batch copy for all retained slots using advanced indexing
+                        h_idx = torch.arange(self.num_heads, device=device).unsqueeze(1).expand_as(retained_old_idx)
+                        # Only copy where retained_any is True
+                        if retained_any.any():
+                            new_k_int8[retained_any] = self.q_cache_k_int8[h_idx[retained_any], retained_old_idx[retained_any]]
+                            new_v_int8[retained_any] = self.q_cache_v_int8[h_idx[retained_any], retained_old_idx[retained_any]]
+                            new_k_scale[retained_any] = self.q_cache_k_scale[h_idx[retained_any], retained_old_idx[retained_any]]
+                            new_k_zp[retained_any] = self.q_cache_k_zp[h_idx[retained_any], retained_old_idx[retained_any]]
+                            new_v_scale[retained_any] = self.q_cache_v_scale[h_idx[retained_any], retained_old_idx[retained_any]]
+                            new_v_zp[retained_any] = self.q_cache_v_zp[h_idx[retained_any], retained_old_idx[retained_any]]
+                    else:
+                        retained_any = torch.zeros(self.num_heads, new_q_count, device=device, dtype=torch.bool)
+                    
+                    # --- Paths B+C: Handle non-retained windows ---
+                    not_retained = ~retained_any  # [H, new_q_count]
+                    if not_retained.any():
+                        # Use block-boundary arithmetic (same as physical eviction L708-724)
+                        # to find physical positions in main cache
+                        compressed_len = self.logical_id_map.shape[1]
+                        num_old_blocks = max(0, (compressed_len - self.sink_tokens - self._dynamic_local_count) // self.omega)
+                        
+                        if num_old_blocks > 0:
+                            block_starts = self.sink_tokens + torch.arange(num_old_blocks, device=device, dtype=torch.long) * self.omega
+                            block_wids = self.logical_id_map[:, block_starts]  # [H, num_old_blocks]
+                        
+                        for qi in range(new_q_count):
+                            for h in range(self.num_heads):
+                                if retained_any[h, qi]:
+                                    continue  # Already handled by Path A
+                                
+                                wid_val = int(new_q_loser_ids[h, qi].item())
+                                
+                                # Find physical position via block-boundary arithmetic
+                                if num_old_blocks > 0:
+                                    block_match = (block_wids[h] == wid_val).nonzero(as_tuple=True)[0]
+                                    if len(block_match) > 0:
+                                        old_pos = block_starts[block_match[0]].item()
+                                        phys_idx = torch.arange(old_pos, old_pos + self.omega, device=device).clamp(0, seq_len - 1)
+                                        k_fp = past_key_values[0][0, h, phys_idx]
+                                        v_fp = past_key_values[1][0, h, phys_idx]
+                                    else:
+                                        k_fp = torch.zeros(self.omega, head_dim, device=device, dtype=dtype_fp)
+                                        v_fp = torch.zeros(self.omega, head_dim, device=device, dtype=dtype_fp)
                                 else:
                                     k_fp = torch.zeros(self.omega, head_dim, device=device, dtype=dtype_fp)
                                     v_fp = torch.zeros(self.omega, head_dim, device=device, dtype=dtype_fp)
                                 
-                                meta = self.q_retired_meta.get((wid_val, h))
+                                # Path C: Check for archived scale/zp metadata
+                                meta = self.q_retired_meta.get((float(wid_val), h))
                                 if meta is not None:
                                     ks = meta['k_scale'].to(device)
                                     kz = meta['k_zp'].to(device)
@@ -650,6 +684,7 @@ class STICKYKVCache_LayerWise(nn.Module):
                                     new_v_scale[h, qi] = vs.squeeze(0)
                                     new_v_zp[h, qi] = vz.squeeze(0)
                                 else:
+                                    # Path B: Fresh per-window quantization
                                     k_4d = k_fp.unsqueeze(0).unsqueeze(0)
                                     v_4d = v_fp.unsqueeze(0).unsqueeze(0)
                                     kq, ks, kz = self._quantize_k_per_window(k_4d)
@@ -952,12 +987,13 @@ class STICKYKVCache_LayerWise(nn.Module):
         effective_q_tokens = int(self.q_num * compression_ratio)
         self.q_windows_count = effective_q_tokens // self.omega
         
-        available_sticky_tokens = total_token_budget - self.local_num - self.sink_tokens - self.q_num
+        available_sticky_tokens = total_token_budget - self.local_num - self.sink_tokens - effective_q_tokens
         self.k_windows = max(0, available_sticky_tokens // self.omega)
 
     def _clean_scores(self):
         # Hard resets for cross-document isolation
         self.gen_step = self.num_of_tokens_without_eviction = 0
+        self.k_windows = 3  # Reset to constructor default
         self.tokens_since_last_review = 0
         if hasattr(self, "running_attention_votes"):
             self.running_attention_votes.zero_()

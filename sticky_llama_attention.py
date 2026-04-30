@@ -205,11 +205,15 @@ class STICKYLlamaAttention(nn.Module):
         past_key_value = (key_states, value_states) if use_cache else None
 
         # 6. Multi-Head / Grouped-Query Attention
-        key_states_rep = repeat_kv(key_states, self.num_key_value_groups)
-        value_states_rep = repeat_kv(value_states, self.num_key_value_groups)
+        if self.num_heads != self.num_key_value_heads:
+            q_grouped = query_states.reshape(
+                bsz, self.num_key_value_heads, self.num_key_value_groups, q_len, self.head_dim
+            )
+            main_logits = torch.matmul(q_grouped, key_states.transpose(2, 3).unsqueeze(2)) / math.sqrt(self.head_dim)
+            main_logits = main_logits.reshape(bsz, self.num_heads, q_len, -1)
+        else:
+            main_logits = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
 
-        # Calculate raw scores (logits) for main cache
-        main_logits = torch.matmul(query_states, key_states_rep.transpose(2, 3)) / math.sqrt(self.head_dim)
         if attention_mask is not None:
             main_logits = main_logits + attention_mask
         elif q_len > 1:
@@ -228,15 +232,22 @@ class STICKYLlamaAttention(nn.Module):
                 self.kv_cache.q_cache_k_quant, self.kv_cache.q_cache_k_scale, self.kv_cache.q_cache_k_zp, self.kv_cache.quant_bit_width)
             q_v = self.kv_cache._dequantize_from_quant(
                 self.kv_cache.q_cache_v_quant, self.kv_cache.q_cache_v_scale, self.kv_cache.q_cache_v_zp, self.kv_cache.quant_bit_width)
+            
             # Flatten W*omega → total_tokens: [H, W*omega, D]
             H, W, omega, D = q_k.shape
-            q_k = q_k.reshape(H, W * omega, D)
-            q_v = q_v.reshape(H, W * omega, D)
-            # Add batch dim + repeat for GQA
-            q_k_rep = repeat_kv(q_k.unsqueeze(0), self.num_key_value_groups)
-            q_v_rep = repeat_kv(q_v.unsqueeze(0), self.num_key_value_groups)
-            q_logits = torch.matmul(query_states, q_k_rep.transpose(2, 3)) / math.sqrt(self.head_dim)
-            # No causal mask needed — all q-cache tokens are in the past
+            q_k = q_k.reshape(H, W * omega, D).unsqueeze(0)
+            q_v = q_v.reshape(H, W * omega, D).unsqueeze(0)
+
+            if self.num_heads != self.num_key_value_heads:
+                q_grouped = query_states.reshape(
+                    bsz, self.num_key_value_heads, self.num_key_value_groups, q_len, self.head_dim
+                )
+                q_logits_grouped = torch.matmul(
+                    q_grouped, q_k.transpose(2, 3).unsqueeze(2)
+                ) / math.sqrt(self.head_dim)
+                q_logits = q_logits_grouped.reshape(bsz, self.num_heads, q_len, -1)
+            else:
+                q_logits = torch.matmul(query_states, q_k.transpose(2, 3)) / math.sqrt(self.head_dim)
 
             # Joint softmax over [main | q-cache]
             all_logits = torch.cat([main_logits, q_logits], dim=-1)
@@ -248,18 +259,27 @@ class STICKYLlamaAttention(nn.Module):
             attn_weights_main = attn_weights[..., :main_len]
             attn_weights_q = attn_weights[..., main_len:]
 
-            attn_output = (torch.matmul(attn_weights_main, value_states_rep) + 
-                          torch.matmul(attn_weights_q, q_v_rep))
-
-            # Split scores for cache eviction
             if self.num_heads != self.num_key_value_heads:
-                scores_for_cache = attn_weights_main.view(
+                attn_main_grouped = attn_weights_main.reshape(
+                    bsz, self.num_key_value_heads, self.num_key_value_groups, q_len, -1
+                )
+                value_main_grouped = value_states.unsqueeze(2)
+                out_main = torch.matmul(attn_main_grouped, value_main_grouped)
+
+                attn_q_grouped = attn_weights_q.reshape(
+                    bsz, self.num_key_value_heads, self.num_key_value_groups, q_len, -1
+                )
+                out_q = torch.matmul(attn_q_grouped, q_v.unsqueeze(2))
+
+                attn_output = (out_main + out_q).reshape(bsz, self.num_heads, q_len, self.head_dim)
+                scores_for_cache = attn_weights_main.reshape(
                     bsz, self.num_key_value_heads, self.num_key_value_groups, q_len, -1
                 ).mean(dim=2)
-                q_scores_for_cache = attn_weights_q.view(
+                q_scores_for_cache = attn_weights_q.reshape(
                     bsz, self.num_key_value_heads, self.num_key_value_groups, q_len, -1
                 ).mean(dim=2)
             else:
+                attn_output = torch.matmul(attn_weights_main, value_states) + torch.matmul(attn_weights_q, q_v)
                 scores_for_cache = attn_weights_main
                 q_scores_for_cache = attn_weights_q
         else:
@@ -268,15 +288,17 @@ class STICKYLlamaAttention(nn.Module):
             attn_weights = torch.softmax(attn_weights, dim=-1)
             attn_weights = attn_weights.to(query_states.dtype)
 
-            # --- MEMORY OPTIMIZATION: Pre-Aggregation for Cache ---
             if self.num_heads != self.num_key_value_heads:
-                scores_for_cache = attn_weights.view(
+                attn_grouped = attn_weights.reshape(
                     bsz, self.num_key_value_heads, self.num_key_value_groups, q_len, -1
-                ).mean(dim=2)
+                )
+                attn_output = torch.matmul(attn_grouped, value_states.unsqueeze(2)).reshape(
+                    bsz, self.num_heads, q_len, self.head_dim
+                )
+                scores_for_cache = attn_grouped.mean(dim=2)
             else:
+                attn_output = torch.matmul(attn_weights, value_states)
                 scores_for_cache = attn_weights
-
-            attn_output = torch.matmul(attn_weights, value_states_rep)
 
         # Custom Sticky KV Cache Eviction
         # PASS FULL ATTENTION SCORES for Pre-fill Research Analysis

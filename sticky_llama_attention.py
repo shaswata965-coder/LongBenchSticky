@@ -219,15 +219,15 @@ class STICKYLlamaAttention(nn.Module):
             j_idx = torch.arange(q_len + past_len, device=main_logits.device).unsqueeze(0)
             main_logits.masked_fill_(i_idx + past_len < j_idx, mask_val)
 
-        # --- INT8 Q-CACHE: Joint softmax with dequantized quantized cache ---
+        # --- QUANT Q-CACHE: Joint softmax with dequantized quantized cache ---
         q_scores_for_cache = None
-        if (q_len == 1 and hasattr(self.kv_cache, 'q_cache_k_int8') 
-                and self.kv_cache.q_cache_k_int8 is not None):
-            # Dequantize on the fly — q-cache is [H, W, omega, D]
-            q_k = self.kv_cache._dequantize_from_int8(
-                self.kv_cache.q_cache_k_int8, self.kv_cache.q_cache_k_scale, self.kv_cache.q_cache_k_zp)
-            q_v = self.kv_cache._dequantize_from_int8(
-                self.kv_cache.q_cache_v_int8, self.kv_cache.q_cache_v_scale, self.kv_cache.q_cache_v_zp)
+        if (q_len == 1 and hasattr(self.kv_cache, 'q_cache_k_quant') 
+                and self.kv_cache.q_cache_k_quant is not None):
+            # Dequantize on the fly
+            q_k = self.kv_cache._dequantize_from_quant(
+                self.kv_cache.q_cache_k_quant, self.kv_cache.q_cache_k_scale, self.kv_cache.q_cache_k_zp, self.kv_cache.quant_bit_width)
+            q_v = self.kv_cache._dequantize_from_quant(
+                self.kv_cache.q_cache_v_quant, self.kv_cache.q_cache_v_scale, self.kv_cache.q_cache_v_zp, self.kv_cache.quant_bit_width)
             # Flatten W*omega → total_tokens: [H, W*omega, D]
             H, W, omega, D = q_k.shape
             q_k = q_k.reshape(H, W * omega, D)

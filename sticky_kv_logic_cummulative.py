@@ -86,27 +86,35 @@ class STICKYKVCache_LayerWise(nn.Module):
         # SINK_TOKENS specifies permanent non-evictable anchor tokens at start of sequence
         self.sink_tokens = SINK_TOKENS
         
-        # Q_RATIO: percentage of total cache budget reserved for int8-quantized evicted tokens
+        # Q_RATIO: percentage of total cache budget reserved for quantized evicted tokens
         try:
             from sticky_config import Q_RATIO
             self.q_ratio = Q_RATIO
         except ImportError:
             self.q_ratio = 0
+            
+        # Quantization bit-width: 8 (int8) or 4 (packed int4). Defaults to 8.
+        try:
+            from sticky_config import QUANTIZATION_BIT_WIDTH
+            self.quant_bit_width = QUANTIZATION_BIT_WIDTH
+        except ImportError:
+            self.quant_bit_width = 8
         
         # Tracks the number of token slots allocated for the quantized cache (computed at prefill)
         self.q_num = 0
         self.q_windows_count = 0
         
-        # head_dim needed for int8 compression ratio calculation
+        # head_dim needed for compression ratio calculation
         if config is not None and hasattr(config, 'hidden_size') and hasattr(config, 'num_attention_heads'):
             self.head_dim = config.hidden_size // config.num_attention_heads
         else:
             self.head_dim = 64  # Llama 3.2 1B default
         
-        # INT8 quantized side-cache — per-WINDOW quantization (lazy-initialized at prefill)
-        # Layout: [num_heads, q_windows_count, omega, head_dim]
-        self.q_cache_k_int8 = None        # [H, W, omega, D] uint8
-        self.q_cache_v_int8 = None        # [H, W, omega, D] uint8
+        # Quantized side-cache — per-WINDOW quantization (lazy-initialized at prefill).
+        # INT8: q_cache_k_quant shape is [H, W, omega, D] uint8.
+        # INT4: q_cache_k_quant shape is [H, W, omega, D//2] uint8 (two nibbles packed per byte).
+        self.q_cache_k_quant = None
+        self.q_cache_v_quant = None
         # K scale/zp: per-channel per-window, RoPE-paired → [H, W, 1, D]
         self.q_cache_k_scale = None       # [H, W, 1, D] float16
         self.q_cache_k_zp = None          # [H, W, 1, D] float16
@@ -386,8 +394,8 @@ class STICKYKVCache_LayerWise(nn.Module):
                 # Reshape to per-window layout [H, W, omega, D] for independent quantization
                 q_k_data = q_k_data.view(self.num_heads, q_count, self.omega, hd)
                 q_v_data = q_v_data.view(self.num_heads, q_count, self.omega, hd)
-                self.q_cache_k_int8, self.q_cache_k_scale, self.q_cache_k_zp = self._quantize_k_per_window(q_k_data)
-                self.q_cache_v_int8, self.q_cache_v_scale, self.q_cache_v_zp = self._quantize_v_per_window(q_v_data)
+                self.q_cache_k_quant, self.q_cache_k_scale, self.q_cache_k_zp = self._quantize_k_per_window(q_k_data, self.quant_bit_width)
+                self.q_cache_v_quant, self.q_cache_v_scale, self.q_cache_v_zp = self._quantize_v_per_window(q_v_data, self.quant_bit_width)
                 self.q_cache_ids = q_loser_ids.float()
                 self.q_cache_scores = q_loser_scores
 
@@ -627,15 +635,17 @@ class STICKYKVCache_LayerWise(nn.Module):
                             q_wid = self.q_cache_ids[h, qi]
                             if torch.isin(q_wid, final_ids[h]).item():
                                 # Dequantize using per-window index qi directly
-                                k_deq = self._dequantize_from_int8(
-                                    self.q_cache_k_int8[h:h+1, qi:qi+1],   # [1,1,omega,D]
+                                k_deq = self._dequantize_from_quant(
+                                    self.q_cache_k_quant[h:h+1, qi:qi+1],   # [1,1,omega,D]
                                     self.q_cache_k_scale[h:h+1, qi:qi+1],  # [1,1,1,D]
-                                    self.q_cache_k_zp[h:h+1, qi:qi+1]
+                                    self.q_cache_k_zp[h:h+1, qi:qi+1],
+                                    self.quant_bit_width
                                 )  # → [1,1,omega,D]
-                                v_deq = self._dequantize_from_int8(
-                                    self.q_cache_v_int8[h:h+1, qi:qi+1],
+                                v_deq = self._dequantize_from_quant(
+                                    self.q_cache_v_quant[h:h+1, qi:qi+1],
                                     self.q_cache_v_scale[h:h+1, qi:qi+1],
-                                    self.q_cache_v_zp[h:h+1, qi:qi+1]
+                                    self.q_cache_v_zp[h:h+1, qi:qi+1],
+                                    self.quant_bit_width
                                 )
                                 # Squeeze to [omega, D] for insertion
                                 promoted_q_data_k[h].append((q_wid.item(), k_deq.squeeze(0).squeeze(0)))
@@ -682,7 +692,7 @@ class STICKYKVCache_LayerWise(nn.Module):
                 
                 # --- Q-CACHE: Rebuild with ZERO-DEGRADATION routing ---
                 # Three paths per window to prevent quantization error accumulation:
-                # A) RETAINED: was in q-cache, stays in q-cache → copy raw int8+scale directly
+                # A) RETAINED: was in q-cache, stays in q-cache → copy raw quant+scale directly
                 # B) DEMOTED with archived meta: use archived scale/zp from q_retired_meta
                 # C) FRESH: truly new loser → fresh per-window quantization
                 if new_q_loser_ids is not None and self.q_windows_count > 0:
@@ -691,8 +701,9 @@ class STICKYKVCache_LayerWise(nn.Module):
                     dtype_fp = past_key_values[0].dtype
                     
                     # Pre-allocate per-window tensors
-                    new_k_int8 = torch.zeros(self.num_heads, new_q_count, self.omega, head_dim, device=device, dtype=torch.uint8)
-                    new_v_int8 = torch.zeros(self.num_heads, new_q_count, self.omega, head_dim, device=device, dtype=torch.uint8)
+                    quant_bytes_len = head_dim if self.quant_bit_width == 8 else (head_dim // 2)
+                    new_k_quant = torch.zeros(self.num_heads, new_q_count, self.omega, quant_bytes_len, device=device, dtype=torch.uint8)
+                    new_v_quant = torch.zeros(self.num_heads, new_q_count, self.omega, quant_bytes_len, device=device, dtype=torch.uint8)
                     new_k_scale = torch.zeros(self.num_heads, new_q_count, 1, head_dim, device=device, dtype=dtype_fp)
                     new_k_zp = torch.zeros(self.num_heads, new_q_count, 1, head_dim, device=device, dtype=dtype_fp)
                     new_v_scale = torch.zeros(self.num_heads, new_q_count, self.omega, 1, device=device, dtype=dtype_fp)
@@ -700,7 +711,7 @@ class STICKYKVCache_LayerWise(nn.Module):
                     
                     # FIX B: Vectorized q-cache rebuild — eliminates O(H × q_count) Python
                     # loop and .item() CPU syncs. Three routing paths preserved:
-                    # A) RETAINED: was in old q-cache, copy raw int8 directly
+                    # A) RETAINED: was in old q-cache, copy raw quant directly
                     # B) FRESH from main cache: gather via block-boundary arithmetic
                     # C) ARCHIVED meta: per-element fallback (rare, typically 0-3 items)
                     
@@ -716,8 +727,8 @@ class STICKYKVCache_LayerWise(nn.Module):
                         h_idx = torch.arange(self.num_heads, device=device).unsqueeze(1).expand_as(retained_old_idx)
                         # Only copy where retained_any is True
                         if retained_any.any():
-                            new_k_int8[retained_any] = self.q_cache_k_int8[h_idx[retained_any], retained_old_idx[retained_any]]
-                            new_v_int8[retained_any] = self.q_cache_v_int8[h_idx[retained_any], retained_old_idx[retained_any]]
+                            new_k_quant[retained_any] = self.q_cache_k_quant[h_idx[retained_any], retained_old_idx[retained_any]]
+                            new_v_quant[retained_any] = self.q_cache_v_quant[h_idx[retained_any], retained_old_idx[retained_any]]
                             new_k_scale[retained_any] = self.q_cache_k_scale[h_idx[retained_any], retained_old_idx[retained_any]]
                             new_k_zp[retained_any] = self.q_cache_k_zp[h_idx[retained_any], retained_old_idx[retained_any]]
                             new_v_scale[retained_any] = self.q_cache_v_scale[h_idx[retained_any], retained_old_idx[retained_any]]
@@ -764,31 +775,37 @@ class STICKYKVCache_LayerWise(nn.Module):
                                 if meta is not None:
                                     ks = meta['k_scale'].to(device)
                                     kz = meta['k_zp'].to(device)
-                                    k_q = torch.round((k_fp.unsqueeze(0) - kz) / ks).clamp(0, 255).to(torch.uint8)
-                                    new_k_int8[h, qi] = k_q.squeeze(0)
-                                    new_k_scale[h, qi, 0] = ks.squeeze(0)
-                                    new_k_zp[h, qi, 0] = kz.squeeze(0)
                                     vs = meta['v_scale'].to(device)
                                     vz = meta['v_zp'].to(device)
-                                    v_q = torch.round((v_fp.unsqueeze(0) - vz) / vs).clamp(0, 255).to(torch.uint8)
-                                    new_v_int8[h, qi] = v_q.squeeze(0)
+                                    if self.quant_bit_width == 8:
+                                        k_q = torch.round((k_fp.unsqueeze(0) - kz) / ks).clamp(0, 255).to(torch.uint8)
+                                        v_q = torch.round((v_fp.unsqueeze(0) - vz) / vs).clamp(0, 255).to(torch.uint8)
+                                        new_k_quant[h, qi] = k_q.squeeze(0)
+                                        new_v_quant[h, qi] = v_q.squeeze(0)
+                                    else:
+                                        k_q = torch.round((k_fp.unsqueeze(0) - kz) / ks).clamp(0, 15).to(torch.uint8)
+                                        v_q = torch.round((v_fp.unsqueeze(0) - vz) / vs).clamp(0, 15).to(torch.uint8)
+                                        new_k_quant[h, qi] = ((k_q[..., 0::2] << 4) | k_q[..., 1::2]).squeeze(0)
+                                        new_v_quant[h, qi] = ((v_q[..., 0::2] << 4) | v_q[..., 1::2]).squeeze(0)
+                                    new_k_scale[h, qi, 0] = ks.squeeze(0)
+                                    new_k_zp[h, qi, 0] = kz.squeeze(0)
                                     new_v_scale[h, qi] = vs.squeeze(0)
                                     new_v_zp[h, qi] = vz.squeeze(0)
                                 else:
                                     # Path C: FRESH — compute new per-window quantization
                                     k_4d = k_fp.unsqueeze(0).unsqueeze(0)  # [1,1,omega,D]
                                     v_4d = v_fp.unsqueeze(0).unsqueeze(0)
-                                    kq, ks, kz = self._quantize_k_per_window(k_4d)
-                                    vq, vs, vz = self._quantize_v_per_window(v_4d)
-                                    new_k_int8[h, qi] = kq[0, 0]
-                                    new_v_int8[h, qi] = vq[0, 0]
+                                    kq, ks, kz = self._quantize_k_per_window(k_4d, self.quant_bit_width)
+                                    vq, vs, vz = self._quantize_v_per_window(v_4d, self.quant_bit_width)
+                                    new_k_quant[h, qi] = kq[0, 0]
+                                    new_v_quant[h, qi] = vq[0, 0]
                                     new_k_scale[h, qi] = ks[0, 0]
                                     new_k_zp[h, qi] = kz[0, 0]
                                     new_v_scale[h, qi] = vs[0, 0]
                                     new_v_zp[h, qi] = vz[0, 0]
                     
-                    self.q_cache_k_int8 = new_k_int8
-                    self.q_cache_v_int8 = new_v_int8
+                    self.q_cache_k_quant = new_k_quant
+                    self.q_cache_v_quant = new_v_quant
                     self.q_cache_k_scale = new_k_scale
                     self.q_cache_k_zp = new_k_zp
                     self.q_cache_v_scale = new_v_scale
@@ -796,8 +813,8 @@ class STICKYKVCache_LayerWise(nn.Module):
                     self.q_cache_ids = new_q_loser_ids.float()
                     self.q_cache_scores = new_q_loser_scores
                 elif self.q_windows_count > 0:
-                    self.q_cache_k_int8 = None
-                    self.q_cache_v_int8 = None
+                    self.q_cache_k_quant = None
+                    self.q_cache_v_quant = None
                     self.q_cache_k_scale = None
                     self.q_cache_k_zp = None
                     self.q_cache_v_scale = None
@@ -957,7 +974,7 @@ class STICKYKVCache_LayerWise(nn.Module):
     # never called by any code path. The active pipeline uses scatter_add_ via scoreboard.
 
     @staticmethod
-    def _quantize_k_per_window(tensor):
+    def _quantize_k_per_window(tensor, bit_width=8):
         """Quantize K cache: per-channel per-window, with RoPE-paired dimension tying.
         Args:
             tensor: [H, W, omega, D] fp16 — already has RoPE applied
@@ -966,11 +983,6 @@ class STICKYKVCache_LayerWise(nn.Module):
         # Per-channel: reduce across token dim (omega) → [H, W, 1, D]
         t_min = tensor.amin(dim=2, keepdim=True)
         t_max = tensor.amax(dim=2, keepdim=True)
-        
-        # RoPE preservation: tie scales for paired dimensions (i, i+D//2)
-        # LLaMA RoPE rotates pairs (x_i, x_{i+D/2}) in a 2D plane.
-        # Using independent scales distorts the rotation angle.
-        # We unify scale/zp for each pair so the plane is uniformly scaled.
         half_d = tensor.shape[-1] // 2
         t_min_h1, t_min_h2 = t_min[..., :half_d], t_min[..., half_d:]
         t_max_h1, t_max_h2 = t_max[..., :half_d], t_max[..., half_d:]
@@ -979,30 +991,42 @@ class STICKYKVCache_LayerWise(nn.Module):
         t_min = torch.cat([t_min_tied, t_min_tied], dim=-1)
         t_max = torch.cat([t_max_tied, t_max_tied], dim=-1)
         
-        scale = torch.clamp((t_max - t_min) / 255.0, min=1e-8)
-        quantized = torch.round((tensor - t_min) / scale).clamp(0, 255).to(torch.uint8)
-        return quantized, scale.to(tensor.dtype), t_min.to(tensor.dtype)
+        if bit_width == 4:
+            scale = torch.clamp((t_max - t_min) / 15.0, min=1e-8)
+            quantized = torch.round((tensor - t_min) / scale).clamp(0, 15).to(torch.uint8)
+            packed = (quantized[..., 0::2] << 4) | quantized[..., 1::2]
+            return packed, scale.to(tensor.dtype), t_min.to(tensor.dtype)
+        else:
+            scale = torch.clamp((t_max - t_min) / 255.0, min=1e-8)
+            quantized = torch.round((tensor - t_min) / scale).clamp(0, 255).to(torch.uint8)
+            return quantized, scale.to(tensor.dtype), t_min.to(tensor.dtype)
 
     @staticmethod
-    def _quantize_v_per_window(tensor):
-        """Quantize V cache: per-token per-window.
-        Args:
-            tensor: [H, W, omega, D] fp16
-        Returns: (uint8_tensor[H,W,omega,D], scale[H,W,omega,1], zp[H,W,omega,1])
-        """
-        # Per-token: reduce across head_dim (D) → [H, W, omega, 1]
+    def _quantize_v_per_window(tensor, bit_width=8):
+        """Quantize V cache: per-token per-window."""
         t_min = tensor.amin(dim=3, keepdim=True)
         t_max = tensor.amax(dim=3, keepdim=True)
-        scale = torch.clamp((t_max - t_min) / 255.0, min=1e-8)
-        quantized = torch.round((tensor - t_min) / scale).clamp(0, 255).to(torch.uint8)
-        return quantized, scale.to(tensor.dtype), t_min.to(tensor.dtype)
+        if bit_width == 4:
+            scale = torch.clamp((t_max - t_min) / 15.0, min=1e-8)
+            quantized = torch.round((tensor - t_min) / scale).clamp(0, 15).to(torch.uint8)
+            packed = (quantized[..., 0::2] << 4) | quantized[..., 1::2]
+            return packed, scale.to(tensor.dtype), t_min.to(tensor.dtype)
+        else:
+            scale = torch.clamp((t_max - t_min) / 255.0, min=1e-8)
+            quantized = torch.round((tensor - t_min) / scale).clamp(0, 255).to(torch.uint8)
+            return quantized, scale.to(tensor.dtype), t_min.to(tensor.dtype)
 
     @staticmethod
-    def _dequantize_from_int8(int8_tensor, scale, zero_point):
-        """Dequantize int8 tensor back to fp16.
-        Works for any shape — scale/zp broadcast automatically.
-        """
-        return int8_tensor.to(scale.dtype) * scale + zero_point
+    def _dequantize_from_quant(quant_tensor, scale, zero_point, bit_width=8):
+        """Dequantize int8 or packed int4 tensor back to fp16."""
+        if bit_width == 4:
+            q_even = (quant_tensor >> 4) & 0x0F
+            q_odd = quant_tensor & 0x0F
+            unpacked = torch.stack((q_even, q_odd), dim=-1)
+            unpacked = unpacked.view(*quant_tensor.shape[:-1], -1)
+            return unpacked.to(scale.dtype) * scale + zero_point
+        else:
+            return quant_tensor.to(scale.dtype) * scale + zero_point
 
     def _evict_from_window_scores(self):
         valid_mask = ~torch.isnan(self.window_scores[:, :, 1])
@@ -1108,12 +1132,12 @@ class STICKYKVCache_LayerWise(nn.Module):
         # Reserve a portion of the total budget for int8-quantized evicted tokens
         self.q_num = (total_token_budget * self.q_ratio) // 100
         
-        # Int8 compression: ~2x more windows fit
+        # Quant compression: ~2x for INT8, ~4x for INT4
         # FIX (Bug 3): omega is a token-count, not a byte overhead.
-        # INT8 uses 1 byte per element vs bf16's 2 bytes per element.
+        # bf16 uses 2 bytes per element.
         bf16_bytes = 2 * self.head_dim
-        int8_bytes = self.head_dim  # 1 byte per element for INT8
-        compression_ratio = bf16_bytes / int8_bytes
+        quant_bytes = self.head_dim if self.quant_bit_width == 8 else (self.head_dim / 2.0)
+        compression_ratio = bf16_bytes / quant_bytes
         effective_q_tokens = int(self.q_num * compression_ratio)
         self.q_windows_count = effective_q_tokens // self.omega
         
@@ -1138,8 +1162,8 @@ class STICKYKVCache_LayerWise(nn.Module):
         self.prompt_boundary = [-1 for _ in range(self.num_heads)]
         self.prefill_attention_matrix = None  # FIX (Audit Bug 4): prevent CPU RAM leak across documents
         # Reset q-cache state
-        self.q_cache_k_int8 = None
-        self.q_cache_v_int8 = None
+        self.q_cache_k_quant = None
+        self.q_cache_v_quant = None
         self.q_cache_k_scale = None
         self.q_cache_k_zp = None
         self.q_cache_v_scale = None

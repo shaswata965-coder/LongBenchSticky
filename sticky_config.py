@@ -16,6 +16,11 @@ P_RATIO = 50 # Local/Recent window size as % of total budget
 # Int8 provides ~2x compression vs fp16, so the effective q-cache capacity is ~2x q_num.
 Q_RATIO = 10  # Set to e.g. 10 for 10% of total budget allocated to quantized evicted tokens
 
+# Quantization bit-width for the evicted (q-cache) tokens.
+# 8 → standard INT8 (1 byte/element, 2x compression vs fp16) — backward-compatible default.
+# 4 → packed INT4 (0.5 bytes/element, 4x compression vs fp16) — doubles q_windows_count.
+QUANTIZATION_BIT_WIDTH = 8
+
 # To use a fixed number of tokens for local windows, set LOCAL_NUM_TOKENS (e.g., 256) and comment out P_RATIO
 # LOCAL_NUM_TOKENS = 32
 

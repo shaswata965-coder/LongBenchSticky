@@ -6,7 +6,7 @@ import sticky_config
 
 def main():
     # 1. Path to your local model weights/directory
-    model_path = "/kaggle/input/llama-3.2/transformers/1b-instruct/1"
+    model_path = "/home/ee/phd/eez228470/llama-3.1-8b-instruct"
 
     # 2. Define your custom configuration
     config = LlamaConfig.from_pretrained(model_path)

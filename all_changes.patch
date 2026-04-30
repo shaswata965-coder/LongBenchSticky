@@ -1,0 +1,1655 @@
+--- LongBenchSticky_trial/sticky_config.py	2026-04-22 21:50:33.000000000 +0530
++++ LongBenchSticky/sticky_config.py	2026-04-25 23:11:31.000000000 +0530
+@@ -4,16 +4,16 @@
+ 
+ # --- STICKY SPECIFIC RATIOS ---
+ # Adjust these to match the VRAM usage of your quantized setup
+-R_RATIO = 50  # Total KV cache budget (e.g., 25% of sequence length)
++R_RATIO = 20  # Total KV cache budget (e.g., 25% of sequence length)
+ 
+ # To use a percentage of the cache for local windows, set P_RATIO (e.g., 50) and comment out LOCAL_NUM_TOKENS
+ # P_RATIO = 50 # Local/Recent window size as % of total budget
+ 
+ # To use a fixed number of tokens for local windows, set LOCAL_NUM_TOKENS (e.g., 256) and comment out P_RATIO
+-LOCAL_NUM_TOKENS = 0
++LOCAL_NUM_TOKENS = 32
+ 
+-OMEGA = 5  # Window size for KV cache grouping
+-SINK_TOKENS = 0  # Number of permanently protected sink tokens
++OMEGA = 4 # Window size for KV cache grouping
++SINK_TOKENS = 5  # Number of permanently protected sink tokens
+ tracking_flag = 1
+ dataset_tracker = 1
+ 
+@@ -31,7 +31,7 @@
+ ROPE_HIGH_FREQ_FACTOR = 4.0
+ DATASET_MIN_TOKENS = 2560
+ GENERATION_CONFIG = {
+-    "max_new_tokens": 256,
++    "max_new_tokens": 128,
+     "do_sample": False,
+     "temperature": 1.0,
+ }
+--- LongBenchSticky_trial/sticky_llama_attention_fast_attention.py	2026-04-22 21:50:33.000000000 +0530
++++ LongBenchSticky/sticky_llama_attention_fast_attention.py	2026-04-25 23:25:59.000000000 +0530
+@@ -212,17 +212,22 @@
+         if q_len > 1:
+             # --- EXPLICIT FLASH ATTENTION V2.0 FOR PREFILL (PROMPT) ---
+             
+-            # flash_attn_func expects [bsz, seq_len, num_heads, head_dim]
++            # --- 1. Generation Output via flash_attn_func (Strict FA2 backend) ---
++            # Reformating tensors to (batch_size, seq_len, num_heads, head_dim)
+             q_fa = query_states.transpose(1, 2)
+-            k_fa = key_states_rep.transpose(1, 2)
+-            v_fa = value_states_rep.transpose(1, 2)
++            k_fa = key_states.transpose(1, 2)
++            v_fa = value_states.transpose(1, 2)
+             
++            # Using original un-repeated k_fa and v_fa takes advantage of FA2's native GQA support
+             attn_output = flash_attn_func(
+-                q_fa, k_fa, v_fa,
+-                dropout_p=0.0,
++                q_fa, 
++                k_fa, 
++                v_fa, 
++                dropout_p=0.0, 
+                 softmax_scale=1.0 / math.sqrt(self.head_dim),
+-                causal=True,
++                causal=True
+             )
++            # Reformat back to (batch_size, num_heads, seq_len, head_dim) for downstream compatibility
+             attn_output = attn_output.transpose(1, 2)
+             
+             attn_weights_return = None
+--- LongBenchSticky_trial/sticky_kv_logic_fast_attention.py	2026-04-22 21:50:33.000000000 +0530
++++ LongBenchSticky/sticky_kv_logic_fast_attention.py	2026-04-25 23:47:48.000000000 +0530
+@@ -2,7 +2,6 @@
+ from torch import nn
+ import math
+ from transformers.models.llama.modeling_llama import rotate_half
+-from sticky_kv_cuda_ops import per_head_kv_gather, window_score_reduce, vote_accumulate
+ 
+ '''
+ Duplicates the KV heads n_rep times using memory-efficient 
+@@ -105,6 +104,9 @@
+         # Initialize token block tracker for local zone (updated during generation)
+         self.local_num = 0
+         
++        # Persisted dynamic local count (absorbs remainder from prefill alignment)
++        self._dynamic_local_count = 0
++        
+         # Pytorch layout trackers for Keys and Values
+         self.k_seq_dim, self.v_seq_dim = k_seq_dim, v_seq_dim
+         
+@@ -186,7 +188,7 @@
+ 
+         # Defines physical cache sizes using parameters initialized
+         self.cache_size = int(
+-            self.omega * (1 + self.local_num + self.k_windows + self.start_idx) + self.sink_tokens 
++            self.omega * (1 + self.k_windows + self.start_idx) + self.local_num + self.sink_tokens 
+         )
+         
+         # FIX: Will hold the strictly logical mapping of the physical cache
+@@ -200,6 +202,7 @@
+ 
+         # Defines full present context length directly from KV cache
+         seq_len = past_key_values[0].size(self.k_seq_dim) if past_key_values is not None else 0
++        # === Inside __call__ ===
+         
+         # Keeps counter consistent globally 
+         if not self._prefill_done:
+@@ -214,19 +217,20 @@
+         num_new_tokens = q_len
+ 
+         # Initial Configuration Update phase (Prefill Setup)
+-        if num_new_tokens > 1:
++        # FIX (Audit Bug 2): Gate on _prefill_done instead of num_new_tokens > 1.
++        # Using num_new_tokens > 1 would misfire under speculative decoding where
++        # q_len > 1 can occur during generation, destroying all eviction state.
++        if not self._prefill_done:
+             import sticky_config as config_module
+             # Distribute local limits vs sticky window constraints securely before calculating score windows
+             self._update_k_win_and_local_num(num_new_tokens, config_module.GENERATION_CONFIG.get("max_new_tokens", 512))
+             
+             self.cache_size = (
+-                self.omega * (1 + self.local_num + self.k_windows + self.start_idx) + self.sink_tokens
++                self.omega * (1 + self.k_windows + self.start_idx) + self.local_num + self.sink_tokens
+             )
+             # Ensure counters are loaded up accurately considering full prompt is passed
+             self.num_of_tokens_without_eviction += seq_len
+-            # Update boundary tracking parameter defining where generations start natively
+-            for h in range(self.num_heads):
+-                self.prompt_boundary[h] = seq_len - 1
++            self.prompt_boundary = [seq_len - 1] * self.num_heads
+         else:
+             # Generations only generate 1 token at a time so step++
+             self.num_of_tokens_without_eviction += 1
+@@ -235,8 +239,9 @@
+         # Early return bypassed to maintain OMEGA synchronization
+ 
+ 
+-        if num_new_tokens > 1:  # Prompt Stage Active
++        if not self._prefill_done:  # Prompt Stage Active
+             # Determine local token count precisely either fixed constraint or dynamic ratio calculation
++            # FIX: Use sequence length and local_cache_ratio instead of local_num (which is 0 at init)
+             # Unconditionally trust the CFO Allocator's token math
+             local_tokens_count = self.local_num_tokens if self.use_fixed_local_tokens else self.local_num
+             
+@@ -257,6 +262,9 @@
+             
+             # Dynamically absorb remainder tokens into the local sliding window
+             local_tokens_count = seq_len - score_end
++            
++            # Persist the dynamic local count so generation eviction uses the same boundary
++            self._dynamic_local_count = local_tokens_count
+             # -----------------------------
+             
+             if num_windows > 0:
+@@ -264,8 +272,8 @@
+                 scores_slice = attn_score_cache[0, :, :seq_len, self.sink_tokens:score_end]
+                 # Collapse query attentions, creating a 1D tensor describing KV importance per-head
+                 obs_sum = scores_slice.sum(dim=1)
+-                # Sum within blocks of size 'omega' to generate holistic chunk scores (CUDA-accelerated)
+-                win_scores = window_score_reduce(obs_sum, num_windows, self.omega)
++                # Sum within blocks of size 'omega' to generate holistic chunk scores
++                win_scores = obs_sum.view(self.num_heads, num_windows, self.omega).sum(dim=2).to(dtype=torch.float32)
+ 
+                 # Update tensor memory allocating values into initial ranking sets
+                 idx = torch.arange(num_windows, device=self.window_scores.device).unsqueeze(0).expand(self.num_heads, -1)
+@@ -288,7 +296,11 @@
+                     # Accumulate prompt metric again but applied up through the entire context mapping directly to local history
+                     full_scores_slice = attn_score_cache[0, :, :seq_len, self.sink_tokens:actual_full_review]
+                     full_obs_sum = full_scores_slice.sum(dim=1)
+-                    full_win_scores = window_score_reduce(full_obs_sum, total_prompt_windows, self.omega)
++                    full_win_scores = (
++                        full_obs_sum.view(self.num_heads, total_prompt_windows, self.omega)
++                        .sum(dim=2)
++                        .to(dtype=torch.float32)
++                    )
+                     idx_full = torch.arange(
+                         total_prompt_windows, device=self.local_history.device, dtype=torch.long
+                     )
+@@ -308,8 +320,8 @@
+             self.logical_id_map = torch.where(
+                 survivor_ids >= self.sink_tokens,
+                 (survivor_ids - self.sink_tokens) // self.omega,
+-                torch.tensor(-1, device=self.window_scores.device) # Sinks get -1
+-            )
++                torch.full_like(survivor_ids, -1)  # Sinks get -1
++            ).to(torch.long)
+ 
+             self._prefill_done = True  
+             return updated_kv
+@@ -317,18 +329,24 @@
+         else:  # Generation Stage
+             device = self.window_scores.device
+             
+-            # 1. ACCUMULATE VOTES (CUDA-accelerated or PyTorch fallback)
+-            _new_scores = attn_score_cache[0, :, 0, :seq_len].float().contiguous()
+-            vote_accumulate(self.running_attention_votes, _new_scores, seq_len)
++            # FIX (B4): Guard against generation being called before prefill constructed logical_id_map
++            if self.logical_id_map is None:
++                return past_key_values
++            
++            # 1. ACCUMULATE VOTES
++            # Takes the latest generation attention 1D slices across the cache tensor and adds dynamically continuously
++            self.running_attention_votes[:, :seq_len] += attn_score_cache[0, :, 0, :seq_len]
+             self.tokens_since_last_review += 1
+             
+             # 2. PERIODIC EVALUATION
+             # Process eviction constraints specifically when the tracker hits OMEGA boundary thresholds
+             if self.tokens_since_last_review == self.omega:
+-                local_tokens_count = self.local_num_tokens if self.use_fixed_local_tokens else self.local_num
++                # FIX (Bug 1): Use the persisted dynamic local count that absorbed
++                # the prefill remainder, instead of re-reading the static config value.
++                local_tokens_count = self._dynamic_local_count
+                 
+                 # ---------------------------------------------------------
+-                # FIX 4: DIRECT LOGICAL LOOKUP & SCATTER MAP
++                # DIRECT LOGICAL LOOKUP & SCATTER MAP
+                 # ---------------------------------------------------------
+                 
+                 # Retrieve compressed space properties
+@@ -344,80 +362,132 @@
+                 # Zero out negative IDs (sinks) so scatter_add doesn't throw OutOfBounds errors
+                 safe_logical_ids = torch.where(is_chunk_token, logical_ids, torch.zeros_like(logical_ids)).long()
+                 
+-                scoreboard = torch.zeros((self.num_heads, self.window_scores.shape[1]), device=device)
++                scoreboard = torch.zeros((self.num_heads, self.window_scores.shape[1]), device=device, dtype=torch.float32)
+                 scoreboard.scatter_add_(1, safe_logical_ids, routed_votes)
+                 
++                # FIX (Bug 1): Route votes for the omega new tokens not yet in logical_id_map.
++                # These tokens live at physical indices [compressed_len, seq_len) and have
++                # accumulated votes in running_attention_votes, but scatter_add_ above skipped
++                # them because logical_id_map doesn't include them yet. Without this, their
++                # votes are permanently lost when running_attention_votes is zeroed at cycle end.
++                if seq_len > compressed_len:
++                    num_new = seq_len - compressed_len
++                    new_tok_votes = self.running_attention_votes[:, compressed_len:seq_len]
++                    j_indices = torch.arange(num_new, device=device)
++                    global_positions = self.num_of_tokens_without_eviction - self.omega + j_indices
++                    new_lids = torch.clamp((global_positions - self.sink_tokens) // self.omega, min=0)
++                    valid_new = new_lids < scoreboard.shape[1]
++                    if valid_new.any():
++                        new_lids_exp = new_lids[valid_new].unsqueeze(0).expand(self.num_heads, -1)
++                        scoreboard.scatter_add_(1, new_lids_exp, new_tok_votes[:, valid_new])
++                
+                 # Determine current valid old competitors
+                 valid_mask = ~torch.isnan(self.window_scores[:, :, 1])
+                 valid_old_windows = min(self.k_windows, int(valid_mask.sum(dim=1).max().item()))
+ 
+-                old_ids = torch.nan_to_num(self.window_scores[:, :valid_old_windows, 1], nan=0.0)
+-                old_scores_hist = torch.nan_to_num(self.window_scores[:, :valid_old_windows, 0], nan=0.0)
++                raw_ids = self.window_scores[:, :valid_old_windows, 1]
++                raw_scores = self.window_scores[:, :valid_old_windows, 0]
++                # FIX (B2): Track which slots are genuinely registered vs NaN-padded empty slots
++                is_valid_slot = ~torch.isnan(raw_ids)
++                
++                old_ids = torch.nan_to_num(raw_ids, nan=0.0)
++                old_scores_hist = torch.nan_to_num(raw_scores, nan=0.0)
+ 
+                 # Collect new mass generated strictly mapped dynamically 
+                 old_w_gen_scores = torch.gather(scoreboard, 1, old_ids.long()) if valid_old_windows > 0 else torch.zeros_like(old_scores_hist)
++                # FIX (B2): Zero out phantom Window 0 scores gathered from NaN→0 converted empty slots
++                old_w_gen_scores = torch.where(is_valid_slot, old_w_gen_scores, torch.zeros_like(old_w_gen_scores))
+                 old_scores = old_scores_hist + old_w_gen_scores
+ 
+                 # ---------------------------------------------------------
+                 # SCORE THE CHALLENGER (The Emerging Window)
+                 # ---------------------------------------------------------
+                 # Calculate the Logical ID of the window that just fell out of the local bubble
+-                last_id_val = max(0, (self.num_of_tokens_without_eviction - self.sink_tokens - local_tokens_count) // self.omega - 1)
+-                last_id_tensor = torch.full((self.num_heads, 1), float(last_id_val), device=device, dtype=torch.float32)
++                raw_last_id_val = (self.num_of_tokens_without_eviction - self.sink_tokens - local_tokens_count) // self.omega - 1
++                has_challenger = raw_last_id_val >= 0
++                last_id_val = raw_last_id_val
++
++                if has_challenger:
++                    last_id_tensor = torch.full((self.num_heads, 1), float(last_id_val), device=device, dtype=torch.float32)
++
++                    # FIX (Bug 5): Per-head guard against double-counting.
++                    # Each head independently checks if the challenger is already tracked.
++                    # Heads where it's tracked get -inf score so topk naturally excludes the duplicate.
++                    already_tracked_per_head = (old_ids.long() == last_id_val).any(dim=1)  # [num_heads]
++                    
++                    # Compute challenger scores unconditionally for all heads
++                    if last_id_val < scoreboard.shape[1]:
++                        new_w_gen_scores = scoreboard[:, int(last_id_val)]
++                    else:
++                        new_w_gen_scores = torch.zeros(self.num_heads, dtype=torch.float32, device=device)
++
++                    # Safely map prefill history
++                    if last_id_val < self.local_history.shape[1]:
++                        last_id_hist_scores = self.local_history[:, last_id_val].clone()
++                        # Only zero out history for heads where the window is entering competition
++                        self.local_history[:, last_id_val] = torch.where(
++                            already_tracked_per_head,
++                            self.local_history[:, last_id_val],
++                            torch.zeros_like(self.local_history[:, last_id_val])
++                        )
++                    else:
++                        last_id_hist_scores = torch.zeros(self.num_heads, dtype=torch.float32, device=device)
++
++                    new_w_total_scores = new_w_gen_scores + last_id_hist_scores
++
++                    # Mask to -inf for heads where challenger is already tracked — topk excludes it
++                    new_w_total_scores = torch.where(
++                        already_tracked_per_head,
++                        torch.full_like(new_w_total_scores, float('-inf')),
++                        new_w_total_scores
++                    )
+ 
+-                # Because the Emerging Window was physically inside the compressed cache, 
+-                # its votes were already perfectly routed into our dynamic scoreboard!
+-                if last_id_val < scoreboard.shape[1]:
+-                    new_w_gen_scores = scoreboard[:, int(last_id_val)]
++                    # Concatenate challenger with existing windows
++                    competing_ids = torch.cat([old_ids, last_id_tensor], dim=1)
++                    competing_scores = torch.cat([old_scores, new_w_total_scores.unsqueeze(1)], dim=1)
+                 else:
+-                    new_w_gen_scores = torch.zeros(self.num_heads, dtype=torch.float32, device=device)
+-
+-                # Safely map prefill history
+-                if 0 <= last_id_val < self.local_history.shape[1]:
+-                    last_id_hist_scores = self.local_history[:, last_id_val].clone()
+-                    self.local_history[:, last_id_val] = 0.0
++                    # No valid challenger yet — existing windows compete among themselves
++                    competing_ids = old_ids
++                    competing_scores = old_scores
++
++                if competing_ids.shape[1] > 0:
++                    curr_k = min(self.k_windows, competing_scores.shape[1])
++                    top_v, top_i = torch.topk(competing_scores, curr_k, dim=1, largest=True)
++
++                    surviving_ids = torch.gather(competing_ids, 1, top_i)
++                    sort_idx = torch.argsort(surviving_ids, dim=1)
++
++                    final_v = torch.gather(top_v, 1, sort_idx)
++                    final_ids = torch.gather(surviving_ids, 1, sort_idx)
++
++                    self.window_scores.fill_(float("nan"))
++                    self.window_scores[:, :curr_k, 0] = final_v
++                    self.window_scores[:, :curr_k, 1] = final_ids
++                    self.window_scores[:, :curr_k, 2] = final_ids
+                 else:
+-                    last_id_hist_scores = torch.zeros(self.num_heads, dtype=torch.float32, device=device)
+-
+-                new_w_total_scores = new_w_gen_scores + last_id_hist_scores
+-
+-                # Compete directly integrating tracking frameworks
+-                competing_ids = torch.cat([old_ids, last_id_tensor], dim=1)
+-                competing_scores = torch.cat([old_scores, new_w_total_scores.unsqueeze(1)], dim=1)
+-
+-                curr_k = min(self.k_windows, competing_scores.shape[1])
+-                top_v, top_i = torch.topk(competing_scores, curr_k, dim=1, largest=True)
+-
+-                surviving_ids = torch.gather(competing_ids, 1, top_i)
+-                sort_idx = torch.argsort(surviving_ids, dim=1)
+-
+-                final_v = torch.gather(top_v, 1, sort_idx)
+-                final_ids = torch.gather(surviving_ids, 1, sort_idx)
+-
+-                self.window_scores.fill_(float("nan"))
+-                self.window_scores[:, :curr_k, 0] = final_v
+-                self.window_scores[:, :curr_k, 1] = final_ids
+-                self.window_scores[:, :curr_k, 2] = final_ids
++                    final_ids = torch.zeros((self.num_heads, 0), device=device, dtype=torch.float32)
+ 
+                 # ---------------------------------------------------------
+                 # 4. UPDATE LOCAL HISTORY
++                # FIX (Bug 2): The old formula `seq_len - (compressed_len + omega)`
++                # always evaluates to 0 because compressed_len = logical_id_map.shape[1]
++                # which already includes the local zone from the previous cycle.
++                # Use ceiling division so partial-window votes are preserved.
+                 # ---------------------------------------------------------
+-                local_tokens_eff = seq_len - (compressed_len + self.omega)
+-                local_windows = local_tokens_eff // self.omega
++                local_windows = (local_tokens_count + self.omega - 1) // self.omega
+ 
+                 if local_windows > 0:
+-                    local_zone_start_phys = compressed_len + self.omega
+-                    valid_local_len = local_windows * self.omega
+-                    local_slice = self.running_attention_votes[:, local_zone_start_phys : local_zone_start_phys + valid_local_len]
+-                    local_scores = local_slice.view(self.num_heads, local_windows, self.omega).sum(dim=2).to(dtype=torch.float32)
+-
+                     local_id_start = last_id_val + 1
+                     ids = torch.arange(local_id_start, local_id_start + local_windows, device=device, dtype=torch.long)
+ 
+                     valid = (ids >= 0) & (ids < self.local_history.shape[1])
+                     if valid.any():
+                         ids_valid = ids[valid]
+-                        self.local_history[:, ids_valid] += local_scores[:, valid]
++                        # Read votes directly from scoreboard — local zone votes are
++                        # already correctly routed here via scatter_add_ + logical_id_map
++                        sb_valid = ids_valid[ids_valid < scoreboard.shape[1]]
++                        if len(sb_valid) > 0:
++                            self.local_history[:, sb_valid] += scoreboard[:, sb_valid]
+ 
+                 # If r_ratio is 100, skip physical eviction
+                 if self.total_cache_ratio == 100:
+@@ -428,51 +498,56 @@
+                 # ---------------------------------------------------------
+                 # 5. PHYSICAL EVICTION (Purely Relative Slicing)
+                 # ---------------------------------------------------------
+-                # Step A: Filter the OLD compressed cache using relative indices (vectorized)
+-                is_survivor = (self.logical_id_map.unsqueeze(2) == final_ids.unsqueeze(1)).any(dim=2)
++                # Step A: Filter the OLD compressed cache using relative indices
++                is_survivor = (self.logical_id_map.unsqueeze(2) == final_ids.long().unsqueeze(1)).any(dim=2)
++                
++                # FIX (B2): Also keep old local zone tokens still under protection
++                # (logical_id > last_id_val means they haven't graduated to challenger yet)
++                is_continuing_local = (self.logical_id_map > last_id_val) & (self.logical_id_map >= 0)
++                is_kept = is_survivor | is_continuing_local
+                 
+                 relative_indices = torch.arange(compressed_len, device=device).unsqueeze(0).expand(self.num_heads, -1)
+                 
+                 # Assign a massively high index to losers so they sort to the end and get chopped off
+-                kept_old_relative = torch.where(is_survivor, relative_indices, torch.tensor(seq_len + 999, device=device))
++                kept_old_relative = torch.where(is_kept, relative_indices, torch.tensor(seq_len + 999, device=device))
+ 
+-                # Step B: Sinks and Local Zone are defined strictly by their current relative positions
++                # Step B: Sinks and New Generated Tokens
+                 sinks_relative = torch.arange(self.sink_tokens, device=device).unsqueeze(0).expand(self.num_heads, -1)
+-                local_relative = torch.arange(compressed_len + self.omega, seq_len, device=device).unsqueeze(0).expand(self.num_heads, -1)
+-                
+-                all_relative = torch.cat([sinks_relative, kept_old_relative, local_relative], dim=1)
+                 
+-                # Step C: Deduplicate, Sort, and remove Losers (vectorized)
+-                sorted_all, _ = torch.sort(all_relative, dim=1)
+-                is_unique = torch.ones(sorted_all.shape, dtype=torch.bool, device=device)
+-                is_unique[:, 1:] = sorted_all[:, 1:] != sorted_all[:, :-1]
+-                is_unique &= (sorted_all < seq_len)
+-                counts = is_unique.sum(dim=1)
+-                max_len = counts.max().item()
+-                final_relative_indices = torch.zeros((self.num_heads, max_len), device=device, dtype=sorted_all.dtype)
+-                for h in range(self.num_heads):
+-                    valid = sorted_all[h, is_unique[h]]
+-                    n = valid.shape[0]
+-                    final_relative_indices[h, :n] = valid
+-                    if n < max_len:
+-                        final_relative_indices[h, n:] = valid[-1]
++                # FIX (B2): Include the omega newly generated tokens as part of the local zone
++                new_tokens_end = min(compressed_len + self.omega, seq_len)
++                new_tokens_relative = torch.arange(compressed_len, new_tokens_end, device=device).unsqueeze(0).expand(self.num_heads, -1)
++                
++                all_relative = torch.cat([sinks_relative, kept_old_relative, new_tokens_relative], dim=1)
++                
++                # Step C: Vectorized Deduplicate, Sort, and remove Losers
++                SENTINEL = seq_len + 9999
++                sorted_vals, _ = torch.sort(all_relative, dim=1)
++                keep = torch.ones_like(sorted_vals, dtype=torch.bool)
++                keep[:, 1:] = sorted_vals[:, 1:] != sorted_vals[:, :-1]
++                keep &= (sorted_vals < seq_len)
++                compacted = torch.where(keep, sorted_vals, torch.full_like(sorted_vals, SENTINEL))
++                compacted, _ = torch.sort(compacted, dim=1)
++                safe_len = (compacted < seq_len).sum(dim=1).min().item()
++                final_relative_indices = compacted[:, :safe_len]
+                 
+                 # ---------------------------------------------------------
+-                # 6. REBUILD THE LOGICAL MAP FOR THE NEXT CYCLE (vectorized)
++                # 6. REBUILD THE LOGICAL MAP FOR THE NEXT CYCLE
+                 # ---------------------------------------------------------
+-                from_old_mask = final_relative_indices < compressed_len
+-                safe_gather_idx = torch.clamp(final_relative_indices.long(), 0, max(compressed_len - 1, 0))
+-                inherited_ids = torch.gather(self.logical_id_map.float(), 1, safe_gather_idx)
+-                offsets = (final_relative_indices.float() - compressed_len - self.omega)
+-                computed_ids = (last_id_val + 1) + offsets // self.omega
+-                self.logical_id_map = torch.where(from_old_mask, inherited_ids, computed_ids)
+-                
+-                # Gather physical KV cache (CUDA-accelerated or PyTorch fallback)
+-                clamped_indices = torch.clamp(final_relative_indices, 0, seq_len - 1)
+-                k_kept, v_kept = per_head_kv_gather(
+-                    past_key_values[0][0], past_key_values[1][0], clamped_indices
+-                )
+-                updated_kv = (k_kept.unsqueeze(0), v_kept.unsqueeze(0))
++                is_old = final_relative_indices < compressed_len
++                old_gather_idx = torch.clamp(final_relative_indices, 0, max(compressed_len - 1, 0)).long()
++                inherited_ids = torch.gather(self.logical_id_map, 1, old_gather_idx)
++                j_offsets = final_relative_indices - compressed_len
++                global_positions = self.num_of_tokens_without_eviction - self.omega + j_offsets
++                new_ids = torch.clamp((global_positions - self.sink_tokens) // self.omega, min=0)
++                self.logical_id_map = torch.where(is_old, inherited_ids, new_ids).long()
++                
++                # Gather physical KV cache using relative arrays
++                head_dim = past_key_values[0].shape[-1]
++                gather_idx = torch.clamp(final_relative_indices, 0, seq_len - 1).unsqueeze(-1).expand(-1, -1, head_dim)
++                k_kept = torch.gather(past_key_values[0][0], 1, gather_idx).unsqueeze(0)
++                v_kept = torch.gather(past_key_values[1][0], 1, gather_idx).unsqueeze(0)
++                updated_kv = (k_kept, v_kept)
+ 
+                 # Reset accumulator vectors entirely explicitly
+                 self.running_attention_votes.zero_()
+@@ -489,34 +564,8 @@
+         """
+         return {}
+ 
+-    def _update_window_scores_generation_vectorized(self, attn_scores, local_id, orig_id):
+-        # Maps boundaries using chunk constraints logically targeting tensor blocks efficiently.
+-        device = self.window_scores.device
+-        w_start, w_end = int(local_id * self.omega + self.sink_tokens), int(
+-            local_id * self.omega + (self.sink_tokens - 1) + self.omega
+-        )
+-        new_scores = (
+-            attn_scores[0, :, 0, w_start : w_end + 1]
+-            .sum(dim=-1)
+-            .to(self.window_scores.dtype)
+-        )
+-        
+-        # Validate elements identically locating target array
+-        current_ids = self.window_scores[:, :, 1]
+-        matches = current_ids == local_id
+-        has_match = matches.any(dim=1)
+-        if has_match.any():
+-            match_indices = matches[has_match].float().argmax(dim=1)
+-            matched_heads = has_match.nonzero().squeeze(-1)
+-            self.window_scores[matched_heads, match_indices, 0] += new_scores[has_match]
+-        if (~has_match).any():
+-            no_match_heads = (~has_match).nonzero().squeeze(-1)
+-            valid_mask = ~torch.isnan(self.window_scores[:, :, 0])
+-            counts = valid_mask[no_match_heads].sum(dim=1)
+-            counts = torch.clamp(counts, 0, self.window_scores.shape[1] - 1)
+-            self.window_scores[no_match_heads, counts, 0] = new_scores[no_match_heads]
+-            self.window_scores[no_match_heads, counts, 1] = float(local_id)
+-            self.window_scores[no_match_heads, counts, 2] = float(orig_id)
++    # REMOVED (Audit Bug 5): _update_window_scores_generation_vectorized was a dead method
++    # never called by any code path. The active pipeline uses scatter_add_ via scoreboard.
+ 
+     def _evict_from_window_scores(self):
+         # Checks purely valid values bypassing NaN allocations explicitly generated earlier
+@@ -558,11 +607,14 @@
+         # 1. Take out sink tokens and assign array
+         sinks = self.sink_indices.unsqueeze(0).expand(self.num_heads, -1)
+         
++        # [Steps 2 & 3 Removed: Redundant math deleted to enforce boundary synchronization]
++        
+         sticky_w = torch.nan_to_num(
+             self.window_scores[:, : self.k_windows, 1], nan=0.0
+         ).long()
+         window_tokens = self.window_to_token_map[sticky_w].view(self.num_heads, -1)
+         
++        # 4. Final local zone calculations building indices directly out to sequence end exclusively 
+         # FIX: Directly inject the exact boundary passed from the caller
+         local_start = local_start_idx
+         
+@@ -572,34 +624,31 @@
+         else:
+             all_indices = torch.cat([sinks, window_tokens], dim=1)
+             
++        # Optional: ensure unique and properly ordered (not strictly required here depending on generation assumptions, but safe metric)
+         # Using simple clamping for gather safety preventing OutOfBounds indexing exceptions natively
+         all_indices_clamped = torch.clamp(all_indices, 0, seq_len - 1)
+         
+-        # WE MUST SORT AND DEDUPLICATE PER HEAD so the physical KV cache stays chronological
+-        # and so that the ledger mapping correctly aligns with the physical tensor dimensions.
+-        # Vectorized dedup + sort: sort each head, then mask duplicate consecutive values
++        # Vectorized sort + dedup per head
++        SENTINEL = seq_len + 9999
+         sorted_vals, _ = torch.sort(all_indices_clamped, dim=1)
+-        is_unique = torch.ones(sorted_vals.shape, dtype=torch.bool, device=device)
+-        is_unique[:, 1:] = sorted_vals[:, 1:] != sorted_vals[:, :-1]
+-        counts = is_unique.sum(dim=1)
+-        max_len = counts.max().item()
+-        final_indices = torch.zeros((self.num_heads, max_len), device=device, dtype=sorted_vals.dtype)
+-        for h in range(self.num_heads):
+-            valid = sorted_vals[h, is_unique[h]]
+-            n = valid.shape[0]
+-            final_indices[h, :n] = valid
+-            if n < max_len:
+-                final_indices[h, n:] = valid[-1]
+-        
+-        # Gather using CUDA-accelerated or PyTorch fallback
+-        k_kept, v_kept = per_head_kv_gather(
+-            past_key_values[0][0], past_key_values[1][0], final_indices
++        keep = torch.ones_like(sorted_vals, dtype=torch.bool)
++        keep[:, 1:] = sorted_vals[:, 1:] != sorted_vals[:, :-1]
++        compacted = torch.where(keep, sorted_vals, torch.full_like(sorted_vals, SENTINEL))
++        compacted, _ = torch.sort(compacted, dim=1)
++        safe_len = (compacted < seq_len).sum(dim=1).min().item()
++        final_indices = compacted[:, :safe_len]
++        
++        # Shape indices exactly natively indexing vector space across head dimension arrays matching constraints
++        gather_idx = (
++            final_indices
++            .unsqueeze(-1)
++            .expand(-1, -1, head_dim)
+         )
+         
+         # Returns physically compressed parameters correctly matching gathered index
+         return (
+-            k_kept.unsqueeze(0),
+-            v_kept.unsqueeze(0),
++            torch.gather(past_key_values[0][0], 1, gather_idx).unsqueeze(0),
++            torch.gather(past_key_values[1][0], 1, gather_idx).unsqueeze(0),
+         ), final_indices
+ 
+     def _update_k_win_and_local_num(self, new_tokens, max_tokens):
+@@ -624,10 +673,15 @@
+         self.k_windows = max(0, available_sticky_tokens // self.omega)
+ 
+     def _clean_scores(self):
+-        # Hard resets dynamically tracking metrics inside class resetting variables unconditionally 
++        # Hard resets for cross-document isolation
+         self.gen_step = self.num_of_tokens_without_eviction = 0
+         self.tokens_since_last_review = 0
+         if hasattr(self, "running_attention_votes"):
+             self.running_attention_votes.zero_()
+         self.window_scores.fill_(float("nan"))
+         self.global_token_counter.zero_()
++        self.local_history.zero_()
++        self._prefill_done = False
++        self.logical_id_map = None
++        self._dynamic_local_count = 0
++        self.prompt_boundary = [-1 for _ in range(self.num_heads)]
+\ No newline at end of file
+--- LongBenchSticky_trial/engine.py	2026-04-22 21:50:33.000000000 +0530
++++ LongBenchSticky/engine.py	2026-04-23 20:29:51.000000000 +0530
+@@ -4,86 +4,43 @@
+ import re
+ import numpy as np
+ from typing import Dict, Any, List
++from scipy import stats
+ 
+ import sticky_config as config
+ import metrics
+ import data_loader
+-import utils
+ 
+-# ── Task Category Sets (for routing) ─────────────────────────────────────
+-QA_TASKS = {"narrativeqa", "qasper", "multifieldqa_en", "hotpotqa", "2wikimqa", "musique", "triviaqa"}
+-ROUGE_TASKS = {"gov_report", "qmsum", "multi_news", "samsum"}
+-CODE_TASKS = {"lcc", "repobench-p"}
+-CLASSIFICATION_TASKS = {"trec"}
+-COUNT_TASKS = {"passage_count"}
+-RETRIEVAL_TASKS = {"passage_retrieval_en"}
++DATASET_MAX_TOKENS = {
++    "narrativeqa": 128, "qasper": 128, "multifieldqa_en": 64,
++    "hotpotqa": 32, "2wikimqa": 32, "musique": 32,
++    "gov_report": 512, "qmsum": 512, "multi_news": 512,
++    "trec": 64, "triviaqa": 32, "samsum": 128,
++    "passage_count": 32, "passage_retrieval_en": 32,
++    "lcc": 64, "repobench-p": 64,
++}
++
++
++def calculate_ci(values, confidence=0.95):
++    if len(values) < 2:
++        return 0.0
++    sem = np.std(values, ddof=1) / np.sqrt(len(values))
++    return sem * stats.t.ppf((1 + confidence) / 2., len(values) - 1)
+ 
+-def get_ground_truth(ex: Dict[str, Any], task: str) -> List[str]:
+-    """
+-    Robust extraction of ground truth references for all 16 LongBench datasets.
+-    LongBench standardizes all datasets to have an 'answers' field (list of strings).
+-    Task-specific fallbacks handle edge cases.
+-    """
+-    # ── Code tasks: key is inconsistent across sources ────────────────
+-    if task in CODE_TASKS:
+-        possible_keys = ["answers", "answer", "target", "output", "reference", "completion"]
+-        for key in possible_keys:
+-            if key in ex:
+-                val = ex[key]
+-                if isinstance(val, list) and val:
+-                    return val
+-                if isinstance(val, str) and val.strip():
+-                    return [val]
+-
+-    # ── Summarization: may use 'summary' or 'targets' ────────────────
+-    if task in ROUGE_TASKS:
+-        if "answers" in ex:
+-            return ex["answers"]
+-        if "summary" in ex:
+-            return [ex["summary"]]
+-        if "targets" in ex:
+-            return ex["targets"]
+ 
+-    # ── Standard Fallback (QA, Classification, Synthetic, etc.) ──────
++def get_ground_truth(ex: Dict[str, Any], task: str) -> List[str]:
++    """Extract ground truth references. LongBench uses 'answers' (list of strings)."""
+     if "answers" in ex:
+         return ex["answers"]
+     if "answer" in ex:
+         val = ex["answer"]
+         return [val] if isinstance(val, str) else val
+-        
+     return []
+ 
+-def extract_answer_span(prediction: str, references: List[str]) -> str:
+-    """
+-    Standard 'Answer Inclusion' Logic:
+-    If the normalized reference appears within the normalized prediction,
+-    we extract it as the answer. This penalizes hallucinations (if answer is missing)
+-    but forgives 'chattiness' (if answer is surrounded by text).
+-    """
+-    pred_norm = utils.normalize_answer(prediction)
+-    
+-    # Check all valid references
+-    for ref in references:
+-        ref_norm = utils.normalize_answer(ref)
+-        
+-        # Safety: avoid matching empty or extremely short common words mistakenly
+-        if len(ref_norm) < 3: 
+-            continue
+-            
+-        if ref_norm in pred_norm:
+-            # FOUND IT: The model knows the answer.
+-            # We return the Reference string itself to ensure the Metric (F1/EM)
+-            # gives full credit for finding the correct information.
+-            return ref
+-            
+-    # If no reference is found, return the full prediction 
+-    # so the metric can penalize the wrong answer.
+-    return prediction
+ 
+-# UPDATED: Added 'task' argument
+-def generate(prompt, model, tokenizer, device, refs=None, task=None, **kwargs):
++def generate(prompt, model, tokenizer, device, task=None, **kwargs):
+     messages = [{"role": "user", "content": prompt}]
+-    formatted_prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
++    formatted_prompt = tokenizer.apply_chat_template(
++        messages, tokenize=False, add_generation_prompt=True)
+ 
+     inputs = tokenizer(formatted_prompt, return_tensors="pt").to(device)
+ 
+@@ -91,9 +48,7 @@
+         torch.cuda.reset_peak_memory_stats()
+         torch.cuda.synchronize()
+ 
+-    # =========================================================================
+-    # 🧹 1. PRE-GENERATION CLEANUP & RESET
+-    # =========================================================================
++    # Reset sticky KV cache state between samples
+     if hasattr(model, "model") and hasattr(model.model, "layers"):
+         for layer in model.model.layers:
+             if hasattr(layer, "self_attn") and hasattr(layer.self_attn, "_clean_cache"):
+@@ -103,15 +58,20 @@
+ 
+     if device == "cuda":
+         torch.cuda.synchronize()
+-        torch.cuda.empty_cache() 
+-        torch.cuda.reset_peak_memory_stats() # <--- CRITICAL: Reset stats here
++        torch.cuda.empty_cache()
++        torch.cuda.reset_peak_memory_stats()
+         start_mem = torch.cuda.memory_allocated()
+ 
++    gen_config = {k: v for k, v in config.GENERATION_CONFIG.items()}
++    if task and task in DATASET_MAX_TOKENS:
++        gen_config["max_new_tokens"] = DATASET_MAX_TOKENS[task]
++        config.GENERATION_CONFIG["max_new_tokens"] = DATASET_MAX_TOKENS[task]
++
+     start = time.perf_counter()
+     with torch.no_grad():
+         out = model.generate(
+             **inputs,
+-            **config.GENERATION_CONFIG,
++            **gen_config,
+             pad_token_id=tokenizer.eos_token_id,
+             **kwargs
+         )
+@@ -119,132 +79,81 @@
+         torch.cuda.synchronize()
+ 
+     total_time = time.perf_counter() - start
+-    
++
+     input_len = inputs.input_ids.shape[1]
+     gen_tokens = out.shape[1] - input_len
+     raw_text = tokenizer.decode(out[0][input_len:], skip_special_tokens=True)
+-    
+-    # ---------------------------------------------------------
+-    # Dataset-Specific Cleaning Logic
+-    # ---------------------------------------------------------
+-    if task in CODE_TASKS:
+-        # For Code tasks, strip markdown fences and chatty prefixes
+-        clean_text = utils.clean_code_output(raw_text)
+-    elif task in QA_TASKS and refs:
+-        # For QA tasks, try to extract the specific answer span
+-        clean_text = extract_answer_span(raw_text, refs)
+-    elif task in ROUGE_TASKS:
+-        # For Summarization, strip chatty preamble before ROUGE scoring
+-        clean_text = utils.clean_summary_output(raw_text)
+-    elif task in CLASSIFICATION_TASKS:
+-        # For Classification (TREC), strip preamble for label matching
+-        clean_text = utils.clean_classification_output(raw_text)
+-    else:
+-        # Synthetic (passage_count, passage_retrieval_en) — use raw output
+-        clean_text = raw_text
+-    # ---------------------------------------------------------
+ 
+     peak_mem = torch.cuda.max_memory_allocated() if device == "cuda" else 0
+-    
++
+     del inputs
+     del out
+-    
++
+     return {
+-        "text": clean_text,
+-        "raw_text": raw_text,
++        "text": raw_text,
+         "tokens": gen_tokens,
+         "time": total_time,
+-        "peak_mem": peak_mem
++        "peak_mem": peak_mem,
+     }
+ 
+-def evaluate_dataset(name, dataset, seed, model, tokenizer, device):
++
++def evaluate_dataset(name, dataset, seed, model, tokenizer, device, max_samples=None):
+     torch.manual_seed(seed)
+     np.random.seed(seed)
+ 
+     results = []
+-    # Use fallback 100 if attribute doesn't exist to not break other pipelines
+-    sample_size = min(getattr(config, "LONGBENCH_SAMPLES", 100), len(dataset))
++    sample_size = len(dataset) if max_samples is None else min(max_samples, len(dataset))
+ 
+     for i in range(sample_size):
+         ex = dataset[i]
+         try:
+             prompt = data_loader.build_prompt(ex, name)
+         except ValueError as e:
+-            print(f"⚠️  {e}, skipping example")
++            print(f"  {e}, skipping example")
+             continue
+ 
+         refs = get_ground_truth(ex, name)
+         if not refs:
+             continue
+ 
+-        # Pass refs and task to generate for task-specific cleaning
+-        gen = generate(prompt, model, tokenizer, device, refs=refs, task=name, use_cache=True)
+-        
+-        # ── Metric Routing (Official LongBench dataset2metric) ────
+-        if name in ROUGE_TASKS:
+-            ref_text = refs[0] if refs else ""
+-            m = metrics.rouge_metrics(gen["text"], ref_text)
+-        elif name in CODE_TASKS:
+-            ref_text = refs[0] if refs else ""
+-            score = metrics.code_sim_score(gen["text"], ref_text)
+-            m = {"edit_sim": score}
+-        elif name in CLASSIFICATION_TASKS:
+-            # TREC: all_classes is stored per-example in the dataset
+-            all_classes = ex.get("all_classes", [])
+-            ref_text = refs[0] if refs else ""
+-            score = metrics.classification_score(gen["text"], ref_text, all_classes)
+-            m = {"cls_acc": score}
+-        elif name in COUNT_TASKS:
+-            ref_text = refs[0] if refs else ""
+-            score = metrics.count_score(gen["text"], ref_text)
+-            m = {"count_acc": score}
+-        elif name in RETRIEVAL_TASKS:
+-            ref_text = refs[0] if refs else ""
+-            score = metrics.retrieval_score(gen["text"], ref_text)
+-            m = {"retrieval_acc": score}
+-        else:
+-            # Default: QA F1 (narrativeqa, qasper, multifieldqa_en, hotpotqa, 2wikimqa, musique, triviaqa)
+-            m = metrics.qa_metrics(gen["text"], refs)
++        all_classes = ex.get("all_classes", [])
++
++        try:
++            gen = generate(prompt, model, tokenizer, device, task=name, use_cache=True)
++        except torch.cuda.OutOfMemoryError:
++            print(f"  OOM on sample {i}, skipping")
++            torch.cuda.empty_cache()
++            continue
+ 
+         if gen["tokens"] == 0:
+-            print("⚠️  Empty generation detected")
++            print("  Empty generation detected")
++
++        score = metrics.score_sample(name, gen["text"], refs, all_classes=all_classes)
+ 
+         throughput = (gen["tokens"] / gen["time"]) if gen["tokens"] > 1 and gen["time"] > 0 else 0.0
+ 
+         results.append({
+-            "metrics": m,
++            "score": score,
+             "tokens": gen["tokens"],
+             "time": gen["time"],
+             "throughput": throughput,
+-            "peak_mem": gen["peak_mem"]
++            "peak_mem": gen["peak_mem"],
+         })
+-        
++
+         if device == "cuda":
+             torch.cuda.empty_cache()
+-    
+-            # === Data Logger (NEW) ===
++
+     if results:
+-        metric_keys = results[0]["metrics"].keys()
+-        agg = {}
+-        for k in metric_keys:
+-            vals = [r["metrics"][k] for r in results]
+-            agg[k] = np.mean(vals)
+-            ci = utils.calculate_ci(vals, confidence=config.CONFIDENCE_LEVEL)
+-            agg[f"{k}_ci"] = ci
+-
+-        log_parts = [f"{name} (seed={seed})"]
+-        for k in sorted(metric_keys):
+-            mean = agg[k]
+-            ci = agg[f"{k}_ci"]
+-            log_parts.append(f"{k}: {mean:.4f} ± {ci:.4f}")
+-        print("   📊 " + " | ".join(log_parts))
++        scores = [r["score"] for r in results]
++        mean_score = np.mean(scores) * 100
++        ci = calculate_ci([s * 100 for s in scores], confidence=config.CONFIDENCE_LEVEL)
++        print(f"   {name} (seed={seed}) | score: {mean_score:.2f} +/- {ci:.2f}")
+     else:
+-        print(f"   📊 {name} (seed={seed}) — No valid results to log.")
++        print(f"   {name} (seed={seed}) -- No valid results to log.")
+ 
+     return {
+         "dataset": name,
+         "seed": seed,
+         "sample_size": len(results),
+-        "sample_adequacy_heuristic": len(results) >= config.MIN_SAMPLE_ADEQUACY,
+         "results": results
+     }
+--- LongBenchSticky_trial/metrics.py	2026-04-22 21:50:33.000000000 +0530
++++ LongBenchSticky/metrics.py	2026-04-23 20:29:53.000000000 +0530
+@@ -1,98 +1,81 @@
+ import re
++import string
+ from collections import Counter
+-from typing import Dict, List
+-import difflib
+-from rouge_score import rouge_scorer
+-import utils
++from typing import List
+ 
+-# Initialize scorer once
+-rouge = rouge_scorer.RougeScorer(["rouge1", "rouge2", "rougeL"], use_stemmer=True)
++from rouge import Rouge
++from fuzzywuzzy import fuzz
+ 
+-def qa_metrics(pred: str, refs: List[str]) -> Dict[str, float]:
+-    """
+-    Standard QA metrics: Exact Match (EM) and F1 Score.
+-    Used for: narrativeqa, qasper, multifieldqa_en, hotpotqa, 2wikimqa, musique, triviaqa
+-    """
+-    pred_tokens = utils.normalize(pred)
+-    best_f1 = 0.0
+-    em = 0.0
+-
+-    for r in refs:
+-        r_tokens = utils.normalize(r)
+-        if pred.strip() == r.strip():
+-            em = 1.0
+-        common = Counter(pred_tokens) & Counter(r_tokens)
+-        num_same = sum(common.values())
+-
+-        if not pred_tokens or not r_tokens:
+-            f1 = 0.0
+-        else:
+-            p = num_same / len(pred_tokens)
+-            r = num_same / len(r_tokens)
+-            f1 = 2 * p * r / (p + r) if (p + r) else 0.0
+-        best_f1 = max(best_f1, f1)
+-
+-    return {"em": em, "f1": best_f1}
+-
+-def rouge_metrics(pred: str, ref: str) -> Dict[str, float]:
+-    """
+-    Summarization metrics: ROUGE-1, ROUGE-2, ROUGE-L.
+-    Used for: gov_report, qmsum, multi_news, samsum
+-    """
+-    scores = rouge.score(ref, pred)
+-    return {k: v.fmeasure for k, v in scores.items()}
+ 
+-def code_sim_score(pred: str, ref: str) -> float:
+-    """
+-    Edit Similarity for code generation.
+-    Used for: lcc, repobench-p
+-    Calculates the Levenshtein edit similarity normalized by the length of the longer string.
+-    """
+-    # Standard LongBench implementation uses strict character matching without tokenization
+-    # to capture syntax sensitivity.
+-    if not pred and not ref:
+-        return 1.0
+-    if not pred or not ref:
++def normalize_answer(s):
++    """Lower text and remove punctuation, articles and extra whitespace."""
++    def remove_articles(text):
++        return re.sub(r"\b(a|an|the)\b", " ", text)
++    def white_space_fix(text):
++        return " ".join(text.split())
++    def remove_punc(text):
++        exclude = set(string.punctuation)
++        return "".join(ch for ch in text if ch not in exclude)
++    def lower(text):
++        return text.lower()
++    return white_space_fix(remove_articles(remove_punc(lower(s))))
++
++
++def f1_score(prediction, ground_truth):
++    common = Counter(prediction) & Counter(ground_truth)
++    num_same = sum(common.values())
++    if num_same == 0:
++        return 0
++    precision = 1.0 * num_same / len(prediction)
++    recall = 1.0 * num_same / len(ground_truth)
++    f1 = (2 * precision * recall) / (precision + recall)
++    return f1
++
++
++def qa_f1_score(prediction, ground_truth, **kwargs):
++    normalized_prediction = normalize_answer(prediction)
++    normalized_ground_truth = normalize_answer(ground_truth)
++    prediction_tokens = normalized_prediction.split()
++    ground_truth_tokens = normalized_ground_truth.split()
++    return f1_score(prediction_tokens, ground_truth_tokens)
++
++
++def rouge_score(prediction, ground_truth, **kwargs):
++    rouge = Rouge()
++    try:
++        scores = rouge.get_scores([prediction], [ground_truth], avg=True)
++    except Exception:
+         return 0.0
+-        
+-    matcher = difflib.SequenceMatcher(None, pred, ref)
+-    return matcher.ratio()
++    return scores["rouge-l"]["f"]
+ 
+ 
+-# ── Few-shot / Synthetic Metrics (Official THUDM Implementations) ────────
++def code_sim_score(prediction, ground_truth, **kwargs):
++    all_lines = prediction.lstrip('\n').split('\n')
++    prediction = ""
++    for line in all_lines:
++        if ('`' not in line) and ('#' not in line) and ('//' not in line):
++            prediction = line
++            break
++    return (fuzz.ratio(prediction, ground_truth) / 100)
+ 
+-def classification_score(prediction: str, ground_truth: str, all_classes: List[str]) -> float:
+-    """
+-    Classification accuracy for few-shot classification tasks.
+-    Used for: trec
+ 
+-    Checks which class labels appear in the prediction. If the ground truth
+-    label is among them, scores 1/N where N = number of matched classes
+-    (penalizes ambiguous predictions that match multiple classes).
+-    """
++def classification_score(prediction, ground_truth, **kwargs):
+     em_match_list = []
++    all_classes = kwargs["all_classes"]
+     for class_name in all_classes:
+         if class_name in prediction:
+             em_match_list.append(class_name)
+-    # Remove partial/substring matches that are NOT the ground truth
+     for match_term in list(em_match_list):
+         if match_term in ground_truth and match_term != ground_truth:
+             em_match_list.remove(match_term)
+     if ground_truth in em_match_list:
+-        score = 1.0 / len(em_match_list)
++        score = (1.0 / len(em_match_list))
+     else:
+         score = 0.0
+     return score
+ 
+ 
+-def count_score(prediction: str, ground_truth: str) -> float:
+-    """
+-    Counting accuracy for synthetic paragraph-counting tasks.
+-    Used for: passage_count
+-
+-    Extracts all numbers from the prediction and checks what fraction
+-    of them match the ground truth number.
+-    """
++def count_score(prediction, ground_truth, **kwargs):
+     numbers = re.findall(r"\d+", prediction)
+     right_num = 0
+     for number in numbers:
+@@ -102,14 +85,7 @@
+     return float(final_score)
+ 
+ 
+-def retrieval_score(prediction: str, ground_truth: str) -> float:
+-    """
+-    Retrieval accuracy for synthetic paragraph-retrieval tasks.
+-    Used for: passage_retrieval_en
+-
+-    Extracts the paragraph ID from the ground truth ("Paragraph X"),
+-    then checks what fraction of numbers in the prediction match it.
+-    """
++def retrieval_score(prediction, ground_truth, **kwargs):
+     pattern = r'Paragraph (\d+)'
+     matches = re.findall(pattern, ground_truth)
+     if not matches:
+@@ -121,4 +97,41 @@
+         if str(number) == str(ground_truth_id):
+             right_num += 1
+     final_score = 0.0 if len(numbers) == 0 else right_num / len(numbers)
+-    return float(final_score)
+\ No newline at end of file
++    return float(final_score)
++
++
++DATASET_TO_METRIC = {
++    "narrativeqa": qa_f1_score,
++    "qasper": qa_f1_score,
++    "multifieldqa_en": qa_f1_score,
++    "hotpotqa": qa_f1_score,
++    "2wikimqa": qa_f1_score,
++    "musique": qa_f1_score,
++    "gov_report": rouge_score,
++    "qmsum": rouge_score,
++    "multi_news": rouge_score,
++    "trec": classification_score,
++    "triviaqa": qa_f1_score,
++    "samsum": rouge_score,
++    "passage_retrieval_en": retrieval_score,
++    "passage_count": count_score,
++    "lcc": code_sim_score,
++    "repobench-p": code_sim_score,
++}
++
++
++def score_sample(dataset: str, prediction: str, ground_truths: List[str],
++                 all_classes: List[str] = None) -> float:
++    """
++    Score a single prediction against ground truths, matching DefensiveKV's get_score.
++    Returns best score across all ground truths (0-1 scale).
++    """
++    if dataset in ["trec", "triviaqa", "samsum", "lsht"]:
++        prediction = prediction.lstrip('\n').split('\n')[0]
++
++    metric_fn = DATASET_TO_METRIC[dataset]
++    best = 0.0
++    for gt in ground_truths:
++        best = max(best, metric_fn(prediction, gt,
++                                   all_classes=all_classes or []))
++    return best
+--- LongBenchSticky_trial/data_loader.py	2026-04-22 21:50:33.000000000 +0530
++++ LongBenchSticky/data_loader.py	2026-04-23 20:29:53.000000000 +0530
+@@ -3,85 +3,48 @@
+ from typing import Dict, Any
+ from datasets import Dataset
+ 
+-# Standardized Prompts (Official THUDM LongBench Templates)
+-PROMPT_TEMPLATES = {
+-    # ── Single/Multi-Document QA ──────────────────────────────────────
+-    "qa": (
+-        "Answer the question based on the given passages. "
+-        "Only give me the answer and do not output any other words.\n\n"
+-        "{context}\n\n"
+-        "Question: {input}\n\n"
+-        "Answer:"
+-    ),
+-    "narrativeqa": (
+-        "You are given a story, which can be either a novel or a movie script, "
+-        "and a question. Answer the question based on the story.\n\n"
+-        "Story:\n{context}\n\n"
+-        "Question:\n{input}\n\n"
+-        "Answer:"
+-    ),
+-
+-    # ── Summarization ─────────────────────────────────────────────────
+-    "qmsum": (
+-        "You are a helpful assistant. Read the meeting transcript below and write a detailed summary "
+-        "specifically answering the following query.\n\n"
+-        "Meeting Transcript:\n{context}\n\n"
+-        "Query: {input}\n\n"
+-        "Summary:"
+-    ),
+-    "gov_report": (
+-        "You are given a report by a government agency. "
+-        "Write a summary of the report.\n\n"
+-        "Report:\n{context}\n\n"
+-        "Summary:"
+-    ),
+-    "multi_news": (
+-        "You are given several news passages. Write a one-page summary of all news.\n\n"
+-        "News:\n{context}\n\n"
+-        "Now, write a one-page summary of all the news.\n\n"
+-        "Summary:"
+-    ),
+-
+-    # ── Few-shot Learning ─────────────────────────────────────────────
+-    "few_shot": (
+-        "{context}\n{input}"
+-    ),
+-
+-    # ── Synthetic ─────────────────────────────────────────────────────
+-    "passage_count": (
+-        "There are some paragraphs below sourced from Wikipedia. Some of them may be duplicates. "
+-        "Please carefully read these paragraphs and determine how many unique paragraphs there are "
+-        "after removing duplicates. In other words, how many non-repeating paragraphs are there in total?\n\n"
+-        "{context}\n\n"
+-        "Please enter the final count of unique paragraphs after removing duplicates. "
+-        "The output format should only contain the number, such as 1, 2, 3, and so on.\n\n"
+-        "The final answer is: "
+-    ),
+-    "passage_retrieval": (
+-        "Here are 30 paragraphs from Wikipedia, along with an abstract. "
+-        "Please determine which paragraph the abstract is from.\n\n"
+-        "{context}\n\n"
+-        "The following is an abstract.\n\n"
+-        "{input}\n\n"
+-        "Please enter the number of the paragraph that the abstract is from. "
+-        "The answer format must be like \"Paragraph 1\".\n"
+-    ),
+-
+-    # ── Code ──────────────────────────────────────────────────────────
+-    "code": (
+-        "You are a code completion engine. Continue the code provided below. "
+-        "Output ONLY the code continuation. "
+-        "Do NOT output markdown backticks (```). "
+-        "Do NOT add any explanations or conversational text.\n\n"
+-        "{input}"
+-    ),
+-    "code_completion": (
+-        "Please complete the code given below.\n\n"
+-        "{context}\n"
+-    ),
++# ── Exact DefensiveKV / THUDM LongBench prompt templates ──────────────────
++# Separated into context_prompt (wraps the context) and question_prompt
++# (wraps the input/question). Final prompt = context_prompt + question_prompt.
++
++CONTEXT_PROMPT = {
++    "narrativeqa": "You are given a story, which can be either a novel or a movie script, and a question. Answer the question asconcisely as you can, using a single phrase if possible. Do not provide any explanation.\n\nStory: {context}\n\n",
++    "qasper": "You are given a scientific article and a question. Answer the question as concisely as you can, using a single phrase or sentence if possible. If the question cannot be answered based on the information in the article, write \"unanswerable\". If the question is a yes/no question, answer \"yes\", \"no\", or \"unanswerable\". Do not provide any explanation.\n\nArticle: {context}\n\n",
++    "multifieldqa_en": "Read the following text and answer briefly.\n\n{context}\n\n",
++    "hotpotqa": "Answer the question based on the given passages. Only give me the answer and do not output any other words.\n\nThe following are given passages.\n{context}\n\n",
++    "2wikimqa": "Answer the question based on the given passages. Only give me the answer and do not output any other words.\n\nThe following are given passages.\n{context}\n\n",
++    "musique": "Answer the question based on the given passages. Only give me the answer and do not output any other words.\n\nThe following are given passages.\n{context}\n\n",
++    "gov_report": "You are given a report by a government agency. Write a one-page summary of the report.\n\nReport:\n{context}\n\n",
++    "qmsum": "You are given a meeting transcript and a query containing a question or instruction. Answer the query in one or more sentences.\n\nTranscript:\n{context}\n\n",
++    "multi_news": "You are given several news passages. Write a one-page summary of all news. \n\nNews:\n{context}\n\n",
++    "trec": "Please determine the type of the question below. Here are some examples of questions.\n\n{context}\n",
++    "triviaqa": "Answer the question based on the given passage. Only give me the answer and do not output any other words. The following are some examples.\n\n{context}\n\n",
++    "samsum": "Summarize the dialogue into a few short sentences. The following are some examples.\n\n{context}\n\n",
++    "passage_count": "There are some paragraphs below sourced from Wikipedia. Some of them may be duplicates. Please carefully read these paragraphs and determine how many unique paragraphs there are after removing duplicates. In other words, how many non-repeating paragraphs are there in total?\n\n{context}\n\n",
++    "passage_retrieval_en": "Here are 30 paragraphs from Wikipedia, along with an abstract. Please determine which paragraph the abstract is from.\n\n{context}\n\n",
++    "lcc": "Please complete the code given below. \n{context}",
++    "repobench-p": "Please complete the code given below. \n{context}",
++}
++
++QUESTION_PROMPT = {
++    "narrativeqa": "Now, answer the question based on the story asconcisely as you can, using a single phrase if possible. Do not provide any explanation.\n\nQuestion: {input}\n\nAnswer:",
++    "qasper": "Answer the question based on the above article as concisely as you can, using a single phrase or sentence if possible. If the question cannot be answered based on the information in the article, write \"unanswerable\". If the question is a yes/no question, answer \"yes\", \"no\", or \"unanswerable\". Do not provide any explanation.\n\nQuestion: {input}\n\nAnswer:",
++    "multifieldqa_en": "Now, answer the following question based on the above text, only give me the answer and do not output any other words.\n\nQuestion: {input}\nAnswer:",
++    "hotpotqa": "Answer the question based on the given passages. Only give me the answer and do not output any other words.\n\nQuestion: {input}\nAnswer:",
++    "2wikimqa": "Answer the question based on the given passages. Only give me the answer and do not output any other words.\n\nQuestion: {input}\nAnswer:",
++    "musique": "Answer the question based on the given passages. Only give me the answer and do not output any other words.\n\nQuestion: {input}\nAnswer:",
++    "gov_report": "Now, write a one-page summary of the report.\n\nSummary:",
++    "qmsum": "Now, answer the query based on the above meeting transcript in one or more sentences.\n\nQuery: {input}\nAnswer:",
++    "multi_news": "Now, write a one-page summary of all the news.\n\nSummary:",
++    "trec": "{input}",
++    "triviaqa": "{input}",
++    "samsum": "{input}",
++    "passage_count": "Please enter the final count of unique paragraphs after removing duplicates. The output format should only contain the number, such as 1, 2, 3, and so on.\n\nThe final answer is: ",
++    "passage_retrieval_en": "The following is an abstract.\n\n{input}\n\nPlease enter the number of the paragraph that the abstract is from. The answer format must be like \"Paragraph 1\", \"Paragraph 2\", etc.\n\nThe answer is: ",
++    "lcc": "Next line of code:\n",
++    "repobench-p": "{input}Next line of code:\n",
+ }
+ 
+-# CONFIG: Context length is now unrestricted for standardized LongBench testing.
+ 
+ def load_jsonl(path: str) -> Dataset:
+     records = []
+@@ -91,19 +54,14 @@
+                 records.append(json.loads(line))
+     return Dataset.from_list(records)
+ 
++
+ def load_datasets(root: str) -> Dict[str, Dataset]:
+     names = [
+-        # Single-Document QA
+         "narrativeqa", "qasper", "multifieldqa_en",
+-        # Multi-Document QA
+         "hotpotqa", "2wikimqa", "musique",
+-        # Summarization
+         "gov_report", "qmsum", "multi_news",
+-        # Few-shot Learning
+         "trec", "triviaqa", "samsum",
+-        # Synthetic
+         "passage_count", "passage_retrieval_en",
+-        # Code
+         "lcc", "repobench-p",
+     ]
+     out = {}
+@@ -113,56 +71,20 @@
+             ds = load_jsonl(p)
+             assert len(ds) > 0
+             out[n] = ds
+-            print(f"✓ Loaded {n} ({len(ds)})")
++            print(f"  Loaded {n} ({len(ds)})")
+         except Exception as e:
+-            print(f"✗ Skipping {n}: {e}")
++            print(f"  Skipping {n}: {e}")
+     if not out:
+         raise RuntimeError("No datasets loaded.")
+     return out
+ 
++
+ def build_prompt(example: Dict[str, Any], task: str) -> str:
+-    """Build the evaluation prompt for a LongBench task using official THUDM templates."""
+-    # 1. Fetch raw content
+-    ctx = example.get("context") or example.get("document") or ""
+-    inp = example.get("input") or example.get("question") or ""
+-
+-    # ── Single-Document QA ────────────────────────────────────────────
+-    if task == "narrativeqa":
+-        return PROMPT_TEMPLATES["narrativeqa"].format(context=ctx, input=inp)
+-
+-    # ── Single/Multi-Document QA (shared template) ───────────────────
+-    if task in ["qasper", "multifieldqa_en", "hotpotqa", "2wikimqa", "musique"]:
+-        return PROMPT_TEMPLATES["qa"].format(context=ctx, input=inp)
+-
+-    # ── Summarization ─────────────────────────────────────────────────
+-    if task == "qmsum":
+-        return PROMPT_TEMPLATES["qmsum"].format(context=ctx, input=inp)
+-
+-    if task == "gov_report":
+-        return PROMPT_TEMPLATES["gov_report"].format(context=ctx)
+-
+-    if task == "multi_news":
+-        return PROMPT_TEMPLATES["multi_news"].format(context=ctx)
+-
+-    # ── Few-shot Learning ─────────────────────────────────────────────
+-    # TREC, TriviaQA, SAMSum: context = few-shot examples, input = query
+-    if task in ["trec", "triviaqa", "samsum"]:
+-        return PROMPT_TEMPLATES["few_shot"].format(context=ctx, input=inp)
+-
+-    # ── Synthetic ─────────────────────────────────────────────────────
+-    if task == "passage_count":
+-        return PROMPT_TEMPLATES["passage_count"].format(context=ctx)
+-
+-    if task == "passage_retrieval_en":
+-        return PROMPT_TEMPLATES["passage_retrieval"].format(context=ctx, input=inp)
+-
+-    # ── Code ──────────────────────────────────────────────────────────
+-    if task == "lcc":
+-        # LCC stores code in 'context', not 'input'
+-        code_source = ctx if ctx else inp
+-        return PROMPT_TEMPLATES["code"].format(input=code_source)
++    """Build the evaluation prompt matching DefensiveKV's exact templates."""
++    ctx = example.get("context", "") or ""
++    inp = example.get("input", "") or ""
+ 
+-    if task == "repobench-p":
+-        return PROMPT_TEMPLATES["code_completion"].format(context=ctx)
++    if task not in CONTEXT_PROMPT:
++        raise ValueError(f"Unknown task: {task}")
+ 
+-    raise ValueError(f"Unknown task: {task}")
+\ No newline at end of file
++    return CONTEXT_PROMPT[task].format(context=ctx) + QUESTION_PROMPT[task].format(input=inp)
+--- LongBenchSticky_trial/Results/run_longbench_sticky.py	2026-04-22 21:50:33.000000000 +0530
++++ LongBenchSticky/Results/run_longbench_sticky.py	2026-04-23 20:29:46.000000000 +0530
+@@ -2,10 +2,10 @@
+ import os
+ import json
+ import time
++import argparse
+ import torch
+ from transformers import AutoTokenizer
+ 
+-# Add parent directory to path to import engine, data_loader, etc.
+ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+ 
+ import engine
+@@ -14,65 +14,79 @@
+ from sticky_llama_model import STICKYLlamaForCausalLM
+ from configuration_sticky_llama import LlamaConfig
+ 
++
+ def main():
+     print(f"Loading StickyLlama (Custom Cumulative Logic) from {config.MODEL_PATH}...")
+-    
+-    # Load Sticky LLaMA
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--gpu", type=int, default=0, help="GPU index to use")
++    parser.add_argument("--tasks", type=str, default=None,
++                        help="Comma-separated dataset names (e.g. 2wikimqa,hotpotqa)")
++    parser.add_argument("--samples", type=int, default=None,
++                        help="Max samples per dataset (default: all)")
++    args = parser.parse_args()
++
++    device = "cuda"
++
++    data_dir = "/home/ee/phd/eez228470/kv_cache/defensive_kv_new/DefensiveKV/Final_LongBench_Dataset"
++
++    if args.tasks:
++        test_tasks = [t.strip() for t in args.tasks.split(",")]
++    else:
++        test_tasks = sorted(f.replace(".jsonl", "")
++                            for f in os.listdir(data_dir) if f.endswith(".jsonl"))
++
++    print(f"[GPU {args.gpu}] Loading model from {config.MODEL_PATH}...")
++
+     try:
+         model_config = LlamaConfig.from_pretrained(config.MODEL_PATH)
+-        
+-        # Resolve RoPE configurations
++
+         if hasattr(model_config, "rope_scaling") and model_config.rope_scaling is not None:
+             if "rope_type" in model_config.rope_scaling and "type" not in model_config.rope_scaling:
+                 model_config.rope_scaling["type"] = model_config.rope_scaling["rope_type"]
+-        
++
+         model_config.rope_theta = getattr(model_config, "rope_theta", 500000.0)
+-        
+-        # Inject custom sticky config variables
+         model_config.r_ratio = getattr(config, "R_RATIO", 50)
+-        
+-        # Either P_RATIO or LOCAL_NUM_TOKENS will be present
++
+         if hasattr(config, "P_RATIO"):
+             model_config.p_ratio = config.P_RATIO
+         elif hasattr(config, "LOCAL_NUM_TOKENS"):
+             model_config.local_num_tokens = config.LOCAL_NUM_TOKENS
+-            
++
+         model_config.start_idx = getattr(config, "S_IDX", 0)
+ 
+         model = STICKYLlamaForCausalLM.from_pretrained(
+-            config.MODEL_PATH, 
+-            config=model_config, 
+-            torch_dtype=torch.bfloat16, 
++            config.MODEL_PATH,
++            config=model_config,
++            torch_dtype=torch.bfloat16,
+             device_map="auto"
+         )
+         tokenizer = AutoTokenizer.from_pretrained(config.MODEL_PATH)
+-        
++
+         if tokenizer.pad_token is None:
+             tokenizer.pad_token = tokenizer.eos_token
+-            
++
+     except Exception as e:
+-        print(f"Error loading model: {e}")
++        print(f"[GPU {args.gpu}] Error loading model: {e}")
+         return
+ 
+-    print("Model and Tokenizer loaded successfully.")
+-
+-    # Load LongBench datasets
+-    data_dir = "/home/ee/phd/eez228470/kv_cache/defensive_kv_new/DefensiveKV/Final_LongBench_Dataset"
+-    print(f"Loading datasets from {data_dir}...")
++    print(f"[GPU {args.gpu}] Model loaded. Tasks: {test_tasks}")
+ 
+-    # Quick sanity check: only run 2wikimqa
+-    test_tasks = ["2wikimqa"]
+     datasets = {}
+     for t in test_tasks:
+-        ds = data_loader.load_jsonl(os.path.join(data_dir, f"{t}.jsonl"))
++        path = os.path.join(data_dir, f"{t}.jsonl")
++        if not os.path.exists(path):
++            print(f"[GPU {args.gpu}] WARNING: {t}.jsonl not found, skipping")
++            continue
++        ds = data_loader.load_jsonl(path)
+         datasets[t] = ds
+-        print(f"✓ Loaded {t} ({len(ds)})")
++        max_tok = engine.DATASET_MAX_TOKENS.get(t, config.GENERATION_CONFIG["max_new_tokens"])
++        print(f"  Loaded {t} ({len(ds)} samples, max_new_tokens={max_tok})")
+ 
+     all_results = {}
+     total_start = time.time()
+-    
++
+     for task_name, dataset in datasets.items():
+-        print(f"\nEvaluating dataset: {task_name}")
++        print(f"\n[GPU {args.gpu}] Evaluating: {task_name}")
+         for seed in config.SEEDS:
+             task_start = time.time()
+             res = engine.evaluate_dataset(
+@@ -81,26 +95,28 @@
+                 seed=seed,
+                 model=model,
+                 tokenizer=tokenizer,
+-                device="cuda"
++                device=device,
++                max_samples=args.samples,
+             )
+             task_elapsed = time.time() - task_start
+-            
++
+             if task_name not in all_results:
+                 all_results[task_name] = []
+             all_results[task_name].append(res)
+-            
++
+             n = res['sample_size']
+-            print(f"Completed {task_name} (Seed {seed}): {n} samples in {task_elapsed:.1f}s ({task_elapsed/n:.2f}s/sample)")
+-    
++            per_sample = task_elapsed / n if n > 0 else 0
++            print(f"[GPU {args.gpu}] Done {task_name} (Seed {seed}): "
++                  f"{n} samples in {task_elapsed:.1f}s ({per_sample:.2f}s/sample)")
++
+     total_elapsed = time.time() - total_start
+-    print(f"\n⏱ Total evaluation time: {total_elapsed:.1f}s ({total_elapsed/60:.1f} min)")
++    print(f"\n[GPU {args.gpu}] Total: {total_elapsed:.1f}s ({total_elapsed/60:.1f} min)")
+ 
+-    # Save outputs as NPZ
+     import numpy as np
+-    output_file = "long_bench_sticky_metrics.npz"
++    output_file = f"results_gpu{args.gpu}.npz"
+     np.savez_compressed(output_file, data=np.array([json.dumps(all_results)]))
+-    
+-    print(f"\nAll evaluations complete. Results saved to {output_file}")
++    print(f"[GPU {args.gpu}] Saved to {output_file}")
++
+ 
+ if __name__ == "__main__":
+     main()
+--- LongBenchSticky_trial/requirements.txt	2026-04-22 21:50:33.000000000 +0530
++++ LongBenchSticky/requirements.txt	2026-04-23 20:29:54.000000000 +0530
+@@ -8,5 +8,7 @@
+ matplotlib
+ seaborn
+ pandas
+-rouge-score
++rouge
++fuzzywuzzy
++python-Levenshtein
+ ninja
+--- /dev/null	2026-01-27 15:47:05.363817842 +0530
++++ LongBenchSticky/run_debug.py	2026-04-24 01:01:26.000000000 +0530
+@@ -0,0 +1,81 @@
++"""
++Debug runner: verify flash attention matrix matches reference matmul+softmax.
++Output: debug_attn.jsonl (head 0, layer 0)
++"""
++import os
++import sys
++import json
++import torch
++
++os.environ["STICKY_DEBUG"] = "1"
++os.environ["STICKY_DEBUG_LAYER"] = "0"
++os.environ["STICKY_DEBUG_FILE"] = "debug_attn.txt"
++
++if os.path.exists("debug_attn.txt"):
++    os.remove("debug_attn.txt")
++
++import sticky_config as config
++import engine
++import data_loader
++from sticky_llama_model import STICKYLlamaForCausalLM
++from configuration_sticky_llama import LlamaConfig
++from transformers import AutoTokenizer
++
++config.GENERATION_CONFIG["max_new_tokens"] = 32
++
++print("Loading model...")
++model_config = LlamaConfig.from_pretrained(config.MODEL_PATH)
++if hasattr(model_config, "rope_scaling") and model_config.rope_scaling is not None:
++    if "rope_type" in model_config.rope_scaling and "type" not in model_config.rope_scaling:
++        model_config.rope_scaling["type"] = model_config.rope_scaling["rope_type"]
++model_config.rope_theta = getattr(model_config, "rope_theta", 500000.0)
++model_config.r_ratio = getattr(config, "R_RATIO", 50)
++if hasattr(config, "LOCAL_NUM_TOKENS"):
++    model_config.local_num_tokens = config.LOCAL_NUM_TOKENS
++model_config.start_idx = getattr(config, "S_IDX", 0)
++
++model = STICKYLlamaForCausalLM.from_pretrained(
++    config.MODEL_PATH, config=model_config,
++    torch_dtype=torch.bfloat16, device_map="auto"
++)
++tokenizer = AutoTokenizer.from_pretrained(config.MODEL_PATH)
++if tokenizer.pad_token is None:
++    tokenizer.pad_token = tokenizer.eos_token
++
++print("Model loaded. Running debug...")
++
++prompt_text = "I am Ayushman Garg from Delhi living in Bangalore. I am Ayushman Garg from Delhi living in Bangalore. I am Ayushman Garg from Delhi living in Bangalore. a"
++inputs = tokenizer(prompt_text, return_tensors="pt").to("cuda")
++print(f"Token count: {inputs.input_ids.shape[1]}")
++print(f"Token IDs: {inputs.input_ids[0].tolist()}")
++print(f"Tokens: {tokenizer.convert_ids_to_tokens(inputs.input_ids[0])}")
++
++from sticky_llama_attention_fast_attention import _debug_tokens
++_debug_tokens.clear()
++_debug_tokens.extend(tokenizer.convert_ids_to_tokens(inputs.input_ids[0]))
++
++# Reset KV cache
++if hasattr(model, "model") and hasattr(model.model, "layers"):
++    for layer in model.model.layers:
++        if hasattr(layer, "self_attn") and hasattr(layer.self_attn, "_clean_cache"):
++            layer.self_attn._clean_cache()
++            if hasattr(layer.self_attn, "kv_cache"):
++                layer.self_attn.kv_cache._prefill_done = False
++
++import time
++start = time.perf_counter()
++with torch.no_grad():
++    out = model.generate(**inputs, max_new_tokens=10, do_sample=False,
++                         pad_token_id=tokenizer.eos_token_id, use_cache=True)
++elapsed = time.perf_counter() - start
++
++input_len = inputs.input_ids.shape[1]
++gen_tokens = out.shape[1] - input_len
++gen_text = tokenizer.decode(out[0][input_len:], skip_special_tokens=True)
++gen = {"text": gen_text, "tokens": gen_tokens, "time": elapsed}
++
++print(f"Generated: {gen['text']}")
++print(f"Tokens: {gen['tokens']}, Time: {gen['time']:.2f}s")
++
++print(f"\nDebug written to: debug_attn.txt")
++print(f"Open it to see step-by-step attention analysis.")
+--- /dev/null	2026-01-27 15:47:05.363817842 +0530
++++ LongBenchSticky/debug_data.jsonl	2026-04-23 20:29:56.000000000 +0530
+@@ -0,0 +1 @@
++{"input": "", "context": "I am Ayushman Garg from Delhi living in Bangalore. ydfyiciy khjcuyc iy hjcxtuxu hucx", "answers": ["Bangalore"], "length": 10, "dataset": "debug", "language": "en", "all_classes": [], "_id": "debug_0"}
+--- /dev/null	2026-01-27 15:47:05.363817842 +0530
++++ LongBenchSticky/launch_all.sh	2026-04-23 20:29:52.000000000 +0530
+@@ -0,0 +1,51 @@
++#!/bin/bash
++# Launch 7 parallel GPU jobs for all 16 LongBench datasets.
++# CUDA_VISIBLE_DEVICES is set at shell level BEFORE Python starts.
++#
++# Usage:  bash launch_all.sh
++
++cd "$(dirname "$0")"
++export PYTHONUNBUFFERED=1
++
++GPU0_TASKS="gov_report"
++GPU1_TASKS="qmsum,trec"
++GPU2_TASKS="narrativeqa,lcc"
++GPU3_TASKS="musique,samsum"
++GPU4_TASKS="multi_news,hotpotqa,passage_count"
++GPU5_TASKS="repobench-p,triviaqa,2wikimqa"
++GPU6_TASKS="passage_retrieval_en,qasper,multifieldqa_en"
++
++echo "============================================"
++echo "Launching 7 parallel LongBench evaluations"
++echo "============================================"
++echo "GPU 0: $GPU0_TASKS"
++echo "GPU 1: $GPU1_TASKS"
++echo "GPU 2: $GPU2_TASKS"
++echo "GPU 3: $GPU3_TASKS"
++echo "GPU 4: $GPU4_TASKS"
++echo "GPU 5: $GPU5_TASKS"
++echo "GPU 6: $GPU6_TASKS"
++echo "============================================"
++
++mkdir -p logs
++
++CUDA_VISIBLE_DEVICES=0 python Results/run_longbench_sticky.py --gpu 0 --tasks "$GPU0_TASKS" > logs/gpu0.log 2>&1 &
++CUDA_VISIBLE_DEVICES=1 python Results/run_longbench_sticky.py --gpu 1 --tasks "$GPU1_TASKS" > logs/gpu1.log 2>&1 &
++CUDA_VISIBLE_DEVICES=2 python Results/run_longbench_sticky.py --gpu 2 --tasks "$GPU2_TASKS" > logs/gpu2.log 2>&1 &
++CUDA_VISIBLE_DEVICES=3 python Results/run_longbench_sticky.py --gpu 3 --tasks "$GPU3_TASKS" > logs/gpu3.log 2>&1 &
++CUDA_VISIBLE_DEVICES=4 python Results/run_longbench_sticky.py --gpu 4 --tasks "$GPU4_TASKS" > logs/gpu4.log 2>&1 &
++CUDA_VISIBLE_DEVICES=5 python Results/run_longbench_sticky.py --gpu 5 --tasks "$GPU5_TASKS" > logs/gpu5.log 2>&1 &
++CUDA_VISIBLE_DEVICES=6 python Results/run_longbench_sticky.py --gpu 6 --tasks "$GPU6_TASKS" > logs/gpu6.log 2>&1 &
++
++echo ""
++echo "All 7 jobs launched. Logs in LongBenchSticky/logs/"
++echo "Monitor:  tail -f logs/gpu*.log"
++echo "Check:    grep 'Total:' logs/gpu*.log"
++echo ""
++
++wait
++echo "============================================"
++echo "All jobs finished!"
++echo "============================================"
++grep "Total:" logs/gpu*.log
++grep "score:" logs/gpu*.log

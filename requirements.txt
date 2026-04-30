@@ -8,5 +8,7 @@ tqdm
 matplotlib
 seaborn
 pandas
-rouge-score
+rouge
+fuzzywuzzy
+python-Levenshtein
 ninja

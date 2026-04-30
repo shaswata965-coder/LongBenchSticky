@@ -1,0 +1,322 @@
+--- /tmp/attn_before.py	2026-04-27 17:30:45.054185749 +0530
++++ sticky_llama_attention_fast_attention.py	2026-04-27 17:31:19.000000000 +0530
+@@ -1,6 +1,7 @@
+ import torch
+ from torch import nn
+ import math
++import os
+ from typing import Optional, Tuple
+ import torch.nn.functional as F
+ from flash_attn import flash_attn_func
+@@ -11,6 +12,17 @@
+     STICKYKVCache_LayerWise
+ )
+ 
++_ATTN_DEBUG = os.environ.get("STICKY_DEBUG", "0") == "1"
++_ATTN_DEBUG_LAYER = int(os.environ.get("STICKY_DEBUG_LAYER", "0"))
++_ATTN_DEBUG_FILE = os.environ.get("STICKY_DEBUG_FILE", "debug_attn.txt")
++_ATTN_DEBUG_HEADS = int(os.environ.get("STICKY_DEBUG_HEADS", "4"))
++
++def _attn_log(text):
++    if not _ATTN_DEBUG:
++        return
++    with open(_ATTN_DEBUG_FILE, "a") as f:
++        f.write(text + "\n")
++
+ class Llama3RotaryEmbedding(nn.Module):
+     def __init__(self, dim, max_position_embeddings=None, base=None, device=None, scaling_factor=None, low_freq_factor=None, high_freq_factor=None, original_max_position_embeddings=None):
+         super().__init__()
+@@ -284,6 +296,21 @@
+             # since historically it expects a 4D tensor where dim=2 is q_len. Here q_len acts as "1" accumulated metric.
+             accumulated_scores = accumulated_scores.unsqueeze(2)
+             
++            if _ATTN_DEBUG and self.layer_idx == _ATTN_DEBUG_LAYER:
++                w = _attn_log
++                w(f"\n{'='*70}")
++                w(f"=== PREFILL ATTENTION SCORES (Layer {self.layer_idx}) ===")
++                w(f"{'='*70}")
++                w(f"q_len={q_len}, kv_seq_len={kv_seq_len_full}, past_len={past_len}")
++                w(f"num_q_heads={self.num_heads}, num_kv_heads={self.num_key_value_heads}, GQA_groups={self.num_key_value_groups}")
++                w(f"accumulated_scores shape: {accumulated_scores.shape}")
++                for h in range(min(_ATTN_DEBUG_HEADS, self.num_key_value_heads)):
++                    col_sums = accumulated_scores[0, h, 0, :].tolist()
++                    w(f"\n  KV-Head {h} column sums (sum of attention each KV token received from ALL queries):")
++                    w(f"    first 30: {[f'{v:.4f}' for v in col_sums[:30]]}")
++                    w(f"    last  10: {[f'{v:.4f}' for v in col_sums[-10:]]}")
++                    w(f"    total: {sum(col_sums):.4f}, max: {max(col_sums):.4f} at pos {col_sums.index(max(col_sums))}")
++
+             # Remove full_attn_scores matrix logging to prevent OOM
+             past_key_value = self.kv_cache(past_key_value, accumulated_scores.detach(), q_len=q_len)
+             
+@@ -306,6 +333,17 @@
+             else:
+                 scores_for_cache = attn_weights
+     
++            if _ATTN_DEBUG and self.layer_idx == _ATTN_DEBUG_LAYER:
++                w = _attn_log
++                gen_step = self.kv_cache.gen_step
++                w(f"\n--- GEN STEP {gen_step} ATTENTION (Layer {self.layer_idx}) ---")
++                w(f"  cache_len={key_states_rep.shape[2]}, scores_for_cache shape={scores_for_cache.shape}")
++                for h in range(min(_ATTN_DEBUG_HEADS, self.num_key_value_heads)):
++                    row = scores_for_cache[0, h, 0, :].tolist()
++                    w(f"  KV-Head {h}: attn weights = {[f'{v:.4f}' for v in row[:20]]}{'...' if len(row) > 20 else ''}")
++                    top5_vals, top5_idx = torch.topk(scores_for_cache[0, h, 0, :], min(5, len(row)))
++                    w(f"    top-5 positions: {top5_idx.tolist()} with weights: {[f'{v:.4f}' for v in top5_vals.tolist()]}")
++
+             past_key_value = self.kv_cache(past_key_value, scores_for_cache.detach(), q_len=q_len)
+                     
+             # 7. Final Attention Output
+--- /tmp/kv_before.py	2026-04-27 17:30:45.058185754 +0530
++++ sticky_kv_logic_fast_attention.py	2026-04-27 17:33:38.000000000 +0530
+@@ -1,8 +1,20 @@
+ import torch
+ from torch import nn
+ import math
++import os
+ from transformers.models.llama.modeling_llama import rotate_half
+ 
++_KV_DEBUG = os.environ.get("STICKY_DEBUG", "0") == "1"
++_KV_DEBUG_LAYER = int(os.environ.get("STICKY_DEBUG_LAYER", "0"))
++_KV_DEBUG_FILE = os.environ.get("STICKY_DEBUG_FILE", "debug_attn.txt")
++_KV_DEBUG_HEADS = int(os.environ.get("STICKY_DEBUG_HEADS", "4"))
++
++def _kv_log(text):
++    if not _KV_DEBUG:
++        return
++    with open(_KV_DEBUG_FILE, "a") as f:
++        f.write(text + "\n")
++
+ '''
+ Duplicates the KV heads n_rep times using memory-efficient 
+ expansion to match the number of query heads for GQA/MQA.
+@@ -240,14 +252,18 @@
+ 
+ 
+         if not self._prefill_done:  # Prompt Stage Active
+-            # Determine local token count precisely either fixed constraint or dynamic ratio calculation
+-            # FIX: Use sequence length and local_cache_ratio instead of local_num (which is 0 at init)
+-            # Unconditionally trust the CFO Allocator's token math
+             local_tokens_count = self.local_num_tokens if self.use_fixed_local_tokens else self.local_num
+-            
+-            # Application boundary: Exclude Sinks, Local windows, and Observation windows
+-            # Define logical point where eviction boundaries MUST end and local bubble starts
+             score_end = max(self.sink_tokens, seq_len - local_tokens_count)
++
++            if _KV_DEBUG and self.layer_idx == _KV_DEBUG_LAYER:
++                w = _kv_log
++                w(f"\n{'='*70}")
++                w(f"=== PREFILL EVICTION (Layer {self.layer_idx}) ===")
++                w(f"{'='*70}")
++                w(f"  seq_len={seq_len}, omega={self.omega}, sink_tokens={self.sink_tokens}")
++                w(f"  k_windows={self.k_windows}, local_num={self.local_num}, local_num_tokens(config)={self.local_num_tokens}")
++                w(f"  cache_size={self.cache_size}, r_ratio={self.total_cache_ratio}%")
++                w(f"  initial local_tokens_count={local_tokens_count}, initial score_end={score_end}")
+             
+             # Find complete blocks capable of being tracked and potentially evicted
+             num_windows = max(0, (score_end - self.sink_tokens) // self.omega)
+@@ -266,7 +282,13 @@
+             # Persist the dynamic local count so generation eviction uses the same boundary
+             self._dynamic_local_count = local_tokens_count
+             # -----------------------------
+-            
++
++            if _KV_DEBUG and self.layer_idx == _KV_DEBUG_LAYER:
++                w = _kv_log
++                w(f"  AFTER SNAP: score_end={score_end}, num_windows={num_windows}")
++                w(f"  final local_tokens_count={local_tokens_count} (includes remainder)")
++                w(f"  Zone layout: [0..{self.sink_tokens-1}]=SINKS | [{self.sink_tokens}..{score_end-1}]=EVICTABLE ({num_windows} windows) | [{score_end}..{seq_len-1}]=LOCAL ({local_tokens_count} tokens)")
++
+             if num_windows > 0:
+                 # FIX: Use full NxN prefill attention mapped onto the aligned eviction space
+                 scores_slice = attn_score_cache[0, :, :seq_len, self.sink_tokens:score_end]
+@@ -281,6 +303,13 @@
+                 self.window_scores[self.head_indices.unsqueeze(1), idx, 1] = idx.float()
+                 self.window_scores[self.head_indices.unsqueeze(1), idx, 2] = idx.float()
+ 
++            if _KV_DEBUG and self.layer_idx == _KV_DEBUG_LAYER and num_windows > 0:
++                w = _kv_log
++                w(f"\n  --- ALL WINDOW SCORES (before top-K) ---")
++                for h in range(min(_KV_DEBUG_HEADS, self.num_heads)):
++                    ws = win_scores[h, :num_windows].tolist()
++                    w(f"    Head {h}: {[f'{v:.4f}' for v in ws]}")
++
+             # Seed local_history from full prefill attention (cumulative scores so far).
+             # Everything currently in the "Local Zone" will at some point roll over to the "Evictable Zone"
+             # It inherently needs the mass of the prompt to be fair for eviction decisions.
+@@ -310,19 +339,44 @@
+             # Compress scores tensor directly down to Top 'K' specified winners initially via evict
+             self._evict_from_window_scores()
+ 
+-            # Tracking logic removed per Fast Attention v2 instructions.
++            if _KV_DEBUG and self.layer_idx == _KV_DEBUG_LAYER:
++                w = _kv_log
++                w(f"\n  --- TOP-K SURVIVORS (after eviction, k_windows={self.k_windows}) ---")
++                for h in range(min(_KV_DEBUG_HEADS, self.num_heads)):
++                    valid = ~torch.isnan(self.window_scores[h, :, 1])
++                    n_valid = valid.sum().item()
++                    ids = self.window_scores[h, :n_valid, 1].tolist()
++                    scores = self.window_scores[h, :n_valid, 0].tolist()
++                    w(f"    Head {h}: winner_ids={[int(x) for x in ids]}, scores={[f'{v:.4f}' for v in scores]}")
++
++                w(f"\n  --- LOCAL HISTORY (prefill scores for future challengers) ---")
++                for h in range(min(_KV_DEBUG_HEADS, self.num_heads)):
++                    lh = self.local_history[h, :total_prompt_windows].tolist() if total_prompt_windows > 0 else []
++                    w(f"    Head {h}: {[f'{v:.4f}' for v in lh]}")
+ 
+             updated_kv, survivor_ids = self._create_mask_and_evict_from_kv_cache_prompt_stage(
+                 past_key_values, attn_score_cache, score_end
+             )
+             
+-            # THE FIX: Store explicitly mapped Logical IDs, completely eliminating coordinate math later
+             self.logical_id_map = torch.where(
+                 survivor_ids >= self.sink_tokens,
+                 (survivor_ids - self.sink_tokens) // self.omega,
+-                torch.full_like(survivor_ids, -1)  # Sinks get -1
++                torch.full_like(survivor_ids, -1)
+             ).to(torch.long)
+ 
++            if _KV_DEBUG and self.layer_idx == _KV_DEBUG_LAYER:
++                w = _kv_log
++                w(f"\n  --- PHYSICAL CACHE AFTER PREFILL EVICTION ---")
++                w(f"  new cache_len={updated_kv[0].shape[2]}")
++                for h in range(min(_KV_DEBUG_HEADS, self.num_heads)):
++                    phys = survivor_ids[h].tolist()
++                    lids = self.logical_id_map[h].tolist()
++                    w(f"    Head {h}: physical_indices={phys}")
++                    w(f"             logical_ids     ={lids}")
++                    n_sinks = sum(1 for x in lids if x == -1)
++                    n_winners = sum(1 for x in lids if x >= 0 and x < score_end)
++                    w(f"             sinks={n_sinks}, sticky_windows={len([x for x in lids if x >= 0 and x not in [l for l in lids if l == -1]])}, total={len(lids)}")
++
+             self._prefill_done = True  
+             return updated_kv
+ 
+@@ -334,12 +388,14 @@
+                 return past_key_values
+             
+             # 1. ACCUMULATE VOTES
+-            # Takes the latest generation attention 1D slices across the cache tensor and adds dynamically continuously
+             self.running_attention_votes[:, :seq_len] += attn_score_cache[0, :, 0, :seq_len]
+             self.tokens_since_last_review += 1
+-            
++
++            if _KV_DEBUG and self.layer_idx == _KV_DEBUG_LAYER:
++                w = _kv_log
++                w(f"\n  [Gen step {self.gen_step}] vote_step={self.tokens_since_last_review}/{self.omega}, cache_len={seq_len}, total_tokens={self.num_of_tokens_without_eviction}")
++
+             # 2. PERIODIC EVALUATION
+-            # Process eviction constraints specifically when the tracker hits OMEGA boundary thresholds
+             if self.tokens_since_last_review == self.omega:
+                 # FIX (Bug 1): Use the persisted dynamic local count that absorbed
+                 # the prefill remainder, instead of re-reading the static config value.
+@@ -381,6 +437,26 @@
+                         new_lids_exp = new_lids[valid_new].unsqueeze(0).expand(self.num_heads, -1)
+                         scoreboard.scatter_add_(1, new_lids_exp, new_tok_votes[:, valid_new])
+                 
++                if _KV_DEBUG and self.layer_idx == _KV_DEBUG_LAYER:
++                    w = _kv_log
++                    w(f"\n  {'='*60}")
++                    w(f"  === EVICTION CYCLE (gen_step={self.gen_step}) ===")
++                    w(f"  {'='*60}")
++                    w(f"  compressed_len={compressed_len}, seq_len={seq_len}, local_tokens_count={local_tokens_count}")
++                    w(f"  logical_id_map (head 0): {self.logical_id_map[0].tolist()}")
++                    w(f"\n  --- ACCUMULATED VOTES (over {self.omega} steps) ---")
++                    for h in range(min(_KV_DEBUG_HEADS, self.num_heads)):
++                        votes = self.running_attention_votes[h, :seq_len].tolist()
++                        w(f"    Head {h}: {[f'{v:.4f}' for v in votes]}")
++                    w(f"\n  --- SCOREBOARD (per logical window) ---")
++                    for h in range(min(_KV_DEBUG_HEADS, self.num_heads)):
++                        nonzero = (scoreboard[h] != 0).nonzero(as_tuple=True)[0]
++                        if len(nonzero) > 0:
++                            entries = [(int(idx), f'{scoreboard[h, idx].item():.4f}') for idx in nonzero[:20]]
++                            w(f"    Head {h}: {entries}")
++                        else:
++                            w(f"    Head {h}: (all zero)")
++
+                 # Determine current valid old competitors
+                 valid_mask = ~torch.isnan(self.window_scores[:, :, 1])
+                 valid_old_windows = min(self.k_windows, int(valid_mask.sum(dim=1).max().item()))
+@@ -399,9 +475,19 @@
+                 old_w_gen_scores = torch.where(is_valid_slot, old_w_gen_scores, torch.zeros_like(old_w_gen_scores))
+                 old_scores = old_scores_hist + old_w_gen_scores
+ 
+-                # ---------------------------------------------------------
+-                # SCORE THE CHALLENGER (The Emerging Window)
+-                # ---------------------------------------------------------
++                if _KV_DEBUG and self.layer_idx == _KV_DEBUG_LAYER:
++                    w = _kv_log
++                    w(f"\n  --- INCUMBENT WINDOWS ---")
++                    for h in range(min(_KV_DEBUG_HEADS, self.num_heads)):
++                        oids = old_ids[h, :valid_old_windows].tolist()
++                        ohist = old_scores_hist[h, :valid_old_windows].tolist()
++                        ogen = old_w_gen_scores[h, :valid_old_windows].tolist()
++                        otot = old_scores[h, :valid_old_windows].tolist()
++                        w(f"    Head {h}: ids={[int(x) for x in oids]}")
++                        w(f"      hist_scores  ={[f'{v:.4f}' for v in ohist]}")
++                        w(f"      gen_scores   ={[f'{v:.4f}' for v in ogen]}")
++                        w(f"      total_scores ={[f'{v:.4f}' for v in otot]}")
++
+                 # Calculate the Logical ID of the window that just fell out of the local bubble
+                 raw_last_id_val = (self.num_of_tokens_without_eviction - self.sink_tokens - local_tokens_count) // self.omega - 1
+                 has_challenger = raw_last_id_val >= 0
+@@ -442,14 +528,22 @@
+                         new_w_total_scores
+                     )
+ 
+-                    # Concatenate challenger with existing windows
++                    if _KV_DEBUG and self.layer_idx == _KV_DEBUG_LAYER:
++                        w = _kv_log
++                        w(f"\n  --- CHALLENGER ---")
++                        w(f"    challenger_id={last_id_val}")
++                        for h in range(min(_KV_DEBUG_HEADS, self.num_heads)):
++                            w(f"    Head {h}: gen_score={new_w_gen_scores[h].item():.4f}, hist_score={last_id_hist_scores[h].item():.4f}, total={new_w_total_scores[h].item():.4f}, already_tracked={already_tracked_per_head[h].item()}")
++
+                     competing_ids = torch.cat([old_ids, last_id_tensor], dim=1)
+                     competing_scores = torch.cat([old_scores, new_w_total_scores.unsqueeze(1)], dim=1)
+                 else:
+-                    # No valid challenger yet — existing windows compete among themselves
+                     competing_ids = old_ids
+                     competing_scores = old_scores
+ 
++                    if _KV_DEBUG and self.layer_idx == _KV_DEBUG_LAYER:
++                        _kv_log(f"\n  --- NO CHALLENGER (raw_last_id_val={raw_last_id_val}) ---")
++
+                 if competing_ids.shape[1] > 0:
+                     curr_k = min(self.k_windows, competing_scores.shape[1])
+                     top_v, top_i = torch.topk(competing_scores, curr_k, dim=1, largest=True)
+@@ -464,6 +558,14 @@
+                     self.window_scores[:, :curr_k, 0] = final_v
+                     self.window_scores[:, :curr_k, 1] = final_ids
+                     self.window_scores[:, :curr_k, 2] = final_ids
++
++                    if _KV_DEBUG and self.layer_idx == _KV_DEBUG_LAYER:
++                        w = _kv_log
++                        w(f"\n  --- COMPETITION RESULT (top-{curr_k}) ---")
++                        for h in range(min(_KV_DEBUG_HEADS, self.num_heads)):
++                            fids = final_ids[h].tolist()
++                            fscores = final_v[h].tolist()
++                            w(f"    Head {h}: surviving_ids={[int(x) for x in fids]}, scores={[f'{v:.4f}' for v in fscores]}")
+                 else:
+                     final_ids = torch.zeros((self.num_heads, 0), device=device, dtype=torch.float32)
+ 
+@@ -541,7 +643,19 @@
+                 global_positions = self.num_of_tokens_without_eviction - self.omega + j_offsets
+                 new_ids = torch.clamp((global_positions - self.sink_tokens) // self.omega, min=0)
+                 self.logical_id_map = torch.where(is_old, inherited_ids, new_ids).long()
+-                
++
++                if _KV_DEBUG and self.layer_idx == _KV_DEBUG_LAYER:
++                    w = _kv_log
++                    w(f"\n  --- PHYSICAL CACHE AFTER GEN EVICTION ---")
++                    w(f"  old_cache_len={compressed_len}, new_cache_len={safe_len}, evicted={compressed_len - safe_len + (seq_len - compressed_len)} tokens added/removed")
++                    for h in range(min(_KV_DEBUG_HEADS, self.num_heads)):
++                        rel = final_relative_indices[h].tolist()
++                        lids = self.logical_id_map[h].tolist()
++                        w(f"    Head {h}: relative_indices={rel}")
++                        w(f"             logical_ids     ={lids}")
++                        sinks = sum(1 for x in lids if x == -1)
++                        w(f"             sinks={sinks}, non-sink={len(lids)-sinks}, total={len(lids)}")
++
+                 # Gather physical KV cache using relative arrays
+                 head_dim = past_key_values[0].shape[-1]
+                 gather_idx = torch.clamp(final_relative_indices, 0, seq_len - 1).unsqueeze(-1).expand(-1, -1, head_dim)

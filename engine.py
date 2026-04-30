@@ -1,98 +1,209 @@
 import time
+import sticky_config as config
 import torch
 import gc
-import re
 import numpy as np
 from typing import Dict, Any, List
 
-import sticky_config as config
+
 import metrics
 import data_loader
-import utils
 
-# ── Task Category Sets (for routing) ─────────────────────────────────────
-QA_TASKS = {"narrativeqa", "qasper", "multifieldqa_en", "hotpotqa", "2wikimqa", "musique", "triviaqa"}
-ROUGE_TASKS = {"gov_report", "qmsum", "multi_news", "samsum"}
-CODE_TASKS = {"lcc", "repobench-p"}
-CLASSIFICATION_TASKS = {"trec"}
-COUNT_TASKS = {"passage_count"}
-RETRIEVAL_TASKS = {"passage_retrieval_en"}
+# =============================================================================
+# dataset2metric dispatch table  (identical to official LongBench eval.py)
+# Routes every task name to its canonical scoring function.
+# =============================================================================
+dataset2metric = {
+    "narrativeqa":          metrics.qa_f1_score,
+    "qasper":               metrics.qa_f1_score,
+    "multifieldqa_en":      metrics.qa_f1_score,
+    "multifieldqa_zh":      metrics.qa_f1_zh_score,
+    "hotpotqa":             metrics.qa_f1_score,
+    "2wikimqa":             metrics.qa_f1_score,
+    "musique":              metrics.qa_f1_score,
+    "dureader":             metrics.rouge_zh_score,
+    "gov_report":           metrics.rouge_score,
+    "qmsum":                metrics.rouge_score,
+    "multi_news":           metrics.rouge_score,
+    "vcsum":                metrics.rouge_zh_score,
+    "trec":                 metrics.classification_score,
+    "triviaqa":             metrics.qa_f1_score,
+    "samsum":               metrics.rouge_score,
+    "lsht":                 metrics.classification_score,
+    "passage_retrieval_en": metrics.retrieval_score,
+    "passage_count":        metrics.count_score,
+    "passage_retrieval_zh": metrics.retrieval_zh_score,
+    "lcc":                  metrics.code_sim_score,
+    "repobench-p":          metrics.code_sim_score,
+}
+
+# Tasks where the model tends to generate multi-line chat; score only line 0.
+_FIRST_LINE_TASKS = {"trec", "triviaqa", "samsum", "lsht"}
+
+# Tasks that need raw completion (no chat template, no BOS token) -- matches DefensiveKV
+_RAW_COMPLETION_TASKS = {"trec", "triviaqa", "samsum", "lsht", "lcc", "repobench-p"}
+
+
+
+# =============================================================================
+# Ground-truth extraction
+# =============================================================================
 
 def get_ground_truth(ex: Dict[str, Any], task: str) -> List[str]:
     """
-    Robust extraction of ground truth references for all 16 LongBench datasets.
-    LongBench standardizes all datasets to have an 'answers' field (list of strings).
-    Task-specific fallbacks handle edge cases.
+    Robust extraction of ground-truth references from a dataset example.
+    Handles the inconsistent key conventions across LongBench sub-tasks.
     """
-    # ── Code tasks: key is inconsistent across sources ────────────────
-    if task in CODE_TASKS:
-        possible_keys = ["answers", "answer", "target", "output", "reference", "completion"]
-        for key in possible_keys:
+    # NarrativeQA: answer key varies
+    if task == "narrativeqa":
+        if "answer"  in ex: return [ex["answer"]]
+        if "answers" in ex: return ex["answers"]
+
+    # QMSum: summary lives under 'summary' or 'targets'
+    if task == "qmsum":
+        if "summary" in ex: return [ex["summary"]]
+        if "targets"  in ex: return ex["targets"]
+
+    # LCC / Code: reference key is inconsistent across dataset versions
+    if task == "lcc":
+        for key in ("answers", "answer", "target", "output", "reference", "completion"):
             if key in ex:
                 val = ex[key]
-                if isinstance(val, list) and val:
-                    return val
-                if isinstance(val, str) and val.strip():
-                    return [val]
+                if isinstance(val, list) and val:            return val
+                if isinstance(val, str)  and val.strip():    return [val]
 
-    # ── Summarization: may use 'summary' or 'targets' ────────────────
-    if task in ROUGE_TASKS:
-        if "answers" in ex:
-            return ex["answers"]
-        if "summary" in ex:
-            return [ex["summary"]]
-        if "targets" in ex:
-            return ex["targets"]
-
-    # ── Standard Fallback (QA, Classification, Synthetic, etc.) ──────
+    # Standard fallback (2wikimqa, musique, hotpotqa, …)
     if "answers" in ex:
         return ex["answers"]
     if "answer" in ex:
         val = ex["answer"]
         return [val] if isinstance(val, str) else val
-        
+
     return []
 
-def extract_answer_span(prediction: str, references: List[str]) -> str:
-    """
-    Standard 'Answer Inclusion' Logic:
-    If the normalized reference appears within the normalized prediction,
-    we extract it as the answer. This penalizes hallucinations (if answer is missing)
-    but forgives 'chattiness' (if answer is surrounded by text).
-    """
-    pred_norm = utils.normalize_answer(prediction)
-    
-    # Check all valid references
-    for ref in references:
-        ref_norm = utils.normalize_answer(ref)
-        
-        # Safety: avoid matching empty or extremely short common words mistakenly
-        if len(ref_norm) < 3: 
-            continue
-            
-        if ref_norm in pred_norm:
-            # FOUND IT: The model knows the answer.
-            # We return the Reference string itself to ensure the Metric (F1/EM)
-            # gives full credit for finding the correct information.
-            return ref
-            
-    # If no reference is found, return the full prediction 
-    # so the metric can penalize the wrong answer.
-    return prediction
 
-# UPDATED: Added 'task' argument
+def get_all_classes(ex: Dict[str, Any]) -> Any:
+    """Return the 'all_classes' field used by classification tasks, or None."""
+    return ex.get("all_classes", None)
+
+
+
+
+# =============================================================================
+# score_example  (official scorer() logic, per-example)
+# =============================================================================
+
+def score_example(dataset: str, prediction: str,
+                  ground_truths: List[str], all_classes: Any) -> float:
+    """
+    Score a single (prediction, ground_truths) pair using the official
+    LongBench dispatch pattern:
+      • Apply first-line truncation for chat-heavy tasks.
+      • Take the max score over all ground-truth references.
+    Returns a raw score in [0, 1].
+    """
+    if dataset not in dataset2metric:
+        raise ValueError(f"Unknown dataset '{dataset}' — not in dataset2metric.")
+
+    # Official truncation for tasks that generate multi-line chat replies
+    if dataset in _FIRST_LINE_TASKS:
+        prediction = prediction.lstrip("\n").split("\n")[0]
+
+    score = 0.0
+    for ground_truth in ground_truths:
+        score = max(
+            score,
+            dataset2metric[dataset](prediction, ground_truth, all_classes=all_classes),
+        )
+    return score
+
+
+# =============================================================================
+# scorer_e  (official scorer_e() logic — LongBench-E length-stratified scoring)
+# =============================================================================
+
+def scorer_e(dataset: str, predictions: List[str], answers: List[List[str]],
+             lengths: List[int], all_classes: Any) -> Dict[str, float]:
+    """
+    Length-stratified scorer for LongBench-E (mirrors eval.py scorer_e exactly).
+
+    Buckets each example by its input length and returns the mean score × 100
+    for each bucket:
+        "0-4k"  — inputs shorter than 4 000 tokens
+        "4-8k"  — inputs between 4 000 and 8 000 tokens
+        "8k+"   — inputs longer than 8 000 tokens
+
+    Args:
+        dataset:     Task name key into dataset2metric.
+        predictions: List of model prediction strings.
+        answers:     List of ground-truth lists (one list per example).
+        lengths:     List of input token-lengths (one per example).
+        all_classes: Class list used by classification tasks (or None).
+
+    Returns:
+        Dict with keys "0-4k", "4-8k", "8k+" mapped to rounded scores (0–100).
+    """
+    if dataset not in dataset2metric:
+        raise ValueError(f"Unknown dataset '{dataset}' — not in dataset2metric.")
+
+    scores: Dict[str, list] = {"0-4k": [], "4-8k": [], "8k+": []}
+
+    for prediction, ground_truths, length in zip(predictions, answers, lengths):
+        score = 0.0
+
+        # Official truncation for chat-heavy tasks
+        if dataset in _FIRST_LINE_TASKS:
+            prediction = prediction.lstrip("\n").split("\n")[0]
+
+        for ground_truth in ground_truths:
+            score = max(
+                score,
+                dataset2metric[dataset](prediction, ground_truth, all_classes=all_classes),
+            )
+
+        if length < 4000:
+            scores["0-4k"].append(score)
+        elif length < 8000:
+            scores["4-8k"].append(score)
+        else:
+            scores["8k+"].append(score)
+
+    # Average each bucket and scale to 0–100 (empty buckets → 0.0)
+    return {
+        key: round(100 * np.mean(vals), 2) if vals else 0.0
+        for key, vals in scores.items()
+    }
+
+
+# =============================================================================
+# Generation
+# =============================================================================
+
 def generate(prompt, model, tokenizer, device, refs=None, task=None, **kwargs):
-    messages = [{"role": "user", "content": prompt}]
-    formatted_prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-
-    inputs = tokenizer(formatted_prompt, return_tensors="pt").to(device)
+    """
+    Run one forward pass through the model and return the decoded text plus
+    performance counters (token count, wall-clock time, peak VRAM).
+    No output post-processing -- raw decoded text is returned directly,
+    matching DefensiveKV's pipeline.
+    """
+    if task in _RAW_COMPLETION_TASKS:
+        old_bos = tokenizer.bos_token
+        tokenizer.bos_token = ""
+        inputs = tokenizer(prompt, return_tensors="pt").to(device)
+        tokenizer.bos_token = old_bos
+    else:
+        messages = [{"role": "user", "content": prompt}]
+        formatted_prompt = tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+        inputs = tokenizer(formatted_prompt, return_tensors="pt").to(device)
 
     if device == "cuda":
         torch.cuda.reset_peak_memory_stats()
         torch.cuda.synchronize()
 
     # =========================================================================
-    # 🧹 1. PRE-GENERATION CLEANUP & RESET
+    # 🧹 Pre-generation cache cleanup & reset
     # =========================================================================
     if hasattr(model, "model") and hasattr(model.model, "layers"):
         for layer in model.model.layers:
@@ -103,148 +214,150 @@ def generate(prompt, model, tokenizer, device, refs=None, task=None, **kwargs):
 
     if device == "cuda":
         torch.cuda.synchronize()
-        torch.cuda.empty_cache() 
-        torch.cuda.reset_peak_memory_stats() # <--- CRITICAL: Reset stats here
-        start_mem = torch.cuda.memory_allocated()
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()   # CRITICAL: reset before timing
+
+    gen_kwargs = {**config.GENERATION_CONFIG}
+    gen_kwargs.update(kwargs)
+    gen_kwargs.setdefault("pad_token_id", tokenizer.eos_token_id)
+
+    # DefensiveKV-style: stop samsum generation at newline (single-line summary)
+    if task == "samsum":
+        nl_token_id = tokenizer.encode("\n", add_special_tokens=False)[-1]
+        gen_kwargs["eos_token_id"] = [tokenizer.eos_token_id, nl_token_id]
 
     start = time.perf_counter()
     with torch.no_grad():
         out = model.generate(
             **inputs,
-            **config.GENERATION_CONFIG,
-            pad_token_id=tokenizer.eos_token_id,
-            **kwargs
+            **gen_kwargs
         )
     if device == "cuda":
         torch.cuda.synchronize()
 
     total_time = time.perf_counter() - start
-    
-    input_len = inputs.input_ids.shape[1]
+
+    input_len  = inputs.input_ids.shape[1]
     gen_tokens = out.shape[1] - input_len
-    raw_text = tokenizer.decode(out[0][input_len:], skip_special_tokens=True)
-    
-    # ---------------------------------------------------------
-    # Dataset-Specific Cleaning Logic
-    # ---------------------------------------------------------
-    if task in CODE_TASKS:
-        # For Code tasks, strip markdown fences and chatty prefixes
-        clean_text = utils.clean_code_output(raw_text)
-    elif task in QA_TASKS and refs:
-        # For QA tasks, try to extract the specific answer span
-        clean_text = extract_answer_span(raw_text, refs)
-    elif task in ROUGE_TASKS:
-        # For Summarization, strip chatty preamble before ROUGE scoring
-        clean_text = utils.clean_summary_output(raw_text)
-    elif task in CLASSIFICATION_TASKS:
-        # For Classification (TREC), strip preamble for label matching
-        clean_text = utils.clean_classification_output(raw_text)
-    else:
-        # Synthetic (passage_count, passage_retrieval_en) — use raw output
-        clean_text = raw_text
-    # ---------------------------------------------------------
+    raw_text   = tokenizer.decode(out[0][input_len:], skip_special_tokens=True)
+
+    clean_text = raw_text
 
     peak_mem = torch.cuda.max_memory_allocated() if device == "cuda" else 0
-    
+
     del inputs
     del out
-    
+
     return {
-        "text": clean_text,
+        "text":     clean_text,
         "raw_text": raw_text,
-        "tokens": gen_tokens,
-        "time": total_time,
-        "peak_mem": peak_mem
+        "tokens":   gen_tokens,
+        "time":     total_time,
+        "peak_mem": peak_mem,
     }
 
+
+# =============================================================================
+# evaluate_dataset  (main evaluation loop)
+# =============================================================================
+
 def evaluate_dataset(name, dataset, seed, model, tokenizer, device):
+    """
+    Run the full evaluation loop for one LongBench sub-task.
+
+    Scoring follows the official eval.py pattern:
+      • dataset2metric dispatch
+      • max-over-references
+      • first-line truncation for chat-heavy tasks
+      • all_classes passed as kwarg for classification tasks
+
+    Additional project-specific features (all preserved):
+      • Seeded RNG for reproducibility
+      • Per-example throughput & peak-VRAM tracking
+      • CI-width logging at the end
+      • sample_adequacy_heuristic flag in the returned dict
+    """
     torch.manual_seed(seed)
     np.random.seed(seed)
 
     results = []
-    # Use fallback 100 if attribute doesn't exist to not break other pipelines
-    sample_size = min(getattr(config, "LONGBENCH_SAMPLES", 100), len(dataset))
+    sample_size = min(getattr(config, "LONGBENCH_SAMPLES", 1), len(dataset))
+    print(f"Running {sample_size} samples from {config.LONGBENCH_SAMPLES} configured (dataset size: {len(dataset)})")
+
 
     for i in range(sample_size):
         ex = dataset[i]
+
         try:
             prompt = data_loader.build_prompt(ex, name)
         except ValueError as e:
             print(f"⚠️  {e}, skipping example")
             continue
 
-        refs = get_ground_truth(ex, name)
+        refs        = get_ground_truth(ex, name)
+        all_classes = get_all_classes(ex)
+
         if not refs:
             continue
 
-        # Pass refs and task to generate for task-specific cleaning
-        gen = generate(prompt, model, tokenizer, device, refs=refs, task=name, use_cache=True)
-        
-        # ── Metric Routing (Official LongBench dataset2metric) ────
-        if name in ROUGE_TASKS:
-            ref_text = refs[0] if refs else ""
-            m = metrics.rouge_metrics(gen["text"], ref_text)
-        elif name in CODE_TASKS:
-            ref_text = refs[0] if refs else ""
-            score = metrics.code_sim_score(gen["text"], ref_text)
-            m = {"edit_sim": score}
-        elif name in CLASSIFICATION_TASKS:
-            # TREC: all_classes is stored per-example in the dataset
-            all_classes = ex.get("all_classes", [])
-            ref_text = refs[0] if refs else ""
-            score = metrics.classification_score(gen["text"], ref_text, all_classes)
-            m = {"cls_acc": score}
-        elif name in COUNT_TASKS:
-            ref_text = refs[0] if refs else ""
-            score = metrics.count_score(gen["text"], ref_text)
-            m = {"count_acc": score}
-        elif name in RETRIEVAL_TASKS:
-            ref_text = refs[0] if refs else ""
-            score = metrics.retrieval_score(gen["text"], ref_text)
-            m = {"retrieval_acc": score}
-        else:
-            # Default: QA F1 (narrativeqa, qasper, multifieldqa_en, hotpotqa, 2wikimqa, musique, triviaqa)
-            m = metrics.qa_metrics(gen["text"], refs)
+        # Generate — passes task name so post-processing is applied correctly
+        task_max_tokens = data_loader.max_new_tokens.get(name, 128)
+        gen = generate(prompt, model, tokenizer, device, refs=refs, task=name, use_cache=True, max_new_tokens=task_max_tokens)
 
         if gen["tokens"] == 0:
             print("⚠️  Empty generation detected")
 
-        throughput = (gen["tokens"] / gen["time"]) if gen["tokens"] > 1 and gen["time"] > 0 else 0.0
+        # -----------------------------------------------------------------
+        # Score with the official dispatch pattern (mirrors eval.py scorer)
+        # -----------------------------------------------------------------
+        raw_score = score_example(name, gen["text"], refs, all_classes)
+
+        # Derive the metric-key name from the scoring function for logging
+        scorer_fn  = dataset2metric.get(name)
+        metric_key = getattr(scorer_fn, "__name__", "score")
+        m = {metric_key: raw_score}
+        # -----------------------------------------------------------------
+
+        throughput = (
+            gen["tokens"] / gen["time"]
+            if gen["tokens"] > 1 and gen["time"] > 0
+            else 0.0
+        )
 
         results.append({
-            "metrics": m,
-            "tokens": gen["tokens"],
-            "time": gen["time"],
+            "metrics":    m,
+            "tokens":     gen["tokens"],
+            "time":       gen["time"],
             "throughput": throughput,
-            "peak_mem": gen["peak_mem"]
+            "peak_mem":   gen["peak_mem"],
         })
-        
+
         if device == "cuda":
             torch.cuda.empty_cache()
-    
-            # === Data Logger (NEW) ===
+
+    # -------------------------------------------------------------------------
+    # Aggregate logging with confidence intervals
+    # -------------------------------------------------------------------------
     if results:
         metric_keys = results[0]["metrics"].keys()
         agg = {}
         for k in metric_keys:
-            vals = [r["metrics"][k] for r in results]
-            agg[k] = np.mean(vals)
-            ci = utils.calculate_ci(vals, confidence=config.CONFIDENCE_LEVEL)
+            vals    = [r["metrics"][k] for r in results]
+            agg[k]  = np.mean(vals)
+            ci      = metrics.calculate_ci(vals, confidence=config.CONFIDENCE_LEVEL)
             agg[f"{k}_ci"] = ci
 
         log_parts = [f"{name} (seed={seed})"]
         for k in sorted(metric_keys):
-            mean = agg[k]
-            ci = agg[f"{k}_ci"]
-            log_parts.append(f"{k}: {mean:.4f} ± {ci:.4f}")
+            log_parts.append(f"{k}: {agg[k]:.4f} ± {agg[f'{k}_ci']:.4f}")
         print("   📊 " + " | ".join(log_parts))
     else:
         print(f"   📊 {name} (seed={seed}) — No valid results to log.")
 
     return {
-        "dataset": name,
-        "seed": seed,
-        "sample_size": len(results),
+        "dataset":                  name,
+        "seed":                     seed,
+        "sample_size":              len(results),
         "sample_adequacy_heuristic": len(results) >= config.MIN_SAMPLE_ADEQUACY,
-        "results": results
+        "results":                  results,
     }

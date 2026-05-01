@@ -579,12 +579,13 @@ class STICKYKVCache_LayerWise(nn.Module):
                 new_q_loser_ids = None
                 new_q_loser_scores = None
                 if self.q_windows_count > 0:
-                    remaining_scores = competing_scores.clone()
-                    remaining_scores.scatter_(1, top_i, float("-inf"))
-                    num_remaining = int((remaining_scores > float("-inf")).sum(dim=1).min().item())
+                    # OPT-A: scatter (non-inplace) avoids an explicit clone()+scatter_() pair.
+                    # Keeps correct cross-head min-count to guard against pre-existing -inf slots.
+                    loser_scores = competing_scores.scatter(1, top_i, float("-inf"))
+                    num_remaining = int((loser_scores > float("-inf")).sum(dim=1).min().item())
                     if num_remaining > 0:
                         q_count = min(self.q_windows_count, num_remaining)
-                        q_top_v, q_top_i = torch.topk(remaining_scores, q_count, dim=1, largest=True)
+                        q_top_v, q_top_i = torch.topk(loser_scores, q_count, dim=1, largest=True)
                         new_q_loser_ids = torch.gather(competing_ids, 1, q_top_i)
                         new_q_loser_scores = q_top_v
 
@@ -660,7 +661,7 @@ class STICKYKVCache_LayerWise(nn.Module):
 
                 # If r_ratio is 100, skip physical eviction
                 if self.total_cache_ratio == 100:
-                    self.running_attention_votes.zero_()
+                    self.running_attention_votes[:, :seq_len].zero_()  # zero only the live slice
                     self.tokens_since_last_review = 0
                     return past_key_values
                 
@@ -915,8 +916,9 @@ class STICKYKVCache_LayerWise(nn.Module):
                 self.logical_id_map = new_logical_id_map
                 updated_kv = (new_k, new_v)
 
-                # Reset accumulator vectors entirely explicitly
-                self.running_attention_votes.zero_()
+                # Reset only the live slice — zeroing the full 131k buffer wastes 65x
+                # more bandwidth than needed (4MB vs ~62KB for Qasper at omega=8).
+                self.running_attention_votes[:, :seq_len].zero_()
                 self.tokens_since_last_review = 0
                 
                 return updated_kv

@@ -364,8 +364,9 @@ class STICKYKVCache_LayerWise(nn.Module):
             self.gen_step += 1
 
         if not self._prefill_done:  # Prompt Stage Active
-            # FIX 2: PREFILL BOUNDARY ALIGNMENT & REMAINDER LEAKAGE FIX
-            local_tokens_count = self.local_num_tokens if self.use_fixed_local_tokens else self.local_num
+            # Use the clamped CFO allocator value — already handles both fixed and ratio modes.
+            # self.local_num = min(target_local_tokens, remaining) is set by _update_k_win_and_local_num.
+            local_tokens_count = self.local_num
             
             score_end = max(self.sink_tokens, seq_len - local_tokens_count)
             num_windows = max(0, (score_end - self.sink_tokens) // self.omega)
@@ -379,11 +380,11 @@ class STICKYKVCache_LayerWise(nn.Module):
             num_windows = (score_end - self.sink_tokens) // self.omega
             score_end = self.sink_tokens + (num_windows * self.omega)
             
-            # Dynamically absorb remainder tokens perfectly protecting the trailing prompt sequence
-            local_tokens_count = seq_len - score_end
-            
-            # Persist the dynamic local count so generation eviction uses the same boundary
-            self._dynamic_local_count = local_tokens_count
+            # Ceiling division in _update_k_win_and_local_num already absorbs the partial
+            # window into sticky/q-cache slots. Keep the local zone at the CFO-allocated value.
+            # (score_end is still used below to slice attn_score_cache — do not remove that.)
+            self._dynamic_local_count = self.local_num
+            local_tokens_count = self.local_num
             
             if num_windows > 0:
                 # Direct chunking utilizing the aligned boundary
@@ -749,8 +750,15 @@ class STICKYKVCache_LayerWise(nn.Module):
                 # preserved in local_history instead of being wiped by zero_().
                 local_windows = (local_tokens_count + self.omega - 1) // self.omega
 
-                if local_windows > 0 and has_challenger:
-                    local_id_start = last_id_val + 1
+                if local_windows > 0:
+                    # FIX (B6): Derive local_id_start independently of has_challenger.
+                    # When has_challenger is False (very short prompts / early cycles),
+                    # votes for local-zone windows were previously discarded entirely.
+                    # Use the token counter to compute the correct start ID unconditionally.
+                    if has_challenger:
+                        local_id_start = last_id_val + 1
+                    else:
+                        local_id_start = max(0, (self.num_of_tokens_without_eviction - self.sink_tokens - local_tokens_count) // self.omega)
                     ids = torch.arange(local_id_start, local_id_start + local_windows, device=device, dtype=torch.long)
 
                     valid = (ids >= 0) & (ids < self.local_history.shape[1])
@@ -1246,36 +1254,55 @@ class STICKYKVCache_LayerWise(nn.Module):
         ), final_indices
 
     def _update_k_win_and_local_num(self, new_tokens, max_tokens):
-        # FIX 5: CFO Allocator evaluates strictly natively across token budget.
-        # Budget includes max_tokens to ensure the cache can accommodate the full
-        # sequence (prompt + generation) without mid-generation reallocation.
         total_token_budget = (new_tokens + max_tokens) * self.total_cache_ratio // 100
-        
+
+        # --- SEQUENTIAL CARVING ALLOCATOR ---
+        # Priority 1: Sinks (always kept)
+        remaining = max(0, total_token_budget - self.sink_tokens)
+
+        # Priority 2: Local zone
         if self.use_fixed_local_tokens:
             target_local_tokens = self.local_num_tokens
         else:
             target_local_tokens = (total_token_budget * self.local_cache_ratio) // 100
-            
-        self.local_num = min(target_local_tokens, total_token_budget)
-        
-        # Reserve a portion of the total budget for int8-quantized evicted tokens
-        self.q_num = (total_token_budget * self.q_ratio) // 100
-        
-        # Quant compression: ~2x for INT8, ~4x for INT4
-        # FIX (Bug 3): omega is a token-count, not a byte overhead.
-        # bf16 uses 2 bytes per element.
+        self.local_num = min(target_local_tokens, remaining)
+        remaining = max(0, remaining - self.local_num)
+
+        # Priority 3+4: Split remaining between BF16 sticky and INT4 q-cache.
+        # q_ratio% of remaining is the q-cache MEMORY budget (BF16-equivalent slots).
+        # Compression expands those slots into more stored INT4 tokens.
+        # (100-q_ratio)% goes to BF16 full-precision sticky windows.
+        #
+        # Example: 68 remaining, q_ratio=70, INT4 (4x compression):
+        #   bf16_target    = 68 * 30% = 20 BF16 tokens
+        #   q_mem_target   = 68 * 70% = 47 BF16-equivalent slots
+        #   q_int4_target  = 47 * 4   = 188 INT4 tokens can be stored
+        #   k_windows      = ceil(20 / 8) = 3 windows  (absorbs the 4-token remainder)
+        #   q_windows      = ceil(188 / 8) = 24 windows (absorbs the 4-token remainder)
+        #   No recycling — ceiling division absorbs partial windows in-place.
+
         bf16_bytes = 2 * self.head_dim
         quant_bytes = self.head_dim if self.quant_bit_width == 8 else (self.head_dim / 2.0)
         compression_ratio = bf16_bytes / quant_bytes
-        effective_q_tokens = int(self.q_num * compression_ratio)
-        self.q_windows_count = effective_q_tokens // self.omega
-        
-        available_sticky_tokens = total_token_budget - self.local_num - self.sink_tokens - self.q_num
-        self.k_windows = max(0, available_sticky_tokens // self.omega)
+
+        bf16_target   = (remaining * (100 - self.q_ratio)) // 100
+        q_mem_target  = remaining - bf16_target              # complement avoids double rounding
+        q_int4_target = int(q_mem_target * compression_ratio)
+
+        # Round UP to absorb the partial window rather than recycling
+        # remainder tokens to local. At most omega-1 extra tokens per zone.
+        # ceiling division: -(-x // y)
+        self.k_windows       = -(-bf16_target   // self.omega)
+        self.q_windows_count = -(-q_int4_target // self.omega)
+
+        # Track BF16-equivalent memory actually consumed by q-cache
+        q_mem_used   = int((self.q_windows_count * self.omega) / compression_ratio)
+        self.q_num   = q_mem_used
+
         if self.k_windows == 0:
             print(f"WARNING [Layer {self.layer_idx}]: k_windows=0 — insufficient budget for sticky windows "
                   f"(budget={total_token_budget}, local={self.local_num}, sink={self.sink_tokens}, "
-                  f"q_eff={effective_q_tokens}). Eviction is effectively disabled.")
+                  f"q_windows={self.q_windows_count}). Eviction is effectively disabled.")
         # OPT-6: Precompute quant byte width so q-cache rebuild blocks avoid repeated conditionals
         self._quant_bytes_len = self.head_dim if self.quant_bit_width == 8 else (self.head_dim // 2)
 

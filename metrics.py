@@ -135,9 +135,7 @@ def classification_score(prediction, ground_truth, **kwargs):
     for class_name in all_classes:
         if class_name in prediction:
             em_match_list.append(class_name)
-    for match_term in em_match_list:
-        if match_term in ground_truth and match_term != ground_truth:
-            em_match_list.remove(match_term)
+    em_match_list = [t for t in em_match_list if not (t in ground_truth and t != ground_truth)]
     if ground_truth in em_match_list:
         score = 1.0 / len(em_match_list)
     else:
@@ -148,6 +146,8 @@ def classification_score(prediction, ground_truth, **kwargs):
 def retrieval_score(prediction, ground_truth, **kwargs):
     pattern = r'Paragraph (\d+)'
     matches = re.findall(pattern, ground_truth)
+    if not matches:
+        return 0.0
     ground_truth_id = matches[0]
     numbers = re.findall(r"\d+", prediction)
     right_num = 0
@@ -161,6 +161,8 @@ def retrieval_score(prediction, ground_truth, **kwargs):
 def retrieval_zh_score(prediction, ground_truth, **kwargs):
     pattern = r'段落(\d+)'
     matches = re.findall(pattern, ground_truth)
+    if not matches:
+        return 0.0
     ground_truth_id = matches[0]
     numbers = re.findall(r"\d+", prediction)
     right_num = 0

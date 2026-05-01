@@ -5,7 +5,7 @@ from datasets import Dataset
 
 
 context_prompt = {
-    "narrativeqa": "You are given a story, which can be either a novel or a movie script, and a question. Answer the question asconcisely as you can, using a single phrase if possible. Do not provide any explanation.\n\nStory: {context}\n\n",
+    "narrativeqa": "You are given a story, which can be either a novel or a movie script, and a question. Answer the question as concisely as you can, using a single phrase if possible. Do not provide any explanation.\n\nStory: {context}\n\n",
     "qasper": "You are given a scientific article and a question. Answer the question as concisely as you can, using a single phrase or sentence if possible. If the question cannot be answered based on the information in the article, write \"unanswerable\". If the question is a yes/no question, answer \"yes\", \"no\", or \"unanswerable\". Do not provide any explanation.\n\nArticle: {context}\n\n",
     "multifieldqa_en": "Read the following text and answer briefly.\n\n{context}\n\n",
     "multifieldqa_zh": "阅读以下文字并用中文简短回答：\n\n{context}\n\n",
@@ -29,7 +29,7 @@ context_prompt = {
 }
 
 question_prompt = {
-    "narrativeqa": "Now, answer the question based on the story asconcisely as you can, using a single phrase if possible. Do not provide any explanation.\n\nQuestion: {input}\n\nAnswer:",
+    "narrativeqa": "Now, answer the question based on the story as concisely as you can, using a single phrase if possible. Do not provide any explanation.\n\nQuestion: {input}\n\nAnswer:",
     "qasper": "Answer the question based on the above article as concisely as you can, using a single phrase or sentence if possible. If the question cannot be answered based on the information in the article, write \"unanswerable\". If the question is a yes/no question, answer \"yes\", \"no\", or \"unanswerable\". Do not provide any explanation.\n\nQuestion: {input}\n\nAnswer:",
     "multifieldqa_en": "Now, answer the following question based on the above text, only give me the answer and do not output any other words.\n\nQuestion: {input}\nAnswer:",
     "multifieldqa_zh": "现在请基于上面的文章回答下面的问题，只告诉我答案，不要输出任何其他字词。\n\n问题：{input}\n回答：",
@@ -122,5 +122,10 @@ def build_prompt(example: Dict[str, Any], task: str) -> str:
 
     if task not in context_prompt or task not in question_prompt:
         raise ValueError(f"Unknown task: {task}")
+
+    # FIX (L5): Warn and skip examples with empty context to prevent
+    # scoring hallucinated answers from information-free prompts.
+    if not ctx.strip():
+        raise ValueError(f"Empty context for task '{task}' — example has no 'context' or 'document' field")
 
     return context_prompt[task].format(context=ctx) + question_prompt[task].format(input=inp)

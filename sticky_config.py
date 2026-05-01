@@ -42,8 +42,10 @@ ROPE_LOW_FREQ_FACTOR = 1.0
 ROPE_HIGH_FREQ_FACTOR = 4.0
 DATASET_MIN_TOKENS = 50
 GENERATION_CONFIG = {
-    "max_new_tokens": 100,
+    "max_new_tokens": 512,
     "do_sample": False,
+    # NOTE: temperature is ignored by HuggingFace generate() when do_sample=False.
+    # Kept here so that switching to do_sample=True gives deterministic (temp=1.0) results.
     "temperature": 1.0,
 }
 

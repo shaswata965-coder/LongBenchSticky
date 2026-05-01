@@ -31,6 +31,16 @@ class STICKYLlamaForCausalLM(LlamaForCausalLM):
     def prepare_inputs_for_generation(
         self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None, **kwargs
     ):
+        """Prepare inputs for autoregressive generation.
+        
+        NOTE: The position_ids computed here are overridden by
+        STICKYLlamaAttention.forward() which uses global_token_counter for RoPE.
+        This override is necessary because the KV cache is compressed by eviction,
+        so the framework's position tracking is incorrect.
+        
+        WARNING: batch_size > 1 is structurally unsupported because
+        global_token_counter is per-layer, not per-batch-item.
+        """
         model_inputs = super().prepare_inputs_for_generation(
             input_ids, past_key_values=past_key_values, attention_mask=attention_mask, inputs_embeds=inputs_embeds, **kwargs
         )

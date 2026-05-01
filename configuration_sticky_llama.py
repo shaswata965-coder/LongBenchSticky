@@ -81,11 +81,19 @@ class LlamaConfig(PretrainedConfig):
         if rope_type is None:
             raise ValueError("`rope_scaling` must contain either 'type' or 'rope_type'.")
     
-        # Expand allowed types to include 'llama3'
-        allowed_types = ["linear", "dynamic", "llama3"]
+        # Expand allowed types to include model-specific RoPE variants
+        allowed_types = ["linear", "dynamic", "llama3", "yarn", "longrope"]
         if rope_type not in allowed_types:
             raise ValueError(f"`rope_scaling` type must be one of {allowed_types}, got {rope_type}")
     
         if rope_factor is not None:
-            if not isinstance(rope_factor, float) or rope_factor < 1.0:
+            if not isinstance(rope_factor, (int, float)) or float(rope_factor) < 1.0:
                 raise ValueError("`rope_scaling` factor must be a float >= 1.")
+            # FIX (M6): Warn when factor=1.0 with llama3 type — it silently
+            # disables long-context extension without any error.
+            if rope_type == "llama3" and float(rope_factor) <= 1.0:
+                import warnings
+                warnings.warn(
+                    f"`rope_scaling` factor={rope_factor} with type='llama3' effectively "
+                    f"disables long-context RoPE extension. Use factor > 1.0 for scaling."
+                )

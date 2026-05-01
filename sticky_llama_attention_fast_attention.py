@@ -123,7 +123,6 @@ class STICKYLlamaAttention(nn.Module):
                  factor = rope_scaling.get("factor", sticky_config.ROPE_SCALING_FACTOR)
                  low_freq = rope_scaling.get("low_freq_factor", sticky_config.ROPE_LOW_FREQ_FACTOR)
                  high_freq = rope_scaling.get("high_freq_factor", sticky_config.ROPE_HIGH_FREQ_FACTOR)
-                 import sticky_config
                  orig_max_pos = rope_scaling.get("original_max_position_embeddings", sticky_config.ORIGINAL_MAX_POSITION_EMBEDDINGS)
                  
                  self.rotary_emb = Llama3RotaryEmbedding(
@@ -171,9 +170,9 @@ class STICKYLlamaAttention(nn.Module):
         if past_key_value is not None:
             # Overwrite the position_ids provided by the LlamaModel.forward because it
             # calculated them using the length of the currently evicted KV cache
-            past_len = self.kv_cache.global_token_counter.item()
+            global_past_len = self.kv_cache.global_token_counter.item()
             position_ids = torch.arange(
-                past_len, past_len + q_len, dtype=torch.long, device=hidden_states.device
+                global_past_len, global_past_len + q_len, dtype=torch.long, device=hidden_states.device
             ).unsqueeze(0)
         elif position_ids is None:
             position_ids = torch.arange(0, q_len, dtype=torch.long, device=hidden_states.device).unsqueeze(0)
@@ -184,13 +183,13 @@ class STICKYLlamaAttention(nn.Module):
         value_states = self.v_proj(hidden_states).view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
         # 3. Causal Masking (Only materialized for decoding to avoid O(N^2) OOM spike in long prefill)
-        past_len = past_key_value[0].shape[-2] if past_key_value is not None else 0
+        phys_past_len = past_key_value[0].shape[-2] if past_key_value is not None else 0
         attention_mask = None
         if q_len == 1:
-            attention_mask = _make_causal_mask(bsz, q_len, past_len, query_states.dtype, query_states.device)
+            attention_mask = _make_causal_mask(bsz, q_len, phys_past_len, query_states.dtype, query_states.device)
 
         # 4. Rotary Positional Embeddings
-        kv_seq_len = key_states.shape[-2] + past_len
+        kv_seq_len = key_states.shape[-2] + phys_past_len
         cos, sin = self.rotary_emb(value_states, seq_len=max(kv_seq_len, position_ids.max().item() + 1))
         query_states = apply_rotary_pos_emb_single(query_states, cos, sin, position_ids)
         key_states = apply_rotary_pos_emb_single(key_states, cos, sin, position_ids)
@@ -256,7 +255,7 @@ class STICKYLlamaAttention(nn.Module):
                     (chunk_len, kv_seq_len_full), torch.finfo(query_states.dtype).min,
                     device=query_states.device, dtype=query_states.dtype
                 )
-                mask_chunk.masked_fill_(k_indices <= (q_indices + past_len), 0.0)
+                mask_chunk.masked_fill_(k_indices <= (q_indices + phys_past_len), 0.0)
                 
                 # Expand mask to match attention chunk [1, 1, chunk_len, kv_seq_len]
                 mask_chunk = mask_chunk.unsqueeze(0).unsqueeze(0)
@@ -315,7 +314,8 @@ class STICKYLlamaAttention(nn.Module):
             else:
                 main_logits = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
 
-            main_logits = main_logits + attention_mask
+            if attention_mask is not None:
+                main_logits = main_logits + attention_mask
 
             q_scores_for_cache = None
             if q_len == 1 and hasattr(self.kv_cache, 'q_cache_k_quant') and self.kv_cache.q_cache_k_quant is not None:
@@ -376,6 +376,10 @@ class STICKYLlamaAttention(nn.Module):
                     attn_output = torch.matmul(attn_weights_main, value_states) + torch.matmul(attn_weights_q, q_v)
                     scores_for_cache = attn_weights_main
                     q_scores_for_cache = attn_weights_q
+                # FIX (C4): Track main-only attention weights for output_attentions.
+                # The joint softmax attn_weights includes q-cache dimensions that
+                # downstream consumers don't expect.
+                attn_weights_for_output = attn_weights_main
             else:
                 attn_weights = torch.softmax(main_logits.to(torch.float32), dim=-1).to(query_states.dtype)
                 if self.num_heads != self.num_key_value_heads:
@@ -389,13 +393,14 @@ class STICKYLlamaAttention(nn.Module):
                 else:
                     attn_output = torch.matmul(attn_weights, value_states)
                     scores_for_cache = attn_weights
+                attn_weights_for_output = attn_weights
 
             past_key_value = self.kv_cache(
                 past_key_value, scores_for_cache.detach(),
                 q_attn_scores=q_scores_for_cache.detach() if q_scores_for_cache is not None else None,
                 q_len=q_len)
                     
-            attn_weights_return = attn_weights if output_attentions else None
+            attn_weights_return = attn_weights_for_output if output_attentions else None
 
         attn_output = attn_output.transpose(1, 2).contiguous().reshape(bsz, q_len, self.hidden_size)
         attn_output = self.o_proj(attn_output)

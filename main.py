@@ -6,7 +6,7 @@ import sticky_config
 
 def main():
     # 1. Path to your local model weights/directory
-    model_path = "/kaggle/input/llama-3.2/transformers/1b-instruct/1"
+    model_path = sticky_config.MODEL_PATH
 
     # 2. Define your custom configuration
     config = LlamaConfig.from_pretrained(model_path)
@@ -15,12 +15,15 @@ def main():
     # config.p_ratio = 20  
     
     # Configuration Option B: Use a fixed number of recent tokens (e.g., 256 tokens)
-    config.local_num_tokens = 256 
+    # FIX (M7): Set LOCAL_NUM_TOKENS on the sticky_config MODULE, not on config.
+    # STICKYKVCache_LayerWise.__init__ reads from `from sticky_config import LOCAL_NUM_TOKENS`,
+    # so config.local_num_tokens has no effect when that import succeeds.
+    sticky_config.LOCAL_NUM_TOKENS = 256
     
     config.r_ratio = getattr(sticky_config, "R_RATIO", 50)
     config.start_idx = getattr(sticky_config, "S_IDX", 0)
-    config.alpha = 32    # Observation window size for prefill stage
-    print(f"Loading model with Config: p_ratio={config.p_ratio}, r_ratio={config.r_ratio}")
+
+    print(f"Loading model with Config: LOCAL_NUM_TOKENS={sticky_config.LOCAL_NUM_TOKENS}, r_ratio={config.r_ratio}")
 
     # 3. Load the tokenizer
     tokenizer = AutoTokenizer.from_pretrained(model_path)
@@ -31,10 +34,7 @@ def main():
     
     print(f"Tokenizer chat template available: {tokenizer.chat_template is not None}")
     
-        # 1. Load config and fix the "Version Gap"
-    config = LlamaConfig.from_pretrained(model_path)
-    
-    # 4.36.0 expects 'type' or nothing. Llama 3.2 provides 'rope_type'.
+    # Fix the rope_scaling "Version Gap" for Llama 3.2 compatibility
     # 4.36.0 expects 'type' or nothing. Llama 3.2 provides 'rope_type'.
     if hasattr(config, "rope_scaling") and config.rope_scaling is not None:
         # Option A: Force it to a format v4.36 knows
@@ -92,7 +92,8 @@ def main():
         use_cache=True
     )
 
-    clean_output = tokenizer.decode(output[0], skip_special_tokens=True)
+    input_len = inputs["input_ids"].shape[1]
+    clean_output = tokenizer.decode(output[0][input_len:], skip_special_tokens=True)
     
     print("\n=== Clean Output ===")
     print(clean_output)

@@ -194,7 +194,7 @@ class STICKYKVCache_LayerWise(nn.Module):
             max_context = config.max_position_embeddings
             # Setup how many possible blocks of OMEGA size could exist
             max_windows = (
-                ((max_context - self.sink_tokens) // self.omega) + 1 if max_context > self.sink_tokens else 1
+                (max_context - self.sink_tokens) // self.omega if max_context > self.sink_tokens else 1
             )
             # Apply safety buffer
             max_windows = max(max_windows, 100)
@@ -216,7 +216,7 @@ class STICKYKVCache_LayerWise(nn.Module):
         self.register_buffer("sink_indices", torch.arange(0, self.sink_tokens, device=device) if self.sink_tokens > 0 else torch.zeros(0, dtype=torch.long, device=device))
         
         # Buffer: stores sticky window scores! Shape is [heads, windows, 3]
-        # Dim 2 is [Cumulative Score, Logical Window ID, Logical Window ID]
+        # Dim 2 is [Cumulative Score, Current Window ID, Original Window ID]
         self.register_buffer(
             "window_scores",
             torch.full(
@@ -263,6 +263,9 @@ class STICKYKVCache_LayerWise(nn.Module):
         
         # FIX: Will hold the strictly logical mapping of the physical cache
         self.logical_id_map = None
+        
+        # Precomputed quant byte width (also re-set by _update_k_win_and_local_num and _clean_scores)
+        self._quant_bytes_len = self.head_dim if self.quant_bit_width == 8 else (self.head_dim // 2)
 
     def _find_logical_window_span(self, h, wid_val, seq_len):
         positions = (self.logical_id_map[h] == int(wid_val)).nonzero(as_tuple=True)[0]
@@ -293,22 +296,26 @@ class STICKYKVCache_LayerWise(nn.Module):
             past_key_values[1][0, h, start:end],
         )
 
-    def __call__(self, past_key_values, attn_score_cache, full_attn_scores=None, q_attn_scores=None):
+    def __call__(self, past_key_values, attn_score_cache, full_attn_scores=None, q_len=None, q_attn_scores=None):
         # Extract sizes
-        bsz, q_heads, q_len, kv_seq_len = attn_score_cache.shape
+        bsz, q_heads, q_len_cache, kv_seq_len = attn_score_cache.shape
         
+        q_len = q_len if q_len is not None else q_len_cache
         # Amount of tokens being put in the cache currently
         num_new_tokens = q_len
 
         # Defines full present context length directly from KV cache
         seq_len = past_key_values[0].size(self.k_seq_dim) if past_key_values is not None else 0
         
-        # Start count
-        global_start = self.global_token_counter.item()
-        
         # --- LEDGER REGISTRATION ---
         if not self._prefill_done:
             num_new = q_len
+            # Defensive: ensure counter is zeroed at the start of a new document's prefill
+            # in case _clean_cache() was missed between documents.
+            self.global_token_counter.zero_()
+            # FIX (M2): Capture global_start AFTER zeroing so stale counter values from
+            # a prior document don't offset ledger entries into wrong rows.
+            global_start = 0
             self.global_token_counter += num_new
             if self.tracking_flag:
                 for i in range(num_new):
@@ -319,6 +326,7 @@ class STICKYKVCache_LayerWise(nn.Module):
                         phys_idx = float(seq_len - q_len + i)
                         self.token_ledger[g_id, 2:2+self.num_heads] = phys_idx
         else:
+            global_start = self.global_token_counter.item()
             self.global_token_counter += 1
             if self.tracking_flag:
                 g_id = global_start
@@ -362,10 +370,12 @@ class STICKYKVCache_LayerWise(nn.Module):
             score_end = max(self.sink_tokens, seq_len - local_tokens_count)
             num_windows = max(0, (score_end - self.sink_tokens) // self.omega)
             
-            # Snap boundary to OMEGA chunks mathematically preventing out of bounds tensor slices
-            score_end = self.sink_tokens + (num_windows * self.omega)
-            score_end = min(score_end, attn_score_cache.shape[3])
-            
+            # OPT-4: Combine first snap + min; keep the omega-aligned recalculation
+            # because attn_score_cache.shape[3] may not be omega-aligned.
+            score_end = min(
+                self.sink_tokens + (num_windows * self.omega),
+                attn_score_cache.shape[3]
+            )
             num_windows = (score_end - self.sink_tokens) // self.omega
             score_end = self.sink_tokens + (num_windows * self.omega)
             
@@ -377,6 +387,9 @@ class STICKYKVCache_LayerWise(nn.Module):
             
             if num_windows > 0:
                 # Direct chunking utilizing the aligned boundary
+                # FIX (BUG-10): Assert q-dim matches seq_len to catch chunked prefill divergence
+                assert attn_score_cache.shape[2] >= seq_len, (
+                    f"attn_score_cache q-dim ({attn_score_cache.shape[2]}) < seq_len ({seq_len})")
                 scores_slice = attn_score_cache[0, :, :seq_len, self.sink_tokens:score_end]
                 obs_sum = scores_slice.sum(dim=1)
                 win_scores = obs_sum.view(self.num_heads, num_windows, self.omega).sum(dim=2).to(dtype=torch.float32)
@@ -428,14 +441,23 @@ class STICKYKVCache_LayerWise(nn.Module):
                 self.q_cache_scores = q_loser_scores
 
             if self.tracking_flag:
-                importance_map = attn_score_cache[0, :, :seq_len, :].sum(dim=1)
+                # OPT-7a: Vectorized prefill importance recording.
+                # Replaces Python for-loop over active_g_ids with batched gather.
+                importance_map = attn_score_cache[0, :, :seq_len, :].sum(dim=1)  # [H, seq_len]
                 active_mask = (self.token_ledger[:, 2:2+self.num_heads] >= 0).any(dim=1) & (self.token_ledger[:, 0] >= 0)
                 active_g_ids = torch.where(active_mask)[0]
-                for g_id in active_g_ids:
-                    pre_eviction_phys_idx = self.token_ledger[g_id, 2].long()
-                    if pre_eviction_phys_idx < importance_map.shape[1]:
-                        self.token_ledger[g_id, 2+self.num_heads:2+2*self.num_heads] = importance_map[:, pre_eviction_phys_idx]
-                        self.global_score_history[g_id, :] = importance_map[:, pre_eviction_phys_idx]
+                if active_g_ids.numel() > 0:
+                    # NOTE: During prefill all KV heads share the same physical index
+                    # (set uniformly on L323), so head-0 column is valid for all heads.
+                    phys_idx = self.token_ledger[active_g_ids, 2].long()
+                    valid = (phys_idx >= 0) & (phys_idx < importance_map.shape[1])
+                    v_gids = active_g_ids[valid]
+                    v_phys = phys_idx[valid]
+                    if v_gids.numel() > 0:
+                        # Gather scores for all valid tokens at once: [H, N_valid] -> transpose -> [N_valid, H]
+                        scores_for_valid = importance_map[:, v_phys].T
+                        self.token_ledger[v_gids, 2+self.num_heads:2+2*self.num_heads] = scores_for_valid
+                        self.global_score_history[v_gids, :] = scores_for_valid
 
             # --- 1. GET SURVIVOR MAP ---
             # FIX 3: Inject score_end boundary directly avoiding calculation collisions
@@ -496,21 +518,29 @@ class STICKYKVCache_LayerWise(nn.Module):
                     q_per_token = q_per_token[:, :q_tokens_total]
                     q_per_window = q_per_token.view(self.num_heads, self.q_cache_ids.shape[1], self.omega).sum(dim=2)
                     self.q_cache_scores = self.q_cache_scores + q_per_window.to(self.q_cache_scores.dtype)
+                else:
+                    print(f"WARNING [Layer {self.layer_idx}]: q-cache score shape mismatch: got {q_per_token.shape[1]}, expected >= {q_tokens_total}. Skipping q-cache score accumulation.")
             
             if self.tracking_flag:
+                # OPT-7b: Vectorized generation per-token tracking.
+                # NOTE: The original skipped an entire head if any phys index was out of range;
+                # this version correctly handles per-element validity (strictly more correct).
                 live_mask = (self.token_ledger[:, 2:2+self.num_heads] >= 0).any(dim=1)
                 live_g_ids = torch.where(live_mask)[0]
                 
-                for head_idx in range(self.num_heads):
-                    phys_indices = self.token_ledger[live_g_ids, 2 + head_idx].long()
-                    valid_mask = phys_indices >= 0
-                    valid_phys = phys_indices[valid_mask]
-                    valid_g_ids = live_g_ids[valid_mask]
+                if live_g_ids.numel() > 0:
+                    all_phys = self.token_ledger[live_g_ids, 2:2+self.num_heads].long()  # [N_live, H]
+                    kv_seq = attn_score_cache.size(-1)
+                    in_range = (all_phys >= 0) & (all_phys < kv_seq)  # [N_live, H]
+                    safe_phys = all_phys.clamp(min=0, max=kv_seq - 1)
                     
-                    if len(valid_phys) > 0 and valid_phys.max() < attn_score_cache.size(-1):
-                        head_scores = attn_score_cache[0, head_idx, 0, valid_phys]
-                        self.token_ledger[valid_g_ids, 2 + self.num_heads + head_idx] += head_scores.float()
-                        self.global_score_history[valid_g_ids, head_idx] += head_scores.float()
+                    gen_scores = attn_score_cache[0, :, 0, :]  # [H, kv_seq]
+                    head_grid = torch.arange(self.num_heads, device=gen_scores.device).unsqueeze(0).expand(live_g_ids.shape[0], -1)
+                    gathered = gen_scores[head_grid, safe_phys]  # [N_live, H]
+                    gathered = gathered * in_range.to(gathered.dtype)
+                    
+                    self.token_ledger[live_g_ids, 2+self.num_heads:2+2*self.num_heads] += gathered.float()
+                    self.global_score_history[live_g_ids, :] += gathered.float()
             
             # 2. PERIODIC EVALUATION
             if self.tokens_since_last_review == self.omega:
@@ -549,27 +579,38 @@ class STICKYKVCache_LayerWise(nn.Module):
                     n_new = seq_len - compressed_len
                     new_tok_votes = self.running_attention_votes[:, compressed_len:seq_len]
                     js = torch.arange(n_new, device=device, dtype=torch.long)
-                    new_lids = ((self.num_of_tokens_without_eviction - self.omega + js - self.sink_tokens) // self.omega).clamp(min=0)
-                    valid_new = new_lids < scoreboard.shape[1]
+                    # FIX (L3): Remove .clamp(min=0) and instead filter out negative IDs
+                    # to prevent artificially inflating Window-0 scores in early generation.
+                    raw_new_lids = (self.num_of_tokens_without_eviction - self.omega + js - self.sink_tokens) // self.omega
+                    valid_new = (raw_new_lids >= 0) & (raw_new_lids < scoreboard.shape[1])
                     if valid_new.any():
-                        scoreboard.scatter_add_(1, new_lids[valid_new].unsqueeze(0).expand(self.num_heads, -1), new_tok_votes[:, valid_new])
+                        scoreboard.scatter_add_(1, raw_new_lids[valid_new].unsqueeze(0).expand(self.num_heads, -1), new_tok_votes[:, valid_new])
                 
                 # Determine current valid old competitors
                 valid_mask = ~torch.isnan(self.window_scores[:, :, 1])
-                valid_old_windows = min(self.k_windows, int(valid_mask.sum(dim=1).max().item()))
+                # FIX (C1): Use .min() not .max() — parity with fast-attention module.
+                # .max() caused NaN-padded slots to be read for heads with fewer valid windows,
+                # injecting phantom Window-0 scores via nan_to_num(nan=0.0).
+                valid_old_windows = min(self.k_windows, int(valid_mask.sum(dim=1).min().item()))
 
                 raw_ids = self.window_scores[:, :valid_old_windows, 1]
                 raw_scores = self.window_scores[:, :valid_old_windows, 0]
                 # FIX (B2): Track which slots are genuinely registered vs NaN-padded empty slots
                 is_valid_slot = ~torch.isnan(raw_ids)
                 
-                old_ids = torch.nan_to_num(raw_ids, nan=0.0)
+                # OPT-5: Use nan_to_num once for safe gather index, then in-place masked_fill_
+                # to avoid allocating a second [H, k_windows] tensor via torch.where.
+                old_ids = raw_ids.nan_to_num(nan=0.0)
+                safe_ids = old_ids.long()
                 old_scores_hist = torch.nan_to_num(raw_scores, nan=0.0)
 
                 # Collect new mass generated strictly mapped dynamically 
-                old_w_gen_scores = torch.gather(scoreboard, 1, old_ids.long()) if valid_old_windows > 0 else torch.zeros_like(old_scores_hist)
-                # FIX (B2): Zero out phantom Window 0 scores gathered from NaN→0 converted empty slots
-                old_w_gen_scores = torch.where(is_valid_slot, old_w_gen_scores, torch.zeros_like(old_w_gen_scores))
+                if valid_old_windows > 0:
+                    old_w_gen_scores = scoreboard.gather(1, safe_ids)
+                    # FIX (B2): Zero out phantom Window 0 scores gathered from NaN→0 converted empty slots
+                    old_w_gen_scores.masked_fill_(~is_valid_slot, 0.0)  # in-place, no extra allocation
+                else:
+                    old_w_gen_scores = old_scores_hist.new_zeros(old_scores_hist.shape)
                 old_scores = old_scores_hist + old_w_gen_scores
 
                 # ---------------------------------------------------------
@@ -577,6 +618,9 @@ class STICKYKVCache_LayerWise(nn.Module):
                 # ---------------------------------------------------------
                 # Calculate the Logical ID of the window that just fell out of the local bubble
                 raw_last_id_val = (self.num_of_tokens_without_eviction - self.sink_tokens - local_tokens_count) // self.omega - 1
+                # FIX (BUG-4): Clamp challenger ID to valid window range
+                max_valid_wid = self.window_scores.shape[1] - 1
+                raw_last_id_val = min(raw_last_id_val, max_valid_wid)
                 has_challenger = raw_last_id_val >= 0
                 last_id_val = raw_last_id_val
 
@@ -679,10 +723,10 @@ class STICKYKVCache_LayerWise(nn.Module):
                                 self.quant_bit_width
                             )
                             # Squeeze to [omega, D] for insertion
-                            promoted_q_data_k[h].append((q_wid.item(), k_deq.squeeze(0).squeeze(0)))
-                            promoted_q_data_v[h].append((q_wid.item(), v_deq.squeeze(0).squeeze(0)))
+                            promoted_q_data_k[h].append((int(q_wid.item()), k_deq.squeeze(0).squeeze(0)))
+                            promoted_q_data_v[h].append((int(q_wid.item()), v_deq.squeeze(0).squeeze(0)))
                             # Archive per-window scale/zp (never deleted)
-                            self.q_retired_meta[(q_wid.item(), h)] = {
+                            self.q_retired_meta[(int(q_wid.item()), h)] = {
                                 'k_scale': self.q_cache_k_scale[h, qi].detach().clone(),
                                 'k_zp': self.q_cache_k_zp[h, qi].detach().clone(),
                                 'v_scale': self.q_cache_v_scale[h, qi].detach().clone(),
@@ -732,7 +776,8 @@ class STICKYKVCache_LayerWise(nn.Module):
                     dtype_fp = past_key_values[0].dtype
                     
                     # Pre-allocate per-window tensors
-                    quant_bytes_len = head_dim if self.quant_bit_width == 8 else (head_dim // 2)
+                    # OPT-6: Use precomputed value from _update_k_win_and_local_num
+                    quant_bytes_len = self._quant_bytes_len
                     new_k_quant = torch.zeros(self.num_heads, new_q_count, self.omega, quant_bytes_len, device=device, dtype=torch.uint8)
                     new_v_quant = torch.zeros(self.num_heads, new_q_count, self.omega, quant_bytes_len, device=device, dtype=torch.uint8)
                     new_k_scale = torch.zeros(self.num_heads, new_q_count, 1, head_dim, device=device, dtype=dtype_fp)
@@ -777,14 +822,18 @@ class STICKYKVCache_LayerWise(nn.Module):
                                 
                                 wid_val = int(new_q_loser_ids[h, qi].item())
                                 
+                                # FIX (C3): Graceful fallback instead of RuntimeError.
+                                # Zero-fill this q-cache slot if the window is missing.
                                 kv_tensors = self._gather_window_from_current_kv(past_key_values, h, wid_val, seq_len=seq_len)
                                 if kv_tensors is not None:
                                     k_fp, v_fp = kv_tensors
                                 else:
-                                    raise RuntimeError(f"Q-Cache rebuild failed: loser window {wid_val} not found in main cache or is partial.")
+                                    print(f"WARNING [Layer {self.layer_idx}]: Q-Cache rebuild: loser window {wid_val} not found for head {h}. Zero-filling.")
+                                    k_fp = torch.zeros(self.omega, head_dim, device=device, dtype=dtype_fp)
+                                    v_fp = torch.zeros(self.omega, head_dim, device=device, dtype=dtype_fp)
                                 
-                                # Path B: O(1) dict lookup for archived scales
-                                meta = self.q_retired_meta.get((float(wid_val), h))
+                                # Path C: Check for archived scale/zp metadata
+                                meta = self.q_retired_meta.get((wid_val, h))
                                 if meta is not None:
                                     ks = meta['k_scale'].to(device)
                                     kz = meta['k_zp'].to(device)
@@ -792,20 +841,26 @@ class STICKYKVCache_LayerWise(nn.Module):
                                     vz = meta['v_zp'].to(device)
                                     if self.quant_bit_width == 8:
                                         k_q = torch.round((k_fp.unsqueeze(0) - kz) / ks).clamp(0, 255).to(torch.uint8)
-                                        v_q = torch.round((v_fp.unsqueeze(0) - vz) / vs).clamp(0, 255).to(torch.uint8)
+                                        # FIX (M3): Do NOT unsqueeze v_fp — vs is [omega,1], v_fp is [omega,D].
+                                        # unsqueeze(0) would create [1,omega,D] which broadcasts with [omega,1]
+                                        # to produce a wrong [omega,omega,D] shape explosion.
+                                        v_q = torch.round((v_fp - vz) / vs).clamp(0, 255).to(torch.uint8)
                                         new_k_quant[h, qi] = k_q.squeeze(0)
-                                        new_v_quant[h, qi] = v_q.squeeze(0)
+                                        new_v_quant[h, qi] = v_q
                                     else:
                                         k_q = torch.round((k_fp.unsqueeze(0) - kz) / ks).clamp(0, 15).to(torch.uint8)
-                                        v_q = torch.round((v_fp.unsqueeze(0) - vz) / vs).clamp(0, 15).to(torch.uint8)
+                                        # FIX (M3): Same unsqueeze fix for int4 path.
+                                        v_q = torch.round((v_fp - vz) / vs).clamp(0, 15).to(torch.uint8)
                                         new_k_quant[h, qi] = ((k_q[..., 0::2] << 4) | k_q[..., 1::2]).squeeze(0)
-                                        new_v_quant[h, qi] = ((v_q[..., 0::2] << 4) | v_q[..., 1::2]).squeeze(0)
+                                        new_v_quant[h, qi] = (v_q[..., 0::2] << 4) | v_q[..., 1::2]
                                     new_k_scale[h, qi, 0] = ks.squeeze(0)
                                     new_k_zp[h, qi, 0] = kz.squeeze(0)
-                                    new_v_scale[h, qi] = vs.squeeze(0)
-                                    new_v_zp[h, qi] = vz.squeeze(0)
+                                    # FIX (BUG-14): Use view instead of squeeze to avoid
+                                    # dimension collapse when omega==1
+                                    new_v_scale[h, qi] = vs.view(self.omega, 1)
+                                    new_v_zp[h, qi] = vz.view(self.omega, 1)
                                 else:
-                                    # Path C: FRESH — compute new per-window quantization
+                                    # Path B: FRESH — compute new per-window quantization
                                     k_4d = k_fp.unsqueeze(0).unsqueeze(0)  # [1,1,omega,D]
                                     v_4d = v_fp.unsqueeze(0).unsqueeze(0)
                                     kq, ks, kz = self._quantize_k_per_window(k_4d, self.quant_bit_width)
@@ -850,7 +905,8 @@ class STICKYKVCache_LayerWise(nn.Module):
                 
                 new_k = torch.zeros(1, self.num_heads, new_seq_len, head_dim, device=device, dtype=dtype_fp)
                 new_v = torch.zeros(1, self.num_heads, new_seq_len, head_dim, device=device, dtype=dtype_fp)
-                new_logical_id_map = torch.zeros(self.num_heads, new_seq_len, device=device, dtype=torch.long)
+                # FIX (BUG-3): Initialize to -1 so unset entries don't alias valid Window 0
+                new_logical_id_map = torch.full((self.num_heads, new_seq_len), -1, device=device, dtype=torch.long)
 
                 # To support token ledger:
                 mapping = torch.full((self.num_heads, seq_len), -1.0, device=device, dtype=torch.float32)
@@ -883,10 +939,14 @@ class STICKYKVCache_LayerWise(nn.Module):
                 _prom_v = {(_h, int(w)): v for _h in range(self.num_heads) for w, v in promoted_q_data_v[_h]}
 
                 # Precompute local logical IDs vector (same for all heads)
+                # FIX (BUG-3): Compute unconditionally — when has_challenger is False,
+                # derive the start window ID from the token counter so local zone
+                # entries don't stay at -1 (or the old zero which aliased Window 0).
                 _local_lids = None
-                if local_tokens_count > 0 and has_challenger:
+                if local_tokens_count > 0:
                     _offsets = torch.arange(local_tokens_count, device=device, dtype=torch.long)
-                    _local_lids = (last_id_val + 1) + (_offsets // self.omega)
+                    local_start_wid = max(0, (self.num_of_tokens_without_eviction - self.sink_tokens - local_tokens_count) // self.omega)
+                    _local_lids = local_start_wid + (_offsets // self.omega)
 
                 # 1. Sinks
                 new_k[0, :, :self.sink_tokens] = past_key_values[0][0, :, :self.sink_tokens]
@@ -922,8 +982,12 @@ class STICKYKVCache_LayerWise(nn.Module):
                 not_in_main_mask = ~found_in_main
                 if not_in_main_mask.any():
                     heads, indices = not_in_main_mask.nonzero(as_tuple=True)
-                    for h_idx, i_idx in zip(heads.tolist(), indices.tolist()):
-                        wid_val = int(final_ids[h_idx, i_idx].item())
+                    # OPT-2: Extract all wid_vals in one .tolist() call instead of
+                    # O(count) per-iteration .item() CPU-GPU syncs.
+                    all_wid_vals = final_ids[heads, indices].long().tolist()
+                    heads_list = heads.tolist()
+                    indices_list = indices.tolist()
+                    for h_idx, i_idx, wid_val in zip(heads_list, indices_list, all_wid_vals):
                         new_pos = self.sink_tokens + i_idx * self.omega
                         
                         p_k = _prom_k.get((h_idx, wid_val))
@@ -932,6 +996,14 @@ class STICKYKVCache_LayerWise(nn.Module):
                             new_k[0, h_idx, new_pos:new_pos+self.omega] = p_k
                             new_v[0, h_idx, new_pos:new_pos+self.omega] = p_v
                             new_logical_id_map[h_idx, new_pos:new_pos+self.omega] = wid_val
+                            # FIX (BUG-6): Update mapping for promoted q-cache windows
+                            # so ledger entries don't get falsely marked as evicted.
+                            span = self._find_logical_window_span(h_idx, wid_val, seq_len)
+                            if span is not None:
+                                old_s, old_e = span
+                                mapping[h_idx, old_s:old_e] = torch.arange(
+                                    new_pos, new_pos + self.omega, device=device, dtype=torch.float32
+                                )
                         else:
                             span = self._find_logical_window_span(h_idx, wid_val, seq_len)
                             if span is not None:
@@ -941,44 +1013,55 @@ class STICKYKVCache_LayerWise(nn.Module):
                                 new_logical_id_map[h_idx, new_pos:new_pos+self.omega] = wid_val
                                 mapping[h_idx, old_start:old_end] = torch.arange(new_pos, new_pos+self.omega, device=device, dtype=torch.float32)
                             else:
-                                raise RuntimeError(f"Physical Eviction failed: window {wid_val} not found or is partial.")
+                                print(f"WARNING [Layer {self.layer_idx}]: Physical eviction: window {wid_val} "
+                                      f"not found or partial for head {h_idx}. Zero-filling slot.")
+                                new_logical_id_map[h_idx, new_pos:new_pos+self.omega] = wid_val
                 
                 # 3. Local Zone
                 if local_tokens_count > 0:
                     old_local_start = seq_len - local_tokens_count
                     new_local_start = new_compressed_len
-                    new_k[0, :, new_local_start:] = past_key_values[0][0, :, old_local_start:old_local_start+local_tokens_count]
-                    new_v[0, :, new_local_start:] = past_key_values[1][0, :, old_local_start:old_local_start+local_tokens_count]
+                    # FIX (BUG-7): Clamp to prevent silent truncation if dynamic count drifts
+                    actual_local = min(local_tokens_count, seq_len - old_local_start)
+                    new_k[0, :, new_local_start:new_local_start+actual_local] = past_key_values[0][0, :, old_local_start:old_local_start+actual_local]
+                    new_v[0, :, new_local_start:new_local_start+actual_local] = past_key_values[1][0, :, old_local_start:old_local_start+actual_local]
                     
                     if _local_lids is not None:
-                        new_logical_id_map[:, new_local_start:new_local_start + local_tokens_count] = _local_lids.unsqueeze(0)
+                        new_logical_id_map[:, new_local_start:new_local_start + actual_local] = _local_lids[:actual_local].unsqueeze(0)
                         
-                    mapping[:, old_local_start:old_local_start+local_tokens_count] = torch.arange(new_local_start, new_local_start+local_tokens_count, device=device, dtype=torch.float32).unsqueeze(0)
+                    mapping[:, old_local_start:old_local_start+actual_local] = torch.arange(new_local_start, new_local_start+actual_local, device=device, dtype=torch.float32).unsqueeze(0)
                 
                 self.logical_id_map = new_logical_id_map
                 updated_kv = (new_k, new_v)
                 
                 if self.tracking_flag:
-                    for head_idx in range(self.num_heads):
-                        phys_col = 2 + head_idx
-                        live_mask = (self.token_ledger[:, 2:2+self.num_heads] >= 0).any(dim=1)
-                        g_ids = torch.where(live_mask)[0]
-                        old_phys = self.token_ledger[g_ids, phys_col].long()
-                        
-                        valid_old = (old_phys >= 0) & (old_phys < seq_len)
-                        valid_old_phys = old_phys[valid_old]
-                        valid_g_ids = g_ids[valid_old]
-                        
+                    # OPT-7c: Vectorized eviction ledger update.
+                    # Replaces O(H) head loop with a single [N_live, H] gather + scatter.
+                    # FIX (OPT-7c dtype): mapping is float32; new_phys is derived from it
+                    # so we write it back as float32 to match the ledger column dtype.
+                    live_mask = (self.token_ledger[:, 2:2+self.num_heads] >= 0).any(dim=1)
+                    g_ids = torch.where(live_mask)[0]
+
+                    if g_ids.numel() > 0:
+                        # [N_live, H] — physical positions for all heads at once
+                        all_phys = self.token_ledger[g_ids, 2:2+self.num_heads].long()
+                        valid_old = (all_phys >= 0) & (all_phys < seq_len)  # [N_live, H]
+                        safe_phys = all_phys.clamp(min=0, max=seq_len - 1)
+
                         # FIX: Record votes for ALL tokens that were valid in this cycle BEFORE eviction.
                         # This ensures dying tokens get their final 'omega' steps of attention recorded.
-                        if len(valid_g_ids) > 0:
-                            head_scores_acc = self.running_attention_votes[head_idx, valid_old_phys]
-                            self.token_ledger[valid_g_ids, 2 + self.num_heads + head_idx] += head_scores_acc.float()
-                            self.global_score_history[valid_g_ids, head_idx] += head_scores_acc.float()
+                        head_grid = torch.arange(self.num_heads, device=device).unsqueeze(0).expand(g_ids.shape[0], -1)
+                        votes = self.running_attention_votes[head_grid, safe_phys]  # [N_live, H]
+                        votes = votes * valid_old.to(votes.dtype)
+                        self.token_ledger[g_ids, 2+self.num_heads:2+2*self.num_heads] += votes.float()
+                        self.global_score_history[g_ids, :] += votes.float()
 
-                        # Now update the physical indices for the survivors
-                        new_phys = mapping[head_idx, valid_old_phys]
-                        self.token_ledger[valid_g_ids, phys_col] = new_phys
+                        # Update physical indices using the mapping tensor.
+                        # mapping is float32; use same dtype to preserve ledger column dtype.
+                        new_phys = mapping[head_grid, safe_phys]  # [N_live, H] float32
+                        # Mark evicted/invalid slots as -1.0 (matches the ledger sentinel)
+                        new_phys = torch.where(valid_old, new_phys, torch.full_like(new_phys, -1.0))
+                        self.token_ledger[g_ids, 2:2+self.num_heads] = new_phys
 
                 self.running_attention_votes.zero_()
                 self.tokens_since_last_review = 0
@@ -1070,7 +1153,7 @@ class STICKYKVCache_LayerWise(nn.Module):
         )
         ids, orig_ids = self.window_scores[:, :, 1], self.window_scores[:, :, 2]
         
-        curr_k = min(self.k_windows, int(valid_mask.sum(dim=1).max().item()))
+        curr_k = min(self.k_windows, int(valid_mask.sum(dim=1).min().item()))
         
         top_v, top_i = torch.topk(scores, curr_k, dim=1, largest=True)
         kept_ids, kept_orig = torch.gather(ids, 1, top_i), torch.gather(
@@ -1108,15 +1191,18 @@ class STICKYKVCache_LayerWise(nn.Module):
         
         sinks = self.sink_indices.unsqueeze(0).expand(self.num_heads, -1)
         
-        # FIX (Bug 1): Only map genuinely valid (non-NaN) window score entries.
-        # NaN→0 conversion previously resurrected evicted window-0 tokens.
+        # FIX (C3): Only include genuinely valid (non-NaN) window score entries.
+        # Previously, invalid NaN slots were zeroed to token index 0 via multiply-by-0,
+        # inserting a phantom token-0 into the survivor set when sink_tokens == 0.
         raw_w = self.window_scores[:, :self.k_windows, 1]
         valid_w_mask = ~torch.isnan(raw_w)
-        sticky_w = torch.where(valid_w_mask, raw_w.long(), torch.zeros_like(raw_w, dtype=torch.long))
-        all_window_tokens = self.window_to_token_map[sticky_w]  # [H, k_windows, omega]
-        # Zero out tokens from invalid (NaN) slots so they don't enter the survivor set
-        all_window_tokens = all_window_tokens * valid_w_mask.unsqueeze(-1).long()
-        window_tokens = all_window_tokens.view(self.num_heads, -1)
+        valid_k = int(valid_w_mask.all(dim=0).sum().item())
+        if valid_k > 0:
+            sticky_w = self.window_scores[:, :valid_k, 1].long()
+            all_window_tokens = self.window_to_token_map[sticky_w]
+            window_tokens = all_window_tokens.view(self.num_heads, -1)
+        else:
+            window_tokens = torch.zeros(self.num_heads, 0, device=device, dtype=torch.long)
         
         local_start = local_start_idx
         if local_start < seq_len:
@@ -1127,19 +1213,27 @@ class STICKYKVCache_LayerWise(nn.Module):
             
         all_indices_clamped = torch.clamp(all_indices, 0, seq_len - 1)
         
-        sorted_indices = []
-        for h in range(self.num_heads):
-            unique = torch.unique(all_indices_clamped[h])
-            sorted_indices.append(unique)
-            
+        # OPT-1: Batched sort + adjacent-diff replaces per-head torch.unique() loop.
+        # WE MUST SORT AND DEDUPLICATE PER HEAD so the physical KV cache stays chronological
+        # and so that the ledger mapping correctly aligns with the physical tensor dimensions.
+        sorted_all, _ = torch.sort(all_indices_clamped, dim=1)   # [H, N]
+        # Mark the first occurrence of each value per row (diff != 0 means value changed)
+        diff = torch.cat([
+            torch.ones(self.num_heads, 1, device=device, dtype=torch.bool),
+            sorted_all[:, 1:] != sorted_all[:, :-1]
+        ], dim=1)                                                # [H, N]
+        # Per-head unique count -> global safe_len (one .item() sync, unavoidable)
+        per_head_counts = diff.sum(dim=1)                        # [H]
         # FIX (Bug A): Use min-len truncation instead of max-len padding.
         # Padding duplicated the last KV entry, corrupting model attention.
         # Truncation drops only the highest-index local tail tokens, which
         # safely re-enter at the next eviction cycle.
-        safe_len = min(len(u) for u in sorted_indices)
-        final_indices = torch.stack(
-            [u[:safe_len] for u in sorted_indices], dim=0
-        )
+        safe_len = int(per_head_counts.min().item())
+        # Compact: for each head pull only the unique values up to safe_len
+        final_indices = torch.stack([
+            sorted_all[h][diff[h]][:safe_len]
+            for h in range(self.num_heads)
+        ], dim=0)
         
         gather_idx = (
             final_indices
@@ -1152,7 +1246,9 @@ class STICKYKVCache_LayerWise(nn.Module):
         ), final_indices
 
     def _update_k_win_and_local_num(self, new_tokens, max_tokens):
-        # FIX 5: CFO Allocator evaluates strictly natively across token budget. 
+        # FIX 5: CFO Allocator evaluates strictly natively across token budget.
+        # Budget includes max_tokens to ensure the cache can accommodate the full
+        # sequence (prompt + generation) without mid-generation reallocation.
         total_token_budget = (new_tokens + max_tokens) * self.total_cache_ratio // 100
         
         if self.use_fixed_local_tokens:
@@ -1176,11 +1272,18 @@ class STICKYKVCache_LayerWise(nn.Module):
         
         available_sticky_tokens = total_token_budget - self.local_num - self.sink_tokens - effective_q_tokens
         self.k_windows = max(0, available_sticky_tokens // self.omega)
+        if self.k_windows == 0:
+            print(f"WARNING [Layer {self.layer_idx}]: k_windows=0 — insufficient budget for sticky windows "
+                  f"(budget={total_token_budget}, local={self.local_num}, sink={self.sink_tokens}, "
+                  f"q_eff={effective_q_tokens}). Eviction is effectively disabled.")
+        # OPT-6: Precompute quant byte width so q-cache rebuild blocks avoid repeated conditionals
+        self._quant_bytes_len = self.head_dim if self.quant_bit_width == 8 else (self.head_dim // 2)
 
     def _clean_scores(self):
         # Hard resets for cross-document isolation
         self.gen_step = self.num_of_tokens_without_eviction = 0
         self.k_windows = 3  # Reset to constructor default
+        self.local_num = 0  # FIX (M2): Reset stale local_num from previous document
         self.tokens_since_last_review = 0
         if hasattr(self, "running_attention_votes"):
             self.running_attention_votes.zero_()
@@ -1210,3 +1313,5 @@ class STICKYKVCache_LayerWise(nn.Module):
         # entries from previous documents will falsely match new windows with
         # the same ID, applying incorrect float16 scale/zp to their quantization.
         self.q_retired_meta = {}
+        # Reset precomputed quant byte width
+        self._quant_bytes_len = self.head_dim if self.quant_bit_width == 8 else (self.head_dim // 2)

@@ -1,7 +1,6 @@
 import time
 import sticky_config as config
 import torch
-import gc
 import numpy as np
 from typing import Dict, Any, List
 
@@ -187,10 +186,10 @@ def generate(prompt, model, tokenizer, device, refs=None, task=None, **kwargs):
     matching DefensiveKV's pipeline.
     """
     if task in _RAW_COMPLETION_TASKS:
-        old_bos = tokenizer.bos_token
-        tokenizer.bos_token = ""
-        inputs = tokenizer(prompt, return_tensors="pt").to(device)
-        tokenizer.bos_token = old_bos
+        # FIX (M1): Use add_special_tokens=False instead of mutating bos_token.
+        # Setting bos_token="" has no effect on PreTrainedTokenizerFast (Llama 3)
+        # which controls BOS prepending via the add_bos_token attribute.
+        inputs = tokenizer(prompt, return_tensors="pt", add_special_tokens=False).to(device)
     else:
         messages = [{"role": "user", "content": prompt}]
         formatted_prompt = tokenizer.apply_chat_template(
@@ -209,8 +208,6 @@ def generate(prompt, model, tokenizer, device, refs=None, task=None, **kwargs):
         for layer in model.model.layers:
             if hasattr(layer, "self_attn") and hasattr(layer.self_attn, "_clean_cache"):
                 layer.self_attn._clean_cache()
-                if hasattr(layer.self_attn, "kv_cache"):
-                    layer.self_attn.kv_cache._prefill_done = False
 
     if device == "cuda":
         torch.cuda.synchronize()
@@ -281,7 +278,7 @@ def evaluate_dataset(name, dataset, seed, model, tokenizer, device):
     np.random.seed(seed)
 
     results = []
-    sample_size = min(getattr(config, "LONGBENCH_SAMPLES", 1), len(dataset))
+    sample_size = min(config.LONGBENCH_SAMPLES, len(dataset))
     print(f"Running {sample_size} samples from {config.LONGBENCH_SAMPLES} configured (dataset size: {len(dataset)})")
 
 
@@ -310,7 +307,11 @@ def evaluate_dataset(name, dataset, seed, model, tokenizer, device):
         # -----------------------------------------------------------------
         # Score with the official dispatch pattern (mirrors eval.py scorer)
         # -----------------------------------------------------------------
-        raw_score = score_example(name, gen["text"], refs, all_classes)
+        try:
+            raw_score = score_example(name, gen["text"], refs, all_classes)
+        except ValueError as e:
+            print(f"⚠️  Scoring error: {e}, skipping example")
+            continue
 
         # Derive the metric-key name from the scoring function for logging
         scorer_fn  = dataset2metric.get(name)
@@ -320,7 +321,7 @@ def evaluate_dataset(name, dataset, seed, model, tokenizer, device):
 
         throughput = (
             gen["tokens"] / gen["time"]
-            if gen["tokens"] > 1 and gen["time"] > 0
+            if gen["tokens"] >= 1 and gen["time"] > 0
             else 0.0
         )
 

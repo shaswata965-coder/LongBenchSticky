@@ -446,6 +446,13 @@ class STICKYKVCache_LayerWise(nn.Module):
             # 2. PERIODIC EVALUATION
             # Process eviction constraints specifically when the tracker hits OMEGA boundary thresholds
             if self.tokens_since_last_review == self.omega:
+                # --- PROFILING (remove after diagnosis) ---
+                _prof = (self.layer_idx == 0)
+                if _prof:
+                    import time
+                    torch.cuda.synchronize()
+                    _t0 = time.perf_counter()
+                # ------------------------------------------
                 # FIX (Bug 1): Use the persisted dynamic local count that absorbed
                 # the prefill remainder, instead of re-reading the static config value.
                 local_tokens_count = self._dynamic_local_count
@@ -485,6 +492,9 @@ class STICKYKVCache_LayerWise(nn.Module):
                 # Determine current valid old competitors
                 valid_mask = ~torch.isnan(self.window_scores[:, :, 1])
                 valid_old_windows = min(self.k_windows, int(valid_mask.sum(dim=1).min().item()))
+                if _prof:
+                    torch.cuda.synchronize(); _t1 = time.perf_counter()
+                    print(f"[PROF L0] scoreboard+scatter: {(_t1-_t0)*1000:.1f}ms")
 
                 raw_ids = self.window_scores[:, :valid_old_windows, 1]
                 raw_scores = self.window_scores[:, :valid_old_windows, 0]
@@ -590,6 +600,9 @@ class STICKYKVCache_LayerWise(nn.Module):
                         new_q_loser_scores = q_top_v
 
                 # --- Q-CACHE: Handle promotions (q-cache → main cache) ---
+                if _prof:
+                    torch.cuda.synchronize(); _t2 = time.perf_counter()
+                    print(f"[PROF L0] competition+topk: {(_t2-_t1)*1000:.1f}ms")
                 promoted_q_data_k = {h: [] for h in range(self.num_heads)}
                 promoted_q_data_v = {h: [] for h in range(self.num_heads)}
                 if self.q_cache_ids is not None:
@@ -785,6 +798,9 @@ class STICKYKVCache_LayerWise(nn.Module):
                     self.q_cache_ids = None
                     self.q_cache_scores = None
 
+                if _prof:
+                    torch.cuda.synchronize(); _t3 = time.perf_counter()
+                    print(f"[PROF L0] q-cache rebuild: {(_t3-_t2)*1000:.1f}ms")
                 # ---------------------------------------------------------
                 # 5. PHYSICAL EVICTION (Explicit Construction)
                 # ---------------------------------------------------------
@@ -920,6 +936,9 @@ class STICKYKVCache_LayerWise(nn.Module):
                 # more bandwidth than needed (4MB vs ~62KB for Qasper at omega=8).
                 self.running_attention_votes[:, :seq_len].zero_()
                 self.tokens_since_last_review = 0
+                if _prof:
+                    torch.cuda.synchronize(); _t4 = time.perf_counter()
+                    print(f"[PROF L0] physical eviction: {(_t4-_t3)*1000:.1f}ms | TOTAL eviction cycle: {(_t4-_t0)*1000:.1f}ms")
                 
                 return updated_kv
             else:

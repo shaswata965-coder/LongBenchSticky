@@ -468,7 +468,10 @@ class STICKYKVCache_LayerWise(nn.Module):
                 
                 # Retrieve compressed space properties
                 compressed_len = self.logical_id_map.shape[1]
-                compressed_votes = self.running_attention_votes[:, :compressed_len]
+                # .contiguous() once here so the CUDA kernel wrapper (and scatter_add_) never
+                # allocate a hidden copy — running_attention_votes[:, :n] has stride (max_ctx, 1)
+                # which is non-contiguous for a logical [H, n] view.
+                compressed_votes = self.running_attention_votes[:, :compressed_len].contiguous()
                 
                 # Look up Logical IDs directly from our map! No math required.
                 logical_ids = self.logical_id_map

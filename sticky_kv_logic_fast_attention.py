@@ -1122,7 +1122,7 @@ class STICKYKVCache_LayerWise(nn.Module):
         effective_q_tokens = int(self.q_num * compression_ratio)
         self.q_windows_count = effective_q_tokens // self.omega
         
-        available_sticky_tokens = total_token_budget - self.local_num - self.sink_tokens - effective_q_tokens
+        available_sticky_tokens = total_token_budget - self.local_num - self.sink_tokens - self.q_num
         self.k_windows = max(0, available_sticky_tokens // self.omega)
         if self.k_windows == 0:
             print(f"WARNING [Layer {self.layer_idx}]: k_windows=0 — insufficient budget for sticky windows "

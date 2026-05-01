@@ -5,10 +5,19 @@ from transformers.models.llama.modeling_llama import rotate_half
 
 try:
     import sticky_cuda_kernels as _cuda_kernels
-    _CUDA_KERNELS_AVAILABLE = _cuda_kernels.is_available()
 except ImportError:
     _cuda_kernels = None
-    _CUDA_KERNELS_AVAILABLE = False
+
+_CUDA_KERNELS_AVAILABLE = None
+
+def _check_cuda_kernels():
+    global _CUDA_KERNELS_AVAILABLE
+    if _CUDA_KERNELS_AVAILABLE is None:
+        if _cuda_kernels is not None:
+            _CUDA_KERNELS_AVAILABLE = _cuda_kernels.is_available()
+        else:
+            _CUDA_KERNELS_AVAILABLE = False
+    return _CUDA_KERNELS_AVAILABLE
 
 '''
 Duplicates the KV heads n_rep times using memory-efficient 
@@ -464,19 +473,42 @@ class STICKYKVCache_LayerWise(nn.Module):
                 # Look up Logical IDs directly from our map! No math required.
                 logical_ids = self.logical_id_map
                 
-                # CUDA-accelerated scoreboard scatter (fallback built into module)
-                scoreboard = _cuda_kernels.scoreboard_scatter(
-                    compressed_votes, logical_ids, self.window_scores.shape[1]
-                )
-                
-                # Route votes for omega new tokens not yet in logical_id_map
-                if seq_len > compressed_len:
-                    new_tok_votes = self.running_attention_votes[:, compressed_len:seq_len]
-                    _cuda_kernels.scoreboard_scatter_new_tokens(
-                        new_tok_votes, scoreboard,
-                        self.num_of_tokens_without_eviction, self.omega, self.sink_tokens,
-                        compressed_len, seq_len
+                # Scoreboard scatter — route through the sticky_cuda_kernels package
+                # which provides CUDA acceleration with an automatic PyTorch fallback.
+                # BUG-1/11 FIX: guard against _cuda_kernels being None (JIT compile
+                # failed at startup) so the generation path never crashes.
+                if _cuda_kernels is not None:
+                    scoreboard = _cuda_kernels.scoreboard_scatter(
+                        compressed_votes, logical_ids, self.window_scores.shape[1]
                     )
+                    if seq_len > compressed_len:
+                        new_tok_votes = self.running_attention_votes[:, compressed_len:seq_len]
+                        _cuda_kernels.scoreboard_scatter_new_tokens(
+                            new_tok_votes, scoreboard,
+                            self.num_of_tokens_without_eviction, self.omega, self.sink_tokens,
+                            compressed_len, seq_len
+                        )
+                else:
+                    # Inline PyTorch fallback — mirrors sticky_cuda_kernels/__init__.py
+                    max_w = self.window_scores.shape[1]
+                    H_sc = compressed_votes.shape[0]
+                    is_chunk_token = (logical_ids >= 0) & (logical_ids < max_w)
+                    routed = torch.where(is_chunk_token, compressed_votes, torch.zeros_like(compressed_votes))
+                    safe_ids = torch.where(is_chunk_token, logical_ids, torch.zeros_like(logical_ids)).long()
+                    scoreboard = torch.zeros((H_sc, max_w), device=device, dtype=torch.float32)
+                    scoreboard.scatter_add_(1, safe_ids, routed)
+                    if seq_len > compressed_len:
+                        new_tok_votes = self.running_attention_votes[:, compressed_len:seq_len]
+                        n_new = new_tok_votes.shape[1]
+                        js = torch.arange(n_new, device=device, dtype=torch.long)
+                        raw_new_lids = (self.num_of_tokens_without_eviction - self.omega + js - self.sink_tokens) // self.omega
+                        valid_new = (raw_new_lids >= 0) & (raw_new_lids < max_w)
+                        if valid_new.any():
+                            scoreboard.scatter_add_(
+                                1,
+                                raw_new_lids[valid_new].unsqueeze(0).expand(H_sc, -1),
+                                new_tok_votes[:, valid_new]
+                            )
                 
                 # Determine current valid old competitors
                 valid_mask = ~torch.isnan(self.window_scores[:, :, 1])
@@ -840,22 +872,46 @@ class STICKYKVCache_LayerWise(nn.Module):
                     local_start_wid = max(0, (self.num_of_tokens_without_eviction - self.sink_tokens - local_tokens_count) // self.omega)
                     _local_lids = local_start_wid + (_offsets // self.omega)
                 
-                # 1. Sinks — CUDA-accelerated
-                _cuda_kernels.eviction_copy_sinks(
-                    past_key_values[0][0], past_key_values[1][0],
-                    new_k[0], new_v[0],
-                    self.logical_id_map, new_logical_id_map,
-                    self.sink_tokens
-                )
-                
-                # 2. Sticky Zone — CUDA-accelerated
-                if found_in_main.any():
-                    _cuda_kernels.eviction_copy_sticky(
+                # 1. Sinks — CUDA-accelerated with PyTorch fallback
+                # BUG-1/11 FIX: guard against _cuda_kernels being None.
+                if _cuda_kernels is not None:
+                    _cuda_kernels.eviction_copy_sinks(
                         past_key_values[0][0], past_key_values[1][0],
                         new_k[0], new_v[0],
-                        first_phys, found_in_main, final_ids.long(),
-                        new_logical_id_map, curr_k, self.omega, self.sink_tokens
+                        self.logical_id_map, new_logical_id_map,
+                        self.sink_tokens
                     )
+                else:
+                    # Inline PyTorch fallback for sink copy
+                    if self.sink_tokens > 0:
+                        new_k[0, :, :self.sink_tokens] = past_key_values[0][0, :, :self.sink_tokens]
+                        new_v[0, :, :self.sink_tokens] = past_key_values[1][0, :, :self.sink_tokens]
+                        new_logical_id_map[:, :self.sink_tokens] = self.logical_id_map[:, :self.sink_tokens]
+
+                # 2. Sticky Zone — CUDA-accelerated with PyTorch fallback
+                if found_in_main.any():
+                    if _cuda_kernels is not None:
+                        _cuda_kernels.eviction_copy_sticky(
+                            past_key_values[0][0], past_key_values[1][0],
+                            new_k[0], new_v[0],
+                            first_phys, found_in_main, final_ids.long(),
+                            new_logical_id_map, curr_k, self.omega, self.sink_tokens
+                        )
+                    else:
+                        # Inline PyTorch fallback for sticky window copy
+                        _H = past_key_values[0][0].shape[0]
+                        _offsets = torch.arange(self.omega, device=device, dtype=torch.long)
+                        _tgt_starts = self.sink_tokens + torch.arange(curr_k, device=device, dtype=torch.long) * self.omega
+                        _tgt_starts_h = _tgt_starts.unsqueeze(0).expand(_H, -1)  # [H, curr_k]
+                        for _wi in range(curr_k):
+                            for _h in range(_H):
+                                if not found_in_main[_h, _wi]:
+                                    continue
+                                _src = first_phys[_h, _wi] + _offsets
+                                _dst = _tgt_starts_h[_h, _wi] + _offsets
+                                new_k[0, _h, _dst] = past_key_values[0][0, _h, _src]
+                                new_v[0, _h, _dst] = past_key_values[1][0, _h, _src]
+                                new_logical_id_map[_h, _dst] = final_ids[_h, _wi].long()
 
                 not_in_main_mask = ~found_in_main
                 if not_in_main_mask.any():
@@ -886,18 +942,30 @@ class STICKYKVCache_LayerWise(nn.Module):
                                       f"not found or partial for head {h_idx}. Zero-filling slot.")
                                 new_logical_id_map[h_idx, new_pos:new_pos+self.omega] = wid_val
                 
-                # 3. Local Zone — CUDA-accelerated
+                # 3. Local Zone — CUDA-accelerated with PyTorch fallback
                 if local_tokens_count > 0:
                     old_local_start = seq_len - local_tokens_count
                     # FIX (BUG-7): Clamp to prevent silent truncation if dynamic count drifts
                     actual_local = min(local_tokens_count, seq_len - old_local_start)
-                    _cuda_kernels.eviction_copy_local(
-                        past_key_values[0][0], past_key_values[1][0],
-                        new_k[0], new_v[0],
-                        new_logical_id_map, actual_local,
-                        old_local_start, new_compressed_len,
-                        local_start_wid if _local_lids is not None else 0, self.omega
-                    )
+                    _lsw = local_start_wid if _local_lids is not None else 0
+                    if _cuda_kernels is not None:
+                        _cuda_kernels.eviction_copy_local(
+                            past_key_values[0][0], past_key_values[1][0],
+                            new_k[0], new_v[0],
+                            new_logical_id_map, actual_local,
+                            old_local_start, new_compressed_len,
+                            _lsw, self.omega
+                        )
+                    else:
+                        # Inline PyTorch fallback for local zone copy
+                        new_k[0, :, new_compressed_len:new_compressed_len + actual_local] = \
+                            past_key_values[0][0, :, old_local_start:old_local_start + actual_local]
+                        new_v[0, :, new_compressed_len:new_compressed_len + actual_local] = \
+                            past_key_values[1][0, :, old_local_start:old_local_start + actual_local]
+                        _loc_offsets = torch.arange(actual_local, device=device, dtype=torch.long)
+                        _loc_lids = _lsw + (_loc_offsets // self.omega)
+                        new_logical_id_map[:, new_compressed_len:new_compressed_len + actual_local] = \
+                            _loc_lids.unsqueeze(0)
                 
                 self.logical_id_map = new_logical_id_map
                 updated_kv = (new_k, new_v)
@@ -932,8 +1000,8 @@ class STICKYKVCache_LayerWise(nn.Module):
     @staticmethod
     def _quantize_k_per_window(tensor, bit_width=8):
         """Quantize K cache: per-channel per-window, with RoPE-paired dimension tying."""
-        # CUDA fast-path for INT8 fp16
-        if bit_width == 8 and _CUDA_KERNELS_AVAILABLE and tensor.dtype == torch.float16:
+        # CUDA fast-path for INT8 fp16/bf16
+        if bit_width == 8 and _check_cuda_kernels() and tensor.dtype in (torch.float16, torch.bfloat16):
             return _cuda_kernels.quantize_k_int8(tensor)
         # PyTorch fallback (INT4 or non-fp16)
         t_min = tensor.amin(dim=2, keepdim=True)
@@ -959,8 +1027,8 @@ class STICKYKVCache_LayerWise(nn.Module):
     @staticmethod
     def _quantize_v_per_window(tensor, bit_width=8):
         """Quantize V cache: per-token per-window."""
-        # CUDA fast-path for INT8 fp16
-        if bit_width == 8 and _CUDA_KERNELS_AVAILABLE and tensor.dtype == torch.float16:
+        # CUDA fast-path for INT8 fp16/bf16
+        if bit_width == 8 and _check_cuda_kernels() and tensor.dtype in (torch.float16, torch.bfloat16):
             return _cuda_kernels.quantize_v_int8(tensor)
         # PyTorch fallback (INT4 or non-fp16)
         t_min = tensor.amin(dim=3, keepdim=True)
@@ -986,7 +1054,7 @@ class STICKYKVCache_LayerWise(nn.Module):
             return unpacked.to(scale.dtype) * scale + zero_point
         else:
             # CUDA fast-path for INT8
-            if _CUDA_KERNELS_AVAILABLE and quant_tensor.is_cuda and scale.dtype == torch.float16:
+            if _check_cuda_kernels() and quant_tensor.is_cuda and scale.dtype in (torch.float16, torch.bfloat16):
                 per_channel = (scale.shape[-1] > 1)
                 # K: scale is [H,W,1,D], shared across omega rows. V: scale is [H,W,omega,1]
                 omega_val = quant_tensor.shape[-2] // scale.shape[-2] if per_channel and scale.shape[-2] < quant_tensor.shape[-2] else 1

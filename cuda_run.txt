@@ -1,308 +1,121 @@
 ================================================================================
-  STICKY KV CACHE — HPC RUN GUIDE (NVIDIA A100 / SLURM)
+  STICKY KV CACHE — CUDA KERNEL RUN GUIDE
 ================================================================================
 
-This guide walks you through setting up and running the Sticky KV Cache
-LongBench evaluation on an HPC cluster with NVIDIA A100 GPUs (Ampere, sm_80).
+This guide walks you through setting up and running the Sticky KV Cache 
+LongBench evaluation with custom CUDA kernels.
 
-The custom CUDA kernels in sticky_cuda_kernels/ are JIT-compiled on the first
-run via PyTorch's cpp_extension.load(). If compilation fails for any reason,
-the system automatically falls back to pure-PyTorch equivalents — nothing
-will crash.
+The custom CUDA kernels in `sticky_cuda_kernels/` are JIT-compiled on the first
+run via PyTorch's `cpp_extension.load()`. If compilation fails, the system
+automatically falls back to pure-PyTorch equivalents — nothing will crash.
 
 ================================================================================
   QUICK-START CHECKLIST
 ================================================================================
 
-  [ ] 1. Configure sticky_config.py (model path, cache ratios, data dir)
-  [ ] 2. Load CUDA + GCC modules on your cluster
-  [ ] 3. Activate your Python environment
-  [ ] 4. pip install -r requirements.txt  (if not already done)
-  [ ] 5. Set TORCH_CUDA_ARCH_LIST="8.0" for A100
-  [ ] 6. Run: python main.py  (or submit the SLURM script below)
-  [ ] 7. Confirm "[StickyKernels] CUDA kernels compiled and loaded" in the log
+  [ ] 1. Install prerequisites (CUDA Toolkit, and MSVC for Windows / GCC for Linux).
+  [ ] 2. Configure `sticky_config.py` (model path, cache ratios, data dir).
+  [ ] 3. Activate your Python environment (conda or venv).
+  [ ] 4. `pip install -r requirements.txt` (if not already done).
+  [ ] 5. Run the evaluation script: `python Results\run_longbench_sticky.py`
+  [ ] 6. Confirm "[StickyKernels] CUDA kernels compiled and loaded" in the log.
 
 ================================================================================
-  STEP 1 — CONFIGURE sticky_config.py BEFORE ANYTHING ELSE
+  STEP 1 — PREREQUISITES FOR CUDA KERNEL COMPILATION
 ================================================================================
 
-Open sticky_config.py and set these values for your HPC environment:
+To compile the "cuda kernel infused path" on the fly, your system needs a C++ 
+compiler and the NVIDIA CUDA Toolkit.
+
+FOR WINDOWS USERS:
+  1. Install Visual Studio Build Tools (2019 or 2022) with the "Desktop development with C++" workload. 
+     (This provides `cl.exe` which PyTorch needs to compile extensions).
+  2. Install NVIDIA CUDA Toolkit (e.g., v11.8 or v12.1).
+  3. Ensure `nvcc` and `cl` are accessible in your terminal. The easiest way is 
+     to use the "x64 Native Tools Command Prompt for VS" to run your scripts, 
+     or add the MSVC bin directory to your system PATH.
+
+FOR LINUX USERS:
+  1. Ensure you have GCC installed (`gcc --version`). 
+  2. Ensure CUDA Toolkit is installed (`nvcc --version`).
+  * On HPC/SLURM clusters, use: `module load cuda/12.1` and `module load gcc/11.3.0`
+
+================================================================================
+  STEP 2 — CONFIGURE sticky_config.py
+================================================================================
+
+Open `sticky_config.py` in the root folder and set these values:
 
   MODEL_PATH   — Full path to your local model weights directory
-                 Example: "/scratch/yourname/llama-3.2-1b-instruct"
+                 Example: "C:\models\llama-3.2-1b-instruct"
 
   DATA_DIR     — Full path to your LongBench dataset directory
-                 Example: "/scratch/yourname/data/1LongBenchData"
-
-Key cache tuning parameters (defaults are reasonable starting points):
-
-  R_RATIO      = 20    # Total KV cache budget as % of sequence length
-  P_RATIO      = 50    # Local/recent token window as % of total budget
-  Q_RATIO      = 10    # Quantized eviction slot budget as % of total budget
-  OMEGA        = 8     # Tokens per sticky window
-  SINK_TOKENS  = 4     # Permanently pinned prefix tokens (never evicted)
-  QUANTIZATION_BIT_WIDTH = 8  # 8 for INT8, 4 for INT4 (doubles q-cache capacity)
-
-  NUM_SAMPLES     = 10   # Samples to evaluate per task
-  LONGBENCH_SAMPLES = 20 # Max LongBench samples per sub-task
-
---------------------------------------------------------------------------------
-NOTE: The model is loaded in sticky_llama_model.py using STICKYLlamaForCausalLM
-      and torch.bfloat16 by default. Confirm your model checkpoint is compatible.
---------------------------------------------------------------------------------
+                 Example: "C:\data\1LongBenchData"
 
 ================================================================================
-  STEP 2 — LOAD CLUSTER MODULES
+  STEP 3 — PYTHON ENVIRONMENT & DEPENDENCIES
 ================================================================================
 
-Run this in your interactive session or paste it into your SLURM script.
-Module names vary by cluster — adjust to match your HPC's naming convention.
-
-  module purge
-  module load cuda/12.1        # A100 needs CUDA >= 11.0; 12.x preferred
-  module load gcc/11.3.0       # GCC >= 9 required for PyTorch JIT; 11.x+ recommended
-
-Verify both tools are on your PATH:
-
-  nvcc --version    # Should print: release 12.x, V12.x.xxx
-  gcc  --version    # Should print: gcc (GCC) 11.x.x ...
-
-  If nvcc is not found  → you forgot to load the cuda module
-  If gcc  is not found  → you forgot to load the gcc module
-
-================================================================================
-  STEP 3 — ACTIVATE YOUR PYTHON ENVIRONMENT
-================================================================================
-
-Virtual environment (if using venv):
-
-  source /path/to/your/venv/bin/activate
-
-Conda environment (if using conda):
-
+Activate your conda or venv environment:
   conda activate your_env_name
 
-Then confirm you are using the right Python:
-
-  which python
-  python --version    # Should be 3.9+
-
-================================================================================
-  STEP 4 — INSTALL DEPENDENCIES
-================================================================================
-
+Install dependencies:
   pip install -r requirements.txt
+  pip install ninja   # (Highly recommended for faster kernel compilation)
 
-The requirements.txt includes:
-  - torch
-  - transformers==4.35.2
-  - flash_attn          ← requires CUDA toolkit, may take a few minutes to build
-  - numpy, scipy, datasets, tqdm, matplotlib, seaborn, pandas
+* Flash-Attention Note: If you encounter issues installing `flash-attn` from 
+  source on Windows, you might need to download a pre-compiled wheel matching 
+  your PyTorch and CUDA versions from the official flash-attention releases page.
 
-Install ninja to speed up kernel compilation (highly recommended):
+================================================================================
+  STEP 4 — RUN THE LONGBENCH STICKY EVALUATION
+================================================================================
 
-  pip install ninja
+The correct entry point for the full evaluation pipeline is `run_longbench_sticky.py`.
+(Do NOT run `main.py` if you want to benchmark across the datasets).
+
+In your terminal or command prompt, run:
+
+  python Results\run_longbench_sticky.py
 
 --------------------------------------------------------------------------------
-NOTE: flash_attn may need to be installed separately with the right CUDA flag:
-  pip install flash-attn --no-build-isolation
-  If flash_attn fails to compile, check that your nvcc and torch CUDA versions
-  match. Run: python -c "import torch; print(torch.version.cuda)"
---------------------------------------------------------------------------------
-
-================================================================================
-  STEP 5 — SET ENVIRONMENT VARIABLES
-================================================================================
-
-These must be set BEFORE running Python so the JIT compiler sees them.
-
-  # Tell PyTorch's JIT compiler to target the A100 (Ampere, compute cap 8.0)
-  # Required if you are compiling on a login node WITHOUT a GPU attached.
-  # Safe to set even if you are on a compute node with an A100.
-  export TORCH_CUDA_ARCH_LIST="8.0"
-
-  # (Recommended) Redirect the compiled kernel cache to scratch space.
-  # Use this if your home directory has a small quota or slow NFS access.
-  export TORCH_EXTENSIONS_DIR="/scratch/yourname/torch_extensions"
-
-  # (Optional) Silence tokenizer parallelism warning
-  export TOKENIZERS_PARALLELISM=false
-
-================================================================================
-  STEP 6 — RUN THE EVALUATION
-================================================================================
-
---- OPTION A: Interactive Session (for testing / debugging) ---
-
-  srun --partition=gpu --gpus-per-node=A100:1 --time=02:00:00 --pty bash
-  # (Then repeat Steps 2-5 inside the interactive session, then:)
-  python main.py
-
---- OPTION B: Batch Submission (recommended for full evaluation runs) ---
-
-Save the following as run_sticky.slurm and submit with: sbatch run_sticky.slurm
-
-────────────────────────────────────────────────────────────────────────────────
-#!/bin/bash
-#SBATCH --job-name=sticky_kv_eval
-#SBATCH --partition=gpu
-#SBATCH --nodes=1
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=8
-#SBATCH --gpus-per-node=A100:1
-#SBATCH --mem=64G
-#SBATCH --time=12:00:00
-#SBATCH --output=logs/sticky_%x_%j.out
-#SBATCH --error=logs/sticky_%x_%j.err
-
-# --- Environment Setup ---
-module purge
-module load cuda/12.1
-module load gcc/11.3.0
-
-# Activate your Python environment (pick ONE):
-source /path/to/venv/bin/activate
-# conda activate your_env_name
-
-# --- CUDA Kernel Environment Variables ---
-export TORCH_CUDA_ARCH_LIST="8.0"
-export TORCH_EXTENSIONS_DIR="/scratch/${USER}/torch_extensions"
-export TOKENIZERS_PARALLELISM=false
-
-# --- Create logs directory if it does not exist ---
-mkdir -p logs
-
-# --- Sanity Checks ---
-echo "=== Job Info ==="
-echo "Node:    $(hostname)"
-echo "Date:    $(date)"
-echo "Python:  $(which python)"
-echo "CUDA:    $(nvcc --version | grep release)"
-echo ""
-
-echo "=== GPU Info ==="
-nvidia-smi
-echo ""
-
-# --- Run Evaluation ---
-echo "=== Starting Sticky KV Evaluation ==="
-python main.py
-
-echo "=== Done ==="
-────────────────────────────────────────────────────────────────────────────────
-
-Submit with:
-  sbatch run_sticky.slurm
-
-Monitor your job:
-  squeue -u $USER            # View job queue status
-  tail -f logs/sticky_*.out  # Follow live output log
-
-================================================================================
   WHAT TO EXPECT ON THE FIRST RUN
-================================================================================
+--------------------------------------------------------------------------------
 
-1. Python imports sticky_cuda_kernels/__init__.py, which calls
-   torch.utils.cpp_extension.load() on sticky_cuda_kernels/sticky_kernels.cu
-
-2. You will see a pause of ~30–90 seconds while the kernel compiles for sm_80.
-   This is normal. You will see output like:
-   "Using /scratch/yourname/torch_extensions as PyTorch extensions root..."
+1. You will see a pause of ~30–90 seconds while the kernel compiles.
+   "Using ... as PyTorch extensions root..."
    "Detected CUDA files, patching ldflags"
    "Emitting ninja build file ..."
 
-3. On success, the following line is printed:
+2. On success, the following line is printed:
    "[StickyKernels] CUDA kernels compiled and loaded successfully."
 
-4. If compilation fails (e.g. version mismatch), the fallback is used instead:
-   "[StickyKernels] CUDA compilation failed, using PyTorch fallbacks: <reason>"
-   The evaluation still runs — just without the fused kernel acceleration.
+3. If compilation fails (e.g., C++ compiler not found), the fallback is used:
+   "[StickyKernels] CUDA compilation failed, using PyTorch fallbacks"
+   The script WILL continue to run, but without kernel acceleration.
+
+On subsequent runs, PyTorch uses the cached compiled binary instantly!
 
 ================================================================================
-  WHAT TO EXPECT ON SUBSEQUENT RUNS
+  TROUBLESHOOTING KERNEL COMPILATION
 ================================================================================
 
-PyTorch caches the compiled binary in TORCH_EXTENSIONS_DIR (or ~/.cache/torch_
-extensions/ if not set). On the next run, it detects the cached .so and loads
-it instantly — no recompilation occurs.
-
-The cache is invalidated and recompiled automatically if:
-  - sticky_kernels.cu is modified
-  - Your PyTorch version changes
-  - Your CUDA toolkit version changes
-
-================================================================================
-  KERNEL OPERATIONS ACCELERATED BY CUDA (vs PyTorch fallback)
-================================================================================
-
-  1. fused_scoreboard_scatter        — routes attention votes to window scoreboard
-  2. fused_scoreboard_scatter_new_tokens — handles tokens not yet in logical_id_map
-  3. fused_quantize_k_int8           — per-channel INT8 quantization of K cache
-                                       with RoPE-paired dimension tying
-  4. fused_quantize_v_int8           — per-token INT8 quantization of V cache
-  5. fused_dequantize_int8           — INT8 → fp16 dequantization
-  6. fused_eviction_copy_sinks       — copies sink tokens during physical eviction
-  7. fused_eviction_copy_sticky      — copies surviving sticky windows
-  8. fused_eviction_copy_local       — copies local zone tokens
-
-All operations fall back to equivalent pure-PyTorch if the kernel is unavailable.
-
-================================================================================
-  TROUBLESHOOTING
-================================================================================
-
-PROBLEM: "[StickyKernels] CUDA compilation failed" / g++ not found
-FIX:     Load your gcc module: module load gcc/11.3.0
-         Verify with: which g++
+PROBLEM: "Failed to compile" or "cl.exe not found" (Windows)
+FIX:     You must run your script from the "x64 Native Tools Command Prompt" OR 
+         ensure your Visual Studio MSVC bin directory is in your system PATH. 
+         PyTorch cannot find your C++ compiler.
 
 PROBLEM: nvcc not found
-FIX:     Load your CUDA module: module load cuda/12.1
-         Verify with: nvcc --version
+FIX:     Install the CUDA toolkit and ensure its `bin` folder is in your PATH.
 
-PROBLEM: "No module named 'torch'" or wrong Python
-FIX:     Ensure your environment is activated BEFORE running Python.
-         Check: which python  and  python -c "import torch; print(torch.__version__)"
-
-PROBLEM: "Unsupported GPU architecture 'compute_XX'" or sm_XX error
-FIX:     Set: export TORCH_CUDA_ARCH_LIST="8.0"
-         A100 = Ampere = compute capability 8.0. CUDA >= 11.0 is required.
-
-PROBLEM: Permission denied building extension / home directory quota exceeded
-FIX:     Set: export TORCH_EXTENSIONS_DIR="/scratch/${USER}/torch_extensions"
-         This redirects the compiled binary cache to your scratch space.
-
-PROBLEM: flash_attn fails to import
-FIX:     pip install flash-attn --no-build-isolation
-         Ensure torch CUDA version matches nvcc:
-           python -c "import torch; print(torch.version.cuda)"
-           nvcc --version
+PROBLEM: "Unsupported GPU architecture"
+FIX:     If you get compute capability errors, you can force the architecture 
+         variable before running. In PowerShell:
+         $env:TORCH_CUDA_ARCH_LIST="8.6"   # For RTX 30-series (sm_86)
+         $env:TORCH_CUDA_ARCH_LIST="8.9"   # For RTX 40-series (sm_89)
+         $env:TORCH_CUDA_ARCH_LIST="8.0"   # For A100 (sm_80)
+         
+         Then run: python Results\run_longbench_sticky.py
 
 PROBLEM: "RuntimeError: Expected all tensors to be on the same device"
-FIX:     Confirm your model is fully on GPU: model.device_map should not
-         contain CPU layers unless you deliberately offloaded.
-         Check VRAM usage with: nvidia-smi
-
-PROBLEM: OOM (Out of Memory) on A100 (80GB)
-FIX:     Reduce NUM_SAMPLES, R_RATIO, or MAX_CONTEXT_WARNING_TOKENS in
-         sticky_config.py. Also confirm model is in bfloat16 (default).
-
-PROBLEM: Kernel cache is stale after modifying sticky_kernels.cu
-FIX:     Delete the cache directory:
-           rm -rf /scratch/${USER}/torch_extensions/sticky_cuda_ops*
-         The kernel will recompile on the next run.
-
-================================================================================
-  VERSION REQUIREMENTS SUMMARY
-================================================================================
-
-  Python         >= 3.9
-  PyTorch        >= 2.0  (bfloat16 + flash_attn + JIT required)
-  CUDA Toolkit   >= 11.0 (12.x recommended for A100)
-  GCC            >= 9.x  (11.x+ recommended)
-  transformers   == 4.35.2  (pinned — see requirements.txt)
-  flash-attn     >= 2.x
-
-  A100 Compute Capability:  8.0
-  TORCH_CUDA_ARCH_LIST:    "8.0"
-
-================================================================================
+FIX:     Confirm your model is fully on GPU.

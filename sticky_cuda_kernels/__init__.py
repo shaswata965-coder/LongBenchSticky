@@ -63,7 +63,7 @@ def scoreboard_scatter(votes, logical_ids, max_windows):
     # PyTorch fallback
     H = votes.shape[0]
     device = votes.device
-    is_chunk_token = logical_ids >= 0
+    is_chunk_token = (logical_ids >= 0) & (logical_ids < max_windows)
     routed_votes = torch.where(is_chunk_token, votes, torch.zeros_like(votes))
     safe_ids = torch.where(is_chunk_token, logical_ids, torch.zeros_like(logical_ids)).long()
     scoreboard = torch.zeros((H, max_windows), device=device, dtype=torch.float32)
@@ -112,7 +112,7 @@ def quantize_k_int8(tensor):
         (quant [H,W,omega,D] uint8, scale [H,W,1,D] fp16, zp [H,W,1,D] fp16)
     """
     ops = _try_load()
-    if ops is not None and tensor.dtype == torch.float16 and tensor.is_cuda:
+    if ops is not None and tensor.dtype in (torch.float16, torch.bfloat16) and tensor.is_cuda:
         result = ops.fused_quantize_k_int8(tensor.contiguous())
         return result[0], result[1], result[2]
     
@@ -141,7 +141,7 @@ def quantize_v_int8(tensor):
         (quant [H,W,omega,D] uint8, scale [H,W,omega,1] fp16, zp [H,W,omega,1] fp16)
     """
     ops = _try_load()
-    if ops is not None and tensor.dtype == torch.float16 and tensor.is_cuda:
+    if ops is not None and tensor.dtype in (torch.float16, torch.bfloat16) and tensor.is_cuda:
         result = ops.fused_quantize_v_int8(tensor.contiguous())
         return result[0], result[1], result[2]
     
@@ -166,7 +166,7 @@ def dequantize_int8(quant_tensor, scale, zero_point, per_channel=True, omega=1):
         float16 tensor
     """
     ops = _try_load()
-    if ops is not None and quant_tensor.is_cuda and scale.dtype == torch.float16:
+    if ops is not None and quant_tensor.is_cuda and scale.dtype in (torch.float16, torch.bfloat16):
         return ops.fused_dequantize_int8(
             quant_tensor.contiguous(), scale.contiguous(),
             zero_point.contiguous(), per_channel, omega
@@ -182,7 +182,7 @@ def dequantize_int8(quant_tensor, scale, zero_point, per_channel=True, omega=1):
 def eviction_copy_sinks(old_k, old_v, new_k, new_v, old_lid, new_lid, sink_tokens):
     """Copy sink tokens from old to new KV cache. Operates on [H, seq, D] views."""
     ops = _try_load()
-    if ops is not None and old_k.dtype == torch.float16 and old_k.is_cuda:
+    if ops is not None and old_k.dtype in (torch.float16, torch.bfloat16) and old_k.is_cuda:
         ops.fused_eviction_copy_sinks(
             old_k.contiguous(), old_v.contiguous(),
             new_k, new_v, old_lid.contiguous(), new_lid,
@@ -199,7 +199,7 @@ def eviction_copy_sinks(old_k, old_v, new_k, new_v, old_lid, new_lid, sink_token
 def eviction_copy_sticky(old_k, old_v, new_k, new_v, first_phys, found_mask, final_ids, new_lid, curr_k, omega, sink_tokens):
     """Copy surviving sticky windows from old to new KV cache."""
     ops = _try_load()
-    if ops is not None and old_k.dtype == torch.float16 and old_k.is_cuda:
+    if ops is not None and old_k.dtype in (torch.float16, torch.bfloat16) and old_k.is_cuda:
         ops.fused_eviction_copy_sticky(
             old_k.contiguous(), old_v.contiguous(),
             new_k, new_v,
@@ -233,7 +233,7 @@ def eviction_copy_sticky(old_k, old_v, new_k, new_v, first_phys, found_mask, fin
 def eviction_copy_local(old_k, old_v, new_k, new_v, new_lid, local_count, old_local_start, new_local_start, local_start_wid, omega):
     """Copy local zone tokens from old to new KV cache."""
     ops = _try_load()
-    if ops is not None and old_k.dtype == torch.float16 and old_k.is_cuda:
+    if ops is not None and old_k.dtype in (torch.float16, torch.bfloat16) and old_k.is_cuda:
         ops.fused_eviction_copy_local(
             old_k.contiguous(), old_v.contiguous(),
             new_k, new_v, new_lid,

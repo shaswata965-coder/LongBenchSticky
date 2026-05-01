@@ -641,30 +641,30 @@ class STICKYKVCache_LayerWise(nn.Module):
                         self.q_cache_ids.long().unsqueeze(2) == final_ids.long().unsqueeze(1)
                     ).any(dim=2)
                     
-                    for h in range(self.num_heads):
-                        promoted_q_data_k[h] = []
-                        promoted_q_data_v[h] = []
-                        promoted_qi_indices = promo_mask[h].nonzero(as_tuple=True)[0]
-                        for qi in promoted_qi_indices.tolist():
-                            q_wid_val = int(self.q_cache_ids[h, qi].item())
-                            k_deq = self._dequantize_from_quant(
-                                self.q_cache_k_quant[h:h+1, qi:qi+1],
-                                self.q_cache_k_scale[h:h+1, qi:qi+1],
-                                self.q_cache_k_zp[h:h+1, qi:qi+1],
-                                self.quant_bit_width)
-                            v_deq = self._dequantize_from_quant(
-                                self.q_cache_v_quant[h:h+1, qi:qi+1],
-                                self.q_cache_v_scale[h:h+1, qi:qi+1],
-                                self.q_cache_v_zp[h:h+1, qi:qi+1],
-                                self.quant_bit_width)
-                            promoted_q_data_k[h].append((q_wid_val, k_deq.squeeze(0).squeeze(0)))
-                            promoted_q_data_v[h].append((q_wid_val, v_deq.squeeze(0).squeeze(0)))
-                            self.q_retired_meta[(q_wid_val, h)] = {
-                                'k_scale': self.q_cache_k_scale[h, qi].detach().clone(),
-                                'k_zp': self.q_cache_k_zp[h, qi].detach().clone(),
-                                'v_scale': self.q_cache_v_scale[h, qi].detach().clone(),
-                                'v_zp': self.q_cache_v_zp[h, qi].detach().clone(),
+                    # OPT-P1: Batch-dequantize ALL q-cache windows at once (2 kernel
+                    # launches total) instead of per-head per-window calls (~80 launches).
+                    if promo_mask.any():
+                        all_k_deq = self._dequantize_from_quant(
+                            self.q_cache_k_quant, self.q_cache_k_scale,
+                            self.q_cache_k_zp, self.quant_bit_width)
+                        all_v_deq = self._dequantize_from_quant(
+                            self.q_cache_v_quant, self.q_cache_v_scale,
+                            self.q_cache_v_zp, self.quant_bit_width)
+                        # One .nonzero() + .tolist() sync replaces H separate syncs
+                        promo_heads, promo_qis = promo_mask.nonzero(as_tuple=True)
+                        promo_wids = self.q_cache_ids[promo_heads, promo_qis].long().tolist()
+                        promo_heads_list = promo_heads.tolist()
+                        promo_qis_list = promo_qis.tolist()
+                        for ph, pqi, pwid in zip(promo_heads_list, promo_qis_list, promo_wids):
+                            promoted_q_data_k[ph].append((pwid, all_k_deq[ph, pqi]))
+                            promoted_q_data_v[ph].append((pwid, all_v_deq[ph, pqi]))
+                            self.q_retired_meta[(pwid, ph)] = {
+                                'k_scale': self.q_cache_k_scale[ph, pqi].detach().clone(),
+                                'k_zp': self.q_cache_k_zp[ph, pqi].detach().clone(),
+                                'v_scale': self.q_cache_v_scale[ph, pqi].detach().clone(),
+                                'v_zp': self.q_cache_v_zp[ph, pqi].detach().clone(),
                             }
+                        del all_k_deq, all_v_deq
 
                 self.window_scores.fill_(float("nan"))
                 self.window_scores[:, :curr_k, 0] = final_v
@@ -707,7 +707,19 @@ class STICKYKVCache_LayerWise(nn.Module):
                     self.running_attention_votes[:, :seq_len].zero_()  # zero only the live slice
                     self.tokens_since_last_review = 0
                     return past_key_values
-                
+                # OPT-P2: Precompute block-boundary data ONCE for both q-cache rebuild
+                # and physical eviction. Avoids recomputing and enables vectorized window lookup.
+                _pre_compressed_len = self.logical_id_map.shape[1]
+                _pre_num_old_blocks = max(0, (_pre_compressed_len - self.sink_tokens - local_tokens_count) // self.omega)
+                if _pre_num_old_blocks > 0:
+                    _pre_block_starts = self.sink_tokens + torch.arange(
+                        _pre_num_old_blocks, device=device, dtype=torch.long
+                    ) * self.omega
+                    _pre_block_wids = self.logical_id_map[:, _pre_block_starts]  # [H, num_old_blocks]
+                else:
+                    _pre_block_starts = torch.zeros(0, device=device, dtype=torch.long)
+                    _pre_block_wids = torch.zeros(self.num_heads, 0, device=device, dtype=torch.long)
+
                 # --- Q-CACHE: Rebuild with ZERO-DEGRADATION routing ---
                 if new_q_loser_ids is not None and self.q_windows_count > 0:
                     new_q_count = new_q_loser_ids.shape[1]
@@ -723,10 +735,10 @@ class STICKYKVCache_LayerWise(nn.Module):
                     new_v_scale = torch.zeros(self.num_heads, new_q_count, self.omega, 1, device=device, dtype=dtype_fp)
                     new_v_zp = torch.zeros(self.num_heads, new_q_count, self.omega, 1, device=device, dtype=dtype_fp)
                     
-                    # FIX B: Vectorized q-cache rebuild — eliminates O(H × q_count) Python
+                    # OPT-P2: Vectorized q-cache rebuild — eliminates O(H × q_count) Python
                     # loop and .item() CPU syncs. Three routing paths preserved:
                     # A) RETAINED: was in old q-cache, copy raw int8 directly
-                    # B) FRESH from main cache: gather via block-boundary arithmetic
+                    # B) FRESH from main cache: batch-gather + batch-quantize
                     # C) ARCHIVED meta: per-element fallback (rare, typically 0-3 items)
                     
                     # --- Path A: Batch-identify retained windows ---
@@ -750,65 +762,126 @@ class STICKYKVCache_LayerWise(nn.Module):
                     else:
                         retained_any = torch.zeros(self.num_heads, new_q_count, device=device, dtype=torch.bool)
                     
-                    # --- Paths B+C: Handle non-retained windows ---
+                    # --- Paths B+C: Vectorized handling of non-retained windows ---
                     not_retained = ~retained_any  # [H, new_q_count]
                     if not_retained.any():
-                        for qi in range(new_q_count):
-                            for h in range(self.num_heads):
-                                if retained_any[h, qi]:
-                                    continue  # Already handled by Path A
-                                
-                                wid_val = int(new_q_loser_ids[h, qi].item())
-                                
-                                # FIX (C3): Graceful fallback instead of RuntimeError.
-                                # Zero-fill this q-cache slot if the window is missing.
-                                kv_tensors = self._gather_window_from_current_kv(past_key_values, h, wid_val, seq_len=seq_len)
-                                if kv_tensors is not None:
-                                    k_fp, v_fp = kv_tensors
-                                else:
-                                    print(f"WARNING [Layer {self.layer_idx}]: Q-Cache rebuild: loser window {wid_val} not found for head {h}. Zero-filling.")
-                                    k_fp = torch.zeros(self.omega, head_dim, device=device, dtype=dtype_fp)
-                                    v_fp = torch.zeros(self.omega, head_dim, device=device, dtype=dtype_fp)
-                                
-                                # Path C: Check for archived scale/zp metadata
-                                meta = self.q_retired_meta.get((wid_val, h))
-                                if meta is not None:
-                                    ks = meta['k_scale'].to(device)
-                                    kz = meta['k_zp'].to(device)
-                                    vs = meta['v_scale'].to(device)
-                                    vz = meta['v_zp'].to(device)
-                                    if self.quant_bit_width == 8:
-                                        k_q = torch.round((k_fp.unsqueeze(0) - kz) / ks).clamp(0, 255).to(torch.uint8)
-                                        # FIX (M3): Do NOT unsqueeze v_fp — vs is [omega,1], v_fp is [omega,D].
-                                        # unsqueeze(0) would create [1,omega,D] which broadcasts with [omega,1]
-                                        # to produce a wrong [omega,omega,D] shape explosion.
-                                        v_q = torch.round((v_fp - vz) / vs).clamp(0, 255).to(torch.uint8)
-                                        new_k_quant[h, qi] = k_q.squeeze(0)
-                                        new_v_quant[h, qi] = v_q
-                                    else:
-                                        k_q = torch.round((k_fp.unsqueeze(0) - kz) / ks).clamp(0, 15).to(torch.uint8)
-                                        # FIX (M3): Same unsqueeze fix for int4 path.
-                                        v_q = torch.round((v_fp - vz) / vs).clamp(0, 15).to(torch.uint8)
-                                        new_k_quant[h, qi] = ((k_q[..., 0::2] << 4) | k_q[..., 1::2]).squeeze(0)
-                                        new_v_quant[h, qi] = (v_q[..., 0::2] << 4) | v_q[..., 1::2]
-                                    new_k_scale[h, qi, 0] = ks.squeeze(0)
-                                    new_k_zp[h, qi, 0] = kz.squeeze(0)
-                                    # FIX (BUG-14): Use view instead of squeeze to avoid
-                                    # dimension collapse when omega==1
-                                    new_v_scale[h, qi] = vs.view(self.omega, 1)
-                                    new_v_zp[h, qi] = vz.view(self.omega, 1)
-                                else:
-                                    # Path B: Fresh per-window quantization
-                                    k_4d = k_fp.unsqueeze(0).unsqueeze(0)
-                                    v_4d = v_fp.unsqueeze(0).unsqueeze(0)
-                                    kq, ks, kz = self._quantize_k_per_window(k_4d, self.quant_bit_width)
-                                    vq, vs, vz = self._quantize_v_per_window(v_4d, self.quant_bit_width)
-                                    new_k_quant[h, qi] = kq[0, 0]
-                                    new_v_quant[h, qi] = vq[0, 0]
-                                    new_k_scale[h, qi] = ks[0, 0]
-                                    new_k_zp[h, qi] = kz[0, 0]
-                                    new_v_scale[h, qi] = vs[0, 0]
-                                    new_v_zp[h, qi] = vz[0, 0]
+                        # OPT-P2: Batch-gather all non-retained windows from main cache
+                        # using precomputed block-boundary data. One .tolist() sync replaces
+                        # H × q_count individual .item() syncs.
+                        nr_h, nr_qi = not_retained.nonzero(as_tuple=True)
+                        nr_wids = new_q_loser_ids[nr_h, nr_qi].long()
+                        nr_count = nr_h.shape[0]
+                        
+                        # Locate physical positions via block-boundary matching
+                        if _pre_num_old_blocks > 0 and nr_count > 0:
+                            # [nr_count, num_old_blocks] — block wids for each item's head
+                            nr_block_wids = _pre_block_wids[nr_h]
+                            nr_match = (nr_block_wids == nr_wids.unsqueeze(1))
+                            nr_found = nr_match.any(dim=1)          # [nr_count]
+                            nr_slot = nr_match.to(torch.uint8).argmax(dim=1)  # [nr_count]
+                            nr_phys_start = self.sink_tokens + nr_slot * self.omega
+                        else:
+                            nr_found = torch.zeros(nr_count, device=device, dtype=torch.bool)
+                            nr_phys_start = torch.zeros(nr_count, device=device, dtype=torch.long)
+                        
+                        # Batch-gather KV data for all found windows at once
+                        offsets_om = torch.arange(self.omega, device=device, dtype=torch.long)
+                        head_dim_val = past_key_values[0].shape[-1]
+                        
+                        # Separate Path C (archived meta) from Path B (fresh quantize)
+                        nr_h_list = nr_h.tolist()
+                        nr_qi_list = nr_qi.tolist()
+                        nr_wids_list = nr_wids.tolist()
+                        nr_found_list = nr_found.tolist()
+                        
+                        path_b_indices = []  # indices into nr_* arrays
+                        path_c_indices = []
+                        for idx in range(nr_count):
+                            if (nr_wids_list[idx], nr_h_list[idx]) in self.q_retired_meta:
+                                path_c_indices.append(idx)
+                            else:
+                                path_b_indices.append(idx)
+                        
+                        # --- Path B: Batch-gather + batch-quantize fresh windows ---
+                        if path_b_indices:
+                            pb_indices = torch.tensor(path_b_indices, device=device, dtype=torch.long)
+                            pb_h = nr_h[pb_indices]
+                            pb_qi = nr_qi[pb_indices]
+                            pb_found = nr_found[pb_indices]
+                            pb_phys = nr_phys_start[pb_indices]
+                            pb_count = len(path_b_indices)
+                            
+                            # Gather omega tokens per window from past KV
+                            # pb_positions: [pb_count, omega]
+                            pb_positions = pb_phys.unsqueeze(1) + offsets_om.unsqueeze(0)
+                            pb_positions = pb_positions.clamp(0, seq_len - 1)
+                            # Advanced indexing: select per-head slices then gather
+                            pb_gather_idx = pb_positions.unsqueeze(-1).expand(-1, -1, head_dim_val)
+                            # [pb_count, seq, D] — select each item's head
+                            pb_k_heads = past_key_values[0][0, pb_h]
+                            pb_v_heads = past_key_values[1][0, pb_h]
+                            # [pb_count, omega, D]
+                            pb_k_data = torch.gather(pb_k_heads, 1, pb_gather_idx)
+                            pb_v_data = torch.gather(pb_v_heads, 1, pb_gather_idx)
+                            
+                            # Zero-fill windows not found in main cache
+                            if not pb_found.all():
+                                missing = ~pb_found
+                                pb_k_data[missing] = 0
+                                pb_v_data[missing] = 0
+                            
+                            # Batch quantize: [pb_count, 1, omega, D]
+                            pb_k_4d = pb_k_data.unsqueeze(1)
+                            pb_v_4d = pb_v_data.unsqueeze(1)
+                            pb_kq, pb_ks, pb_kz = self._quantize_k_per_window(pb_k_4d, self.quant_bit_width)
+                            pb_vq, pb_vs, pb_vz = self._quantize_v_per_window(pb_v_4d, self.quant_bit_width)
+                            # Scatter results back: pb_kq is [pb_count, 1, omega, quant_bytes_len]
+                            new_k_quant[pb_h, pb_qi] = pb_kq[:, 0]
+                            new_v_quant[pb_h, pb_qi] = pb_vq[:, 0]
+                            new_k_scale[pb_h, pb_qi] = pb_ks[:, 0]
+                            new_k_zp[pb_h, pb_qi] = pb_kz[:, 0]
+                            new_v_scale[pb_h, pb_qi] = pb_vs[:, 0]
+                            new_v_zp[pb_h, pb_qi] = pb_vz[:, 0]
+                            del pb_k_heads, pb_v_heads, pb_k_data, pb_v_data
+                        
+                        # --- Path C: Archived meta (rare, typically 0-3 items) ---
+                        for idx in path_c_indices:
+                            h_val = nr_h_list[idx]
+                            qi_val = nr_qi_list[idx]
+                            wid_val = nr_wids_list[idx]
+                            
+                            # Gather this window's KV from main cache
+                            if nr_found_list[idx]:
+                                ps = int(nr_phys_start[idx].item())
+                                k_fp = past_key_values[0][0, h_val, ps:ps+self.omega]
+                                v_fp = past_key_values[1][0, h_val, ps:ps+self.omega]
+                            else:
+                                k_fp = torch.zeros(self.omega, head_dim, device=device, dtype=dtype_fp)
+                                v_fp = torch.zeros(self.omega, head_dim, device=device, dtype=dtype_fp)
+                            
+                            meta = self.q_retired_meta[(wid_val, h_val)]
+                            ks = meta['k_scale'].to(device)
+                            kz = meta['k_zp'].to(device)
+                            vs = meta['v_scale'].to(device)
+                            vz = meta['v_zp'].to(device)
+                            if self.quant_bit_width == 8:
+                                k_q = torch.round((k_fp.unsqueeze(0) - kz) / ks).clamp(0, 255).to(torch.uint8)
+                                # FIX (M3): Do NOT unsqueeze v_fp — vs is [omega,1], v_fp is [omega,D].
+                                v_q = torch.round((v_fp - vz) / vs).clamp(0, 255).to(torch.uint8)
+                                new_k_quant[h_val, qi_val] = k_q.squeeze(0)
+                                new_v_quant[h_val, qi_val] = v_q
+                            else:
+                                k_q = torch.round((k_fp.unsqueeze(0) - kz) / ks).clamp(0, 15).to(torch.uint8)
+                                # FIX (M3): Same unsqueeze fix for int4 path.
+                                v_q = torch.round((v_fp - vz) / vs).clamp(0, 15).to(torch.uint8)
+                                new_k_quant[h_val, qi_val] = ((k_q[..., 0::2] << 4) | k_q[..., 1::2]).squeeze(0)
+                                new_v_quant[h_val, qi_val] = (v_q[..., 0::2] << 4) | v_q[..., 1::2]
+                            new_k_scale[h_val, qi_val, 0] = ks.squeeze(0)
+                            new_k_zp[h_val, qi_val, 0] = kz.squeeze(0)
+                            # FIX (BUG-14): Use view instead of squeeze to avoid
+                            # dimension collapse when omega==1
+                            new_v_scale[h_val, qi_val] = vs.view(self.omega, 1)
+                            new_v_zp[h_val, qi_val] = vz.view(self.omega, 1)
                     
                     self.q_cache_k_quant = new_k_quant
                     self.q_cache_v_quant = new_v_quant
@@ -846,25 +919,13 @@ class STICKYKVCache_LayerWise(nn.Module):
                 # FIX (BUG-3): Initialize to -1 so unset entries don't alias valid Window 0
                 new_logical_id_map = torch.full((self.num_heads, new_seq_len), -1, device=device, dtype=torch.long)
                 
-                # OPT (Change 1): Replace CPU-bound _phys_first dict builder with
-                # block-boundary arithmetic on GPU. Instead of iterating over every
-                # token in logical_id_map (seq_len * num_heads iterations), we sample
-                # only block start positions (num_old_blocks elements) to find each
-                # window's logical ID, then do a tiny [H, curr_k, num_old_blocks]
-                # broadcast match. Zero logic change — same windows, same positions.
-                compressed_len = self.logical_id_map.shape[1]
-                num_old_blocks = max(0, (compressed_len - self.sink_tokens - local_tokens_count) // self.omega)
+                # OPT-P2: Reuse precomputed block-boundary data from q-cache rebuild.
+                compressed_len = _pre_compressed_len
+                num_old_blocks = _pre_num_old_blocks
                 
                 if num_old_blocks > 0:
-                    # Read the logical ID at the first token of each contiguous block
-                    block_start_positions = self.sink_tokens + torch.arange(
-                        num_old_blocks, device=device, dtype=torch.long
-                    ) * self.omega
-                    # block_wids: [num_heads, num_old_blocks] — logical ID of each old block
-                    block_wids = self.logical_id_map[:, block_start_positions]
-                    
+                    block_wids = _pre_block_wids
                     # Match final_ids against block_wids: [H, curr_k, num_old_blocks]
-                    # This tensor is tiny: num_heads * curr_k * num_old_blocks (e.g. 8*30*30 = 7200)
                     match = (block_wids.unsqueeze(1) == final_ids.unsqueeze(2))
                     found_in_main = match.any(dim=2)        # [H, curr_k] — is window in main cache?
                     slot_idx = match.to(torch.uint8).argmax(dim=2)  # [H, curr_k] — which old block?
@@ -887,13 +948,15 @@ class STICKYKVCache_LayerWise(nn.Module):
                     local_start_wid = max(0, (self.num_of_tokens_without_eviction - self.sink_tokens - local_tokens_count) // self.omega)
                     _local_lids = local_start_wid + (_offsets // self.omega)
                 
-                # FIX-A: Materialize contiguous views of the old KV cache ONCE here.
-                # past_key_values[0][0] is a non-contiguous view (batch dim stripped
-                # from [1,H,seq,D] → [H,seq,D] with stride (H*seq*D, seq*D, D, 1)).
-                # The eviction wrappers no longer call .contiguous() internally, so
-                # we do it once here to avoid 3 hidden full-cache copies per cycle.
-                old_k_c = past_key_values[0][0].contiguous()
-                old_v_c = past_key_values[1][0].contiguous()
+                # OPT-P3: Only materialize contiguous copies when the view is
+                # actually non-contiguous. For batch=1, [1,H,seq,D][0] → [H,seq,D]
+                # is already contiguous, so this avoids ~8 MB of wasted HBM copies.
+                old_k_c = past_key_values[0][0]
+                old_v_c = past_key_values[1][0]
+                if not old_k_c.is_contiguous():
+                    old_k_c = old_k_c.contiguous()
+                if not old_v_c.is_contiguous():
+                    old_v_c = old_v_c.contiguous()
 
                 # 1. Sinks — CUDA-accelerated with PyTorch fallback
                 # BUG-1/11 FIX: guard against _cuda_kernels being None.
@@ -921,20 +984,22 @@ class STICKYKVCache_LayerWise(nn.Module):
                             new_logical_id_map, curr_k, self.omega, self.sink_tokens
                         )
                     else:
-                        # Inline PyTorch fallback for sticky window copy
-                        _H = past_key_values[0][0].shape[0]
+                        # OPT-P4: Vectorized PyTorch fallback — O(H) instead of O(H×k)
+                        _H = self.num_heads
                         _offsets = torch.arange(self.omega, device=device, dtype=torch.long)
                         _tgt_starts = self.sink_tokens + torch.arange(curr_k, device=device, dtype=torch.long) * self.omega
                         _tgt_starts_h = _tgt_starts.unsqueeze(0).expand(_H, -1)  # [H, curr_k]
-                        for _wi in range(curr_k):
-                            for _h in range(_H):
-                                if not found_in_main[_h, _wi]:
-                                    continue
-                                _src = first_phys[_h, _wi] + _offsets
-                                _dst = _tgt_starts_h[_h, _wi] + _offsets
-                                new_k[0, _h, _dst] = past_key_values[0][0, _h, _src]
-                                new_v[0, _h, _dst] = past_key_values[1][0, _h, _src]
-                                new_logical_id_map[_h, _dst] = final_ids[_h, _wi].long()
+                        # Expand source/dest to per-token positions: [H, curr_k*omega]
+                        _src_all = (first_phys.unsqueeze(2) + _offsets).view(_H, -1)
+                        _dst_all = (_tgt_starts_h.unsqueeze(2) + _offsets).view(_H, -1)
+                        _mask_exp = found_in_main.unsqueeze(2).expand(-1, -1, self.omega).reshape(_H, -1)
+                        _lid_exp = final_ids.long().unsqueeze(2).expand(-1, -1, self.omega).reshape(_H, -1)
+                        for _h in range(_H):
+                            m = _mask_exp[_h]
+                            if m.any():
+                                new_k[0, _h, _dst_all[_h, m]] = old_k_c[_h, _src_all[_h, m]]
+                                new_v[0, _h, _dst_all[_h, m]] = old_v_c[_h, _src_all[_h, m]]
+                                new_logical_id_map[_h, _dst_all[_h, m]] = _lid_exp[_h, m]
 
                 not_in_main_mask = ~found_in_main
                 if not_in_main_mask.any():

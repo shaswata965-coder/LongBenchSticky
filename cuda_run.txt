@@ -1,0 +1,84 @@
+# Step-by-Step Guide: Running the CUDA-Integrated Sticky KV Cache on HPC (A100s)
+
+The new CUDA kernels are integrated using PyTorch's Just-In-Time (JIT) compilation mechanism. PyTorch will automatically compile the custom CUDA C++ files the first time you run your evaluation script and cache the compiled binary for subsequent runs.
+
+For HPC environments (typically Linux-based, using SLURM or a similar job scheduler) equipped with NVIDIA A100 GPUs, follow these steps to ensure your environment is configured correctly.
+
+## Step 1: Load the Required Modules
+HPC systems use module systems (e.g., Lmod) to manage software. You must load a CUDA Toolkit that matches your PyTorch installation, as well as a compatible C++ compiler (like GCC).
+
+1. In your interactive session or SLURM submission script, load the necessary modules:
+   ```bash
+   # Example module names (adjust to your specific HPC's naming convention)
+   module load cuda/11.8  # or cuda/12.1, etc.
+   module load gcc/11.2.0 # PyTorch JIT requires a relatively modern GCC
+   ```
+2. Verify the CUDA compiler is available:
+   ```bash
+   nvcc --version
+   ```
+
+## Step 2: Install Ninja Build System
+PyTorch uses `ninja` to parallelize and significantly speed up the JIT compilation process.
+```bash
+pip install ninja
+```
+
+## Step 3: Architecture Optimization (A100)
+A100 GPUs use the Ampere architecture (Compute Capability 8.0). PyTorch's JIT compiler normally auto-detects the GPU architecture you are currently running on. 
+However, if you are compiling on a login node that does *not* have an A100 attached, you should explicitly set the target architecture before running:
+```bash
+export TORCH_CUDA_ARCH_LIST="8.0"
+```
+
+## Step 4: Run Your Evaluation Script
+You can run your LongBench evaluation via an interactive session (`srun`) or a batch script (`sbatch`).
+
+Example SLURM batch script (`run_longbench.slurm`):
+```bash
+#!/bin/bash
+#SBATCH --job-name=sticky_eval
+#SBATCH --partition=gpu
+#SBATCH --nodes=1
+#SBATCH --gpus-per-node=A100:1
+#SBATCH --time=12:00:00
+#SBATCH --output=logs/%x_%j.out
+
+module purge
+module load cuda/11.8
+module load gcc/11.2.0
+
+# Optional: Set cache directory if your home directory is small/slow
+export TORCH_EXTENSIONS_DIR="/scratch/your_username/torch_extensions"
+export TORCH_CUDA_ARCH_LIST="8.0"
+
+# Activate your virtual environment/conda environment
+# source /path/to/venv/bin/activate
+
+python main.py
+```
+
+Submit it:
+```bash
+sbatch run_longbench.slurm
+```
+
+### What to expect on the first run:
+1. When `sticky_kv_logic_fast_attention.py` is imported, the Python wrapper `sticky_cuda_kernels/__init__.py` will attempt to JIT-compile the `sticky_kernels.cu` file.
+2. You will see a slight pause (usually 10 to 60 seconds). Because A100s require complex optimizations, compiling for `sm_80` can take a moment.
+3. If successful, you will see the following message printed in your SLURM output log:
+   `[StickyKernels] CUDA kernels compiled and loaded successfully.`
+4. The script will then continue and evaluate using the high-performance fused CUDA kernels.
+
+### What to expect on subsequent runs:
+PyTorch caches the compiled extension (by default in `~/.cache/torch_extensions/`, or the path you set in `TORCH_EXTENSIONS_DIR`). On your next run, PyTorch will detect the cached binary and load it instantly without recompiling.
+
+## Graceful Degradation (Fallback)
+If the JIT compilation fails (e.g., due to an incompatible GCC version on the compute node), the system will **not crash**. It will catch the error, print a warning detailing why the compilation failed, and automatically fall back to the original pure-PyTorch logic. You will see:
+`[StickyKernels] CUDA compilation failed, using PyTorch fallbacks: <error details>`
+
+## HPC Troubleshooting
+- **Cannot find compiler / g++ not found:** Ensure you loaded a `gcc` module. 
+- **`nvcc` not found:** Ensure you loaded the `cuda` module.
+- **Permission Denied building extension:** By default, PyTorch caches extensions in `~/.cache/`. If your home directory is read-only or out of quota on the compute node, set `export TORCH_EXTENSIONS_DIR=/tmp/torch_extensions` or a path to your scratch space.
+- **"Unsupported gpu architecture 'compute_XX'":** The CUDA module loaded is too old for PyTorch or A100s. A100 requires CUDA >= 11.0. Ensure you are loading `cuda/11.x` or `cuda/12.x`.

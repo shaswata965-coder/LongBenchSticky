@@ -63,7 +63,7 @@ _EVICT_THRESHOLD   = 16_384   # H × tokens × D elements moved per eviction ker
 # 1. Scoreboard Scatter
 # ============================================================
 
-def scoreboard_scatter(votes, logical_ids, max_windows):
+def scoreboard_scatter(votes, logical_ids, max_windows, out=None):
     """
     Fused scoreboard scatter: routes votes to window scoreboard via logical IDs.
 
@@ -71,21 +71,35 @@ def scoreboard_scatter(votes, logical_ids, max_windows):
         votes:       [H, compressed_len] float32
         logical_ids: [H, compressed_len] long
         max_windows: int
+        out:         optional pre-allocated [H, max_windows] float32 buffer.
+                     If provided, it is zeroed in-place and used as output
+                     (avoids cudaMalloc on every call).
     Returns:
-        scoreboard: [H, max_windows] float32
+        scoreboard: [H, max_windows] float32  (== out if out was provided)
     """
     if _OPS is not None and votes.numel() >= _SCATTER_THRESHOLD:
+        if out is not None:
+            # Zero only the live buffer — no cudaMalloc, no memset on a fresh tensor
+            out.zero_()
+            _OPS.fused_scoreboard_scatter_inplace(
+                votes.contiguous(), logical_ids.contiguous(), out
+            )
+            return out
         return _OPS.fused_scoreboard_scatter(
             votes.contiguous(), logical_ids.contiguous(), max_windows
         )
 
-    # PyTorch fallback — faster for small tensors (Qasper-scale contexts)
+    # PyTorch fallback — also uses out buffer when provided to avoid torch.zeros alloc
     H = votes.shape[0]
     device = votes.device
     is_chunk_token = (logical_ids >= 0) & (logical_ids < max_windows)
     routed_votes = torch.where(is_chunk_token, votes, torch.zeros_like(votes))
     safe_ids = torch.where(is_chunk_token, logical_ids, torch.zeros_like(logical_ids)).long()
-    scoreboard = torch.zeros((H, max_windows), device=device, dtype=torch.float32)
+    if out is not None:
+        scoreboard = out
+        scoreboard.zero_()
+    else:
+        scoreboard = torch.zeros((H, max_windows), device=device, dtype=torch.float32)
     scoreboard.scatter_add_(1, safe_ids, routed_votes)
     return scoreboard
 
@@ -205,7 +219,8 @@ def dequantize_int8(quant_tensor, scale, zero_point, per_channel=True, omega=1):
 # ============================================================
 
 def eviction_copy_sinks(old_k, old_v, new_k, new_v, old_lid, new_lid, sink_tokens):
-    """Copy sink tokens from old to new KV cache. Operates on [H, seq, D] views."""
+    """Copy sink tokens from old to new KV cache. Operates on [H, seq, D] views.
+    Caller must ensure old_k and old_v are already contiguous."""
     total_elems = old_k.shape[0] * sink_tokens * old_k.shape[2]
     if (
         _OPS is not None
@@ -214,7 +229,7 @@ def eviction_copy_sinks(old_k, old_v, new_k, new_v, old_lid, new_lid, sink_token
         and total_elems >= _EVICT_THRESHOLD
     ):
         _OPS.fused_eviction_copy_sinks(
-            old_k.contiguous(), old_v.contiguous(),
+            old_k, old_v,                    # caller guarantees contiguous
             new_k, new_v,
             old_lid.contiguous(), new_lid,
             sink_tokens
@@ -232,7 +247,8 @@ def eviction_copy_sticky(
     first_phys, found_mask, final_ids, new_lid,
     curr_k, omega, sink_tokens
 ):
-    """Copy surviving sticky windows from old to new KV cache."""
+    """Copy surviving sticky windows from old to new KV cache.
+    Caller must ensure old_k and old_v are already contiguous."""
     H, _, D = old_k.shape
     total_elems = H * curr_k * omega * D
     if (
@@ -242,7 +258,7 @@ def eviction_copy_sticky(
         and total_elems >= _EVICT_THRESHOLD
     ):
         _OPS.fused_eviction_copy_sticky(
-            old_k.contiguous(), old_v.contiguous(),
+            old_k, old_v,                    # caller guarantees contiguous
             new_k, new_v,
             first_phys.contiguous().long(), found_mask.contiguous(),
             final_ids.contiguous().long(), new_lid,
@@ -274,7 +290,8 @@ def eviction_copy_local(
     local_count, old_local_start, new_local_start,
     local_start_wid, omega
 ):
-    """Copy local zone tokens from old to new KV cache."""
+    """Copy local zone tokens from old to new KV cache.
+    Caller must ensure old_k and old_v are already contiguous."""
     H, _, D = old_k.shape
     total_elems = H * local_count * D
     if (
@@ -284,7 +301,7 @@ def eviction_copy_local(
         and total_elems >= _EVICT_THRESHOLD
     ):
         _OPS.fused_eviction_copy_local(
-            old_k.contiguous(), old_v.contiguous(),
+            old_k, old_v,                    # caller guarantees contiguous
             new_k, new_v, new_lid,
             local_count, old_local_start, new_local_start,
             int(local_start_wid), omega

@@ -380,6 +380,38 @@ void fused_scoreboard_scatter_new_tokens(
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+// In-place variant — caller pre-allocates and pre-zeros `out` [H, max_windows].
+// Eliminates cudaMalloc + memset overhead on every eviction cycle.
+void fused_scoreboard_scatter_inplace(
+    torch::Tensor votes,         // [H, compressed_len] float32 contiguous
+    torch::Tensor logical_ids,   // [H, compressed_len] int64  contiguous
+    torch::Tensor out            // [H, max_windows]  float32  pre-zeroed
+) {
+    TORCH_CHECK(votes.is_cuda() && logical_ids.is_cuda() && out.is_cuda(),
+                "all tensors must be CUDA tensors");
+    TORCH_CHECK(votes.is_contiguous() && logical_ids.is_contiguous() && out.is_contiguous(),
+                "all tensors must be contiguous");
+    TORCH_CHECK(votes.scalar_type() == torch::kFloat32, "votes must be float32");
+    TORCH_CHECK(logical_ids.scalar_type() == torch::kInt64, "logical_ids must be int64");
+    TORCH_CHECK(out.scalar_type() == torch::kFloat32, "out must be float32");
+
+    int H = votes.size(0);
+    int compressed_len = votes.size(1);
+    int max_windows = out.size(1);
+    int total = H * compressed_len;
+    if (total == 0) return;
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+
+    scoreboard_scatter_kernel<<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+        votes.data_ptr<float>(),
+        logical_ids.data_ptr<long>(),
+        out.data_ptr<float>(),
+        H, compressed_len, max_windows
+    );
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 std::vector<torch::Tensor> fused_quantize_k_int8(
     torch::Tensor input  
 ) {
@@ -610,6 +642,7 @@ void fused_eviction_copy_local(
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("fused_scoreboard_scatter", &fused_scoreboard_scatter);
+    m.def("fused_scoreboard_scatter_inplace", &fused_scoreboard_scatter_inplace);
     m.def("fused_scoreboard_scatter_new_tokens", &fused_scoreboard_scatter_new_tokens);
     m.def("fused_quantize_k_int8", &fused_quantize_k_int8);
     m.def("fused_quantize_v_int8", &fused_quantize_v_int8);

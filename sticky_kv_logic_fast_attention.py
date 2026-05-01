@@ -237,6 +237,14 @@ class STICKYKVCache_LayerWise(nn.Module):
             torch.zeros((self.num_heads, max_windows), dtype=torch.float32, device=device),
         )
 
+        # Pre-allocated scoreboard buffer — avoids cudaMalloc inside the CUDA scatter
+        # wrapper on every eviction cycle.  Zeroed in-place before each use.
+        # Shape mirrors window_scores: [H, max_windows].
+        self.register_buffer(
+            "_scoreboard_buf",
+            torch.zeros((self.num_heads, max_windows), dtype=torch.float32, device=device),
+        )
+
 
         # Defines physical cache sizes using parameters initialized
         self.cache_size = int(
@@ -478,11 +486,14 @@ class STICKYKVCache_LayerWise(nn.Module):
                 
                 # Scoreboard scatter — route through the sticky_cuda_kernels package
                 # which provides CUDA acceleration with an automatic PyTorch fallback.
+                # Pass self._scoreboard_buf as the output buffer to avoid a fresh
+                # cudaMalloc([H, max_windows]) + memset on every eviction cycle (Fix B).
                 # BUG-1/11 FIX: guard against _cuda_kernels being None (JIT compile
                 # failed at startup) so the generation path never crashes.
                 if _cuda_kernels is not None:
                     scoreboard = _cuda_kernels.scoreboard_scatter(
-                        compressed_votes, logical_ids, self.window_scores.shape[1]
+                        compressed_votes, logical_ids, self.window_scores.shape[1],
+                        out=self._scoreboard_buf
                     )
                     if seq_len > compressed_len:
                         new_tok_votes = self.running_attention_votes[:, compressed_len:seq_len]
@@ -492,13 +503,14 @@ class STICKYKVCache_LayerWise(nn.Module):
                             compressed_len, seq_len
                         )
                 else:
-                    # Inline PyTorch fallback — mirrors sticky_cuda_kernels/__init__.py
+                    # Inline PyTorch fallback — also uses pre-allocated buffer
                     max_w = self.window_scores.shape[1]
                     H_sc = compressed_votes.shape[0]
                     is_chunk_token = (logical_ids >= 0) & (logical_ids < max_w)
                     routed = torch.where(is_chunk_token, compressed_votes, torch.zeros_like(compressed_votes))
                     safe_ids = torch.where(is_chunk_token, logical_ids, torch.zeros_like(logical_ids)).long()
-                    scoreboard = torch.zeros((H_sc, max_w), device=device, dtype=torch.float32)
+                    scoreboard = self._scoreboard_buf
+                    scoreboard.zero_()
                     scoreboard.scatter_add_(1, safe_ids, routed)
                     if seq_len > compressed_len:
                         new_tok_votes = self.running_attention_votes[:, compressed_len:seq_len]
@@ -875,11 +887,19 @@ class STICKYKVCache_LayerWise(nn.Module):
                     local_start_wid = max(0, (self.num_of_tokens_without_eviction - self.sink_tokens - local_tokens_count) // self.omega)
                     _local_lids = local_start_wid + (_offsets // self.omega)
                 
+                # FIX-A: Materialize contiguous views of the old KV cache ONCE here.
+                # past_key_values[0][0] is a non-contiguous view (batch dim stripped
+                # from [1,H,seq,D] → [H,seq,D] with stride (H*seq*D, seq*D, D, 1)).
+                # The eviction wrappers no longer call .contiguous() internally, so
+                # we do it once here to avoid 3 hidden full-cache copies per cycle.
+                old_k_c = past_key_values[0][0].contiguous()
+                old_v_c = past_key_values[1][0].contiguous()
+
                 # 1. Sinks — CUDA-accelerated with PyTorch fallback
                 # BUG-1/11 FIX: guard against _cuda_kernels being None.
                 if _cuda_kernels is not None:
                     _cuda_kernels.eviction_copy_sinks(
-                        past_key_values[0][0], past_key_values[1][0],
+                        old_k_c, old_v_c,
                         new_k[0], new_v[0],
                         self.logical_id_map, new_logical_id_map,
                         self.sink_tokens
@@ -895,7 +915,7 @@ class STICKYKVCache_LayerWise(nn.Module):
                 if found_in_main.any():
                     if _cuda_kernels is not None:
                         _cuda_kernels.eviction_copy_sticky(
-                            past_key_values[0][0], past_key_values[1][0],
+                            old_k_c, old_v_c,
                             new_k[0], new_v[0],
                             first_phys, found_in_main, final_ids.long(),
                             new_logical_id_map, curr_k, self.omega, self.sink_tokens
@@ -953,7 +973,7 @@ class STICKYKVCache_LayerWise(nn.Module):
                     _lsw = local_start_wid if _local_lids is not None else 0
                     if _cuda_kernels is not None:
                         _cuda_kernels.eviction_copy_local(
-                            past_key_values[0][0], past_key_values[1][0],
+                            old_k_c, old_v_c,
                             new_k[0], new_v[0],
                             new_logical_id_map, actual_local,
                             old_local_start, new_compressed_len,
@@ -1245,6 +1265,7 @@ class STICKYKVCache_LayerWise(nn.Module):
         self.window_scores.fill_(float("nan"))
         self.global_token_counter.zero_()
         self.local_history.zero_()
+        self._scoreboard_buf.zero_()  # FIX-B: clear pre-allocated buffer between documents
         self._prefill_done = False
         self.logical_id_map = None
         self._dynamic_local_count = 0

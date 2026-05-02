@@ -148,7 +148,7 @@ class STICKYQwen2Attention(nn.Module):
         # Fast-path uses FlashAttention for q_len>1, but FlashAttention path cannot
         # incorporate the q-cache (evicted tokens). For chunked/speculative decoding
         # after eviction, fall back to the manual path so q-cache is attended/scored.
-        if q_len > 1 and not qcache_available:
+        if past_kv is None and q_len > 1:
             q_fa = query_states.transpose(1, 2)
             k_fa = key_states.transpose(1, 2)
             v_fa = value_states.transpose(1, 2)
@@ -349,4 +349,4 @@ class STICKYQwen2Attention(nn.Module):
         attn_output = attn_output.transpose(1, 2).contiguous().reshape(bsz, q_len, self.hidden_size)
         attn_output = self.o_proj(attn_output)
 
-        return attn_output, attn_weights_return, past_key_value_out
+        return attn_output, attn_weights_return

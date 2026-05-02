@@ -1,0 +1,391 @@
+--- fast
++++ fast_opt
+@@ -2,22 +2,6 @@
+ from torch import nn
+ import math
+ from transformers.models.llama.modeling_llama import rotate_half
+-
+-try:
+-    import sticky_cuda_kernels as _cuda_kernels
+-except ImportError:
+-    _cuda_kernels = None
+-
+-_CUDA_KERNELS_AVAILABLE = None
+-
+-def _check_cuda_kernels():
+-    global _CUDA_KERNELS_AVAILABLE
+-    if _CUDA_KERNELS_AVAILABLE is None:
+-        if _cuda_kernels is not None:
+-            _CUDA_KERNELS_AVAILABLE = _cuda_kernels.is_available()
+-        else:
+-            _CUDA_KERNELS_AVAILABLE = False
+-    return _CUDA_KERNELS_AVAILABLE
+ 
+ '''
+ Duplicates the KV heads n_rep times using memory-efficient 
+@@ -237,14 +221,6 @@
+             torch.zeros((self.num_heads, max_windows), dtype=torch.float32, device=device),
+         )
+ 
+-        # Pre-allocated scoreboard buffer — avoids cudaMalloc inside the CUDA scatter
+-        # wrapper on every eviction cycle.  Zeroed in-place before each use.
+-        # Shape mirrors window_scores: [H, max_windows].
+-        self.register_buffer(
+-            "_scoreboard_buf",
+-            torch.zeros((self.num_heads, max_windows), dtype=torch.float32, device=device),
+-        )
+-
+ 
+         # Defines physical cache sizes using parameters initialized
+         self.cache_size = int(
+@@ -470,63 +446,48 @@
+             # 2. PERIODIC EVALUATION
+             # Process eviction constraints specifically when the tracker hits OMEGA boundary thresholds
+             if self.tokens_since_last_review == self.omega:
++                # FIX (Issue 5): Removed unconditional _prof block and syncs
++                # to eliminate latency spikes and standard error pollution.
++
+                 # FIX (Bug 1): Use the persisted dynamic local count that absorbed
+                 # the prefill remainder, instead of re-reading the static config value.
+                 local_tokens_count = self._dynamic_local_count
+                 
+                 # Retrieve compressed space properties
+                 compressed_len = self.logical_id_map.shape[1]
+-                # .contiguous() once here so the CUDA kernel wrapper (and scatter_add_) never
+-                # allocate a hidden copy — running_attention_votes[:, :n] has stride (max_ctx, 1)
+-                # which is non-contiguous for a logical [H, n] view.
+-                compressed_votes = self.running_attention_votes[:, :compressed_len].contiguous()
++                compressed_votes = self.running_attention_votes[:, :compressed_len]
+                 
+                 # Look up Logical IDs directly from our map! No math required.
+                 logical_ids = self.logical_id_map
+                 
+-                # Scoreboard scatter — route through the sticky_cuda_kernels package
+-                # which provides CUDA acceleration with an automatic PyTorch fallback.
+-                # Pass self._scoreboard_buf as the output buffer to avoid a fresh
+-                # cudaMalloc([H, max_windows]) + memset on every eviction cycle (Fix B).
+-                # BUG-1/11 FIX: guard against _cuda_kernels being None (JIT compile
+-                # failed at startup) so the generation path never crashes.
+-                if _cuda_kernels is not None:
+-                    scoreboard = _cuda_kernels.scoreboard_scatter(
+-                        compressed_votes, logical_ids, self.window_scores.shape[1],
+-                        out=self._scoreboard_buf
+-                    )
+-                    if seq_len > compressed_len:
+-                        new_tok_votes = self.running_attention_votes[:, compressed_len:seq_len]
+-                        _cuda_kernels.scoreboard_scatter_new_tokens(
+-                            new_tok_votes, scoreboard,
+-                            self.num_of_tokens_without_eviction, self.omega, self.sink_tokens,
+-                            compressed_len, seq_len
+-                        )
+-                else:
+-                    # Inline PyTorch fallback — also uses pre-allocated buffer
+-                    max_w = self.window_scores.shape[1]
+-                    H_sc = compressed_votes.shape[0]
+-                    is_chunk_token = (logical_ids >= 0) & (logical_ids < max_w)
+-                    routed = torch.where(is_chunk_token, compressed_votes, torch.zeros_like(compressed_votes))
+-                    safe_ids = torch.where(is_chunk_token, logical_ids, torch.zeros_like(logical_ids)).long()
+-                    scoreboard = self._scoreboard_buf
+-                    scoreboard.zero_()
+-                    scoreboard.scatter_add_(1, safe_ids, routed)
+-                    if seq_len > compressed_len:
+-                        new_tok_votes = self.running_attention_votes[:, compressed_len:seq_len]
+-                        n_new = new_tok_votes.shape[1]
+-                        js = torch.arange(n_new, device=device, dtype=torch.long)
+-                        raw_new_lids = (self.num_of_tokens_without_eviction - self.omega + js - self.sink_tokens) // self.omega
+-                        valid_new = (raw_new_lids >= 0) & (raw_new_lids < max_w)
+-                        if valid_new.any():
+-                            scoreboard.scatter_add_(
+-                                1,
+-                                raw_new_lids[valid_new].unsqueeze(0).expand(H_sc, -1),
+-                                new_tok_votes[:, valid_new]
+-                            )
++                is_chunk_token = logical_ids >= 0
++                routed_votes = torch.where(is_chunk_token, compressed_votes, torch.zeros_like(compressed_votes))
++                
++                # Zero out negative IDs (sinks) so scatter_add doesn't throw OutOfBounds errors
++                safe_logical_ids = torch.where(is_chunk_token, logical_ids, torch.zeros_like(logical_ids)).long()
++                
++                scoreboard = torch.zeros((self.num_heads, self.window_scores.shape[1]), device=device, dtype=torch.float32)
++                scoreboard.scatter_add_(1, safe_logical_ids, routed_votes)
++                
++                # FIX (Bug 1): Route votes for the omega new tokens not yet in logical_id_map.
++                # These tokens live at physical indices [compressed_len, seq_len) and have
++                # accumulated votes in running_attention_votes, but scatter_add_ above skipped
++                # them because logical_id_map doesn't include them yet. Without this, their
++                # votes are permanently lost when running_attention_votes is zeroed at cycle end.
++                if seq_len > compressed_len:
++                    n_new = seq_len - compressed_len
++                    new_tok_votes = self.running_attention_votes[:, compressed_len:seq_len]
++                    js = torch.arange(n_new, device=device, dtype=torch.long)
++                    # FIX (L3): Remove .clamp(min=0) and instead filter out negative IDs
++                    # to prevent artificially inflating Window-0 scores in early generation.
++                    raw_new_lids = (self.num_of_tokens_without_eviction - self.omega + js - self.sink_tokens) // self.omega
++                    valid_new = (raw_new_lids >= 0) & (raw_new_lids < scoreboard.shape[1])
++                    if valid_new.any():
++                        scoreboard.scatter_add_(1, raw_new_lids[valid_new].unsqueeze(0).expand(self.num_heads, -1), new_tok_votes[:, valid_new])
+                 
+                 # Determine current valid old competitors
+                 valid_mask = ~torch.isnan(self.window_scores[:, :, 1])
++                valid_old_windows = min(self.k_windows, int(valid_mask.sum(dim=1).min().item()))
+                 valid_old_windows = min(self.k_windows, int(valid_mask.sum(dim=1).min().item()))
+ 
+                 raw_ids = self.window_scores[:, :valid_old_windows, 1]
+@@ -707,6 +668,7 @@
+                     self.running_attention_votes[:, :seq_len].zero_()  # zero only the live slice
+                     self.tokens_since_last_review = 0
+                     return past_key_values
++                
+                 # OPT-P2: Precompute block-boundary data ONCE for both q-cache rebuild
+                 # and physical eviction. Avoids recomputing and enables vectorized window lookup.
+                 _pre_compressed_len = self.logical_id_map.shape[1]
+@@ -735,10 +697,10 @@
+                     new_v_scale = torch.zeros(self.num_heads, new_q_count, self.omega, 1, device=device, dtype=dtype_fp)
+                     new_v_zp = torch.zeros(self.num_heads, new_q_count, self.omega, 1, device=device, dtype=dtype_fp)
+                     
+-                    # OPT-P2: Vectorized q-cache rebuild — eliminates O(H × q_count) Python
++                    # FIX B: Vectorized q-cache rebuild — eliminates O(H × q_count) Python
+                     # loop and .item() CPU syncs. Three routing paths preserved:
+                     # A) RETAINED: was in old q-cache, copy raw int8 directly
+-                    # B) FRESH from main cache: batch-gather + batch-quantize
++                    # B) FRESH from main cache: gather via block-boundary arithmetic
+                     # C) ARCHIVED meta: per-element fallback (rare, typically 0-3 items)
+                     
+                     # --- Path A: Batch-identify retained windows ---
+@@ -762,7 +724,7 @@
+                     else:
+                         retained_any = torch.zeros(self.num_heads, new_q_count, device=device, dtype=torch.bool)
+                     
+-                    # --- Paths B+C: Vectorized handling of non-retained windows ---
++                    # --- Paths B+C: Handle non-retained windows ---
+                     not_retained = ~retained_any  # [H, new_q_count]
+                     if not_retained.any():
+                         # OPT-P2: Batch-gather all non-retained windows from main cache
+@@ -919,6 +881,12 @@
+                 # FIX (BUG-3): Initialize to -1 so unset entries don't alias valid Window 0
+                 new_logical_id_map = torch.full((self.num_heads, new_seq_len), -1, device=device, dtype=torch.long)
+                 
++                # OPT (Change 1): Replace CPU-bound _phys_first dict builder with
++                # block-boundary arithmetic on GPU. Instead of iterating over every
++                # token in logical_id_map (seq_len * num_heads iterations), we sample
++                # only block start positions (num_old_blocks elements) to find each
++                # window's logical ID, then do a tiny [H, curr_k, num_old_blocks]
++                # broadcast match. Zero logic change — same windows, same positions.
+                 # OPT-P2: Reuse precomputed block-boundary data from q-cache rebuild.
+                 compressed_len = _pre_compressed_len
+                 num_old_blocks = _pre_num_old_blocks
+@@ -926,6 +894,7 @@
+                 if num_old_blocks > 0:
+                     block_wids = _pre_block_wids
+                     # Match final_ids against block_wids: [H, curr_k, num_old_blocks]
++                    # This tensor is tiny: num_heads * curr_k * num_old_blocks (e.g. 8*30*30 = 7200)
+                     match = (block_wids.unsqueeze(1) == final_ids.unsqueeze(2))
+                     found_in_main = match.any(dim=2)        # [H, curr_k] — is window in main cache?
+                     slot_idx = match.to(torch.uint8).argmax(dim=2)  # [H, curr_k] — which old block?
+@@ -948,58 +917,33 @@
+                     local_start_wid = max(0, (self.num_of_tokens_without_eviction - self.sink_tokens - local_tokens_count) // self.omega)
+                     _local_lids = local_start_wid + (_offsets // self.omega)
+                 
+-                # OPT-P3: Only materialize contiguous copies when the view is
+-                # actually non-contiguous. For batch=1, [1,H,seq,D][0] → [H,seq,D]
+-                # is already contiguous, so this avoids ~8 MB of wasted HBM copies.
+-                old_k_c = past_key_values[0][0]
+-                old_v_c = past_key_values[1][0]
+-                if not old_k_c.is_contiguous():
+-                    old_k_c = old_k_c.contiguous()
+-                if not old_v_c.is_contiguous():
+-                    old_v_c = old_v_c.contiguous()
+-
+-                # 1. Sinks — CUDA-accelerated with PyTorch fallback
+-                # BUG-1/11 FIX: guard against _cuda_kernels being None.
+-                if _cuda_kernels is not None:
+-                    _cuda_kernels.eviction_copy_sinks(
+-                        old_k_c, old_v_c,
+-                        new_k[0], new_v[0],
+-                        self.logical_id_map, new_logical_id_map,
+-                        self.sink_tokens
+-                    )
+-                else:
+-                    # Inline PyTorch fallback for sink copy
+-                    if self.sink_tokens > 0:
+-                        new_k[0, :, :self.sink_tokens] = past_key_values[0][0, :, :self.sink_tokens]
+-                        new_v[0, :, :self.sink_tokens] = past_key_values[1][0, :, :self.sink_tokens]
+-                        new_logical_id_map[:, :self.sink_tokens] = self.logical_id_map[:, :self.sink_tokens]
+-
+-                # 2. Sticky Zone — CUDA-accelerated with PyTorch fallback
++                # 1. Sinks
++                new_k[0, :, :self.sink_tokens] = past_key_values[0][0, :, :self.sink_tokens]
++                new_v[0, :, :self.sink_tokens] = past_key_values[1][0, :, :self.sink_tokens]
++                new_logical_id_map[:, :self.sink_tokens] = self.logical_id_map[:, :self.sink_tokens]
++                
++                # 2. Sticky Zone
+                 if found_in_main.any():
+-                    if _cuda_kernels is not None:
+-                        _cuda_kernels.eviction_copy_sticky(
+-                            old_k_c, old_v_c,
+-                            new_k[0], new_v[0],
+-                            first_phys, found_in_main, final_ids.long(),
+-                            new_logical_id_map, curr_k, self.omega, self.sink_tokens
+-                        )
+-                    else:
+-                        # OPT-P4: Vectorized PyTorch fallback — O(H) instead of O(H×k)
+-                        _H = self.num_heads
+-                        _offsets = torch.arange(self.omega, device=device, dtype=torch.long)
+-                        _tgt_starts = self.sink_tokens + torch.arange(curr_k, device=device, dtype=torch.long) * self.omega
+-                        _tgt_starts_h = _tgt_starts.unsqueeze(0).expand(_H, -1)  # [H, curr_k]
+-                        # Expand source/dest to per-token positions: [H, curr_k*omega]
+-                        _src_all = (first_phys.unsqueeze(2) + _offsets).view(_H, -1)
+-                        _dst_all = (_tgt_starts_h.unsqueeze(2) + _offsets).view(_H, -1)
+-                        _mask_exp = found_in_main.unsqueeze(2).expand(-1, -1, self.omega).reshape(_H, -1)
+-                        _lid_exp = final_ids.long().unsqueeze(2).expand(-1, -1, self.omega).reshape(_H, -1)
+-                        for _h in range(_H):
+-                            m = _mask_exp[_h]
+-                            if m.any():
+-                                new_k[0, _h, _dst_all[_h, m]] = old_k_c[_h, _src_all[_h, m]]
+-                                new_v[0, _h, _dst_all[_h, m]] = old_v_c[_h, _src_all[_h, m]]
+-                                new_logical_id_map[_h, _dst_all[_h, m]] = _lid_exp[_h, m]
++                    target_starts = self.sink_tokens + torch.arange(curr_k, device=device, dtype=torch.long) * self.omega
++                    target_starts = target_starts.unsqueeze(0).expand(self.num_heads, -1)
++                    offsets = torch.arange(self.omega, device=device, dtype=torch.long)
++                    
++                    phys_gather = (first_phys.unsqueeze(2) + offsets).view(self.num_heads, -1)
++                    target_scatter = (target_starts.unsqueeze(2) + offsets).view(self.num_heads, -1)
++                    
++                    mask = found_in_main.unsqueeze(2).expand(-1, -1, self.omega).reshape(self.num_heads, -1)
++                    
++                    valid_phys = phys_gather[mask]
++                    valid_target = target_scatter[mask]
++                    
++                    head_indices = torch.arange(self.num_heads, device=device).unsqueeze(1).expand(-1, curr_k * self.omega)
++                    valid_heads = head_indices[mask]
++                    
++                    new_k[0, valid_heads, valid_target] = past_key_values[0][0, valid_heads, valid_phys]
++                    new_v[0, valid_heads, valid_target] = past_key_values[1][0, valid_heads, valid_phys]
++                    
++                    flat_final_ids = final_ids.unsqueeze(2).expand(-1, -1, self.omega).reshape(self.num_heads, -1)
++                    new_logical_id_map[valid_heads, valid_target] = flat_final_ids[mask].long()
+ 
+                 not_in_main_mask = ~found_in_main
+                 if not_in_main_mask.any():
+@@ -1030,30 +974,17 @@
+                                       f"not found or partial for head {h_idx}. Zero-filling slot.")
+                                 new_logical_id_map[h_idx, new_pos:new_pos+self.omega] = wid_val
+                 
+-                # 3. Local Zone — CUDA-accelerated with PyTorch fallback
++                # 3. Local Zone
+                 if local_tokens_count > 0:
+                     old_local_start = seq_len - local_tokens_count
++                    new_local_start = new_compressed_len
+                     # FIX (BUG-7): Clamp to prevent silent truncation if dynamic count drifts
+                     actual_local = min(local_tokens_count, seq_len - old_local_start)
+-                    _lsw = local_start_wid if _local_lids is not None else 0
+-                    if _cuda_kernels is not None:
+-                        _cuda_kernels.eviction_copy_local(
+-                            old_k_c, old_v_c,
+-                            new_k[0], new_v[0],
+-                            new_logical_id_map, actual_local,
+-                            old_local_start, new_compressed_len,
+-                            _lsw, self.omega
+-                        )
+-                    else:
+-                        # Inline PyTorch fallback for local zone copy
+-                        new_k[0, :, new_compressed_len:new_compressed_len + actual_local] = \
+-                            past_key_values[0][0, :, old_local_start:old_local_start + actual_local]
+-                        new_v[0, :, new_compressed_len:new_compressed_len + actual_local] = \
+-                            past_key_values[1][0, :, old_local_start:old_local_start + actual_local]
+-                        _loc_offsets = torch.arange(actual_local, device=device, dtype=torch.long)
+-                        _loc_lids = _lsw + (_loc_offsets // self.omega)
+-                        new_logical_id_map[:, new_compressed_len:new_compressed_len + actual_local] = \
+-                            _loc_lids.unsqueeze(0)
++                    new_k[0, :, new_local_start:new_local_start+actual_local] = past_key_values[0][0, :, old_local_start:old_local_start+actual_local]
++                    new_v[0, :, new_local_start:new_local_start+actual_local] = past_key_values[1][0, :, old_local_start:old_local_start+actual_local]
++                    
++                    if _local_lids is not None:
++                        new_logical_id_map[:, new_local_start:new_local_start + actual_local] = _local_lids[:actual_local].unsqueeze(0)
+                 
+                 self.logical_id_map = new_logical_id_map
+                 updated_kv = (new_k, new_v)
+@@ -1061,6 +992,7 @@
+                 # Reset only the live slice — zeroing the full 131k buffer wastes 65x
+                 # more bandwidth than needed (4MB vs ~62KB for Qasper at omega=8).
+                 self.running_attention_votes[:, :seq_len].zero_()
++                self.tokens_since_last_review = 0
+                 self.tokens_since_last_review = 0
+                 
+                 return updated_kv
+@@ -1088,10 +1020,6 @@
+     @staticmethod
+     def _quantize_k_per_window(tensor, bit_width=8):
+         """Quantize K cache: per-channel per-window, with RoPE-paired dimension tying."""
+-        # CUDA fast-path for INT8 fp16/bf16
+-        if bit_width == 8 and _check_cuda_kernels() and tensor.dtype in (torch.float16, torch.bfloat16):
+-            return _cuda_kernels.quantize_k_int8(tensor)
+-        # PyTorch fallback (INT4 or non-fp16)
+         t_min = tensor.amin(dim=2, keepdim=True)
+         t_max = tensor.amax(dim=2, keepdim=True)
+         half_d = tensor.shape[-1] // 2
+@@ -1115,10 +1043,6 @@
+     @staticmethod
+     def _quantize_v_per_window(tensor, bit_width=8):
+         """Quantize V cache: per-token per-window."""
+-        # CUDA fast-path for INT8 fp16/bf16
+-        if bit_width == 8 and _check_cuda_kernels() and tensor.dtype in (torch.float16, torch.bfloat16):
+-            return _cuda_kernels.quantize_v_int8(tensor)
+-        # PyTorch fallback (INT4 or non-fp16)
+         t_min = tensor.amin(dim=3, keepdim=True)
+         t_max = tensor.amax(dim=3, keepdim=True)
+         if bit_width == 4:
+@@ -1141,12 +1065,6 @@
+             unpacked = unpacked.view(*quant_tensor.shape[:-1], -1)
+             return unpacked.to(scale.dtype) * scale + zero_point
+         else:
+-            # CUDA fast-path for INT8
+-            if _check_cuda_kernels() and quant_tensor.is_cuda and scale.dtype in (torch.float16, torch.bfloat16):
+-                per_channel = (scale.shape[-1] > 1)
+-                # K: scale is [H,W,1,D], shared across omega rows. V: scale is [H,W,omega,1]
+-                omega_val = quant_tensor.shape[-2] // scale.shape[-2] if per_channel and scale.shape[-2] < quant_tensor.shape[-2] else 1
+-                return _cuda_kernels.dequantize_int8(quant_tensor, scale, zero_point, per_channel=per_channel, omega=omega_val)
+             return quant_tensor.to(scale.dtype) * scale + zero_point
+ 
+     def _evict_from_window_scores(self):
+@@ -1228,28 +1146,11 @@
+         # Using simple clamping for gather safety preventing OutOfBounds indexing exceptions natively
+         all_indices_clamped = torch.clamp(all_indices, 0, seq_len - 1)
+         
+-        # OPT-1: Batched sort + adjacent-diff replaces per-head torch.unique() loop.
+-        # This collapses H separate CUDA kernel launches (sort+unique) into 2 (sort + diff).
+-        # WE MUST SORT AND DEDUPLICATE PER HEAD so the physical KV cache stays chronological
+-        # and so that the ledger mapping correctly aligns with the physical tensor dimensions.
++        # FIX (Issue 2): Remove safe_len min-truncation and diff deduplication.
++        # Since sinks, window_tokens, and local_zone are mutually exclusive logically,
++        # there are no duplicates. Sorting provides the exact dense timeline.
+         sorted_all, _ = torch.sort(all_indices_clamped, dim=1)   # [H, N]
+-        # Mark the first occurrence of each value per row (diff != 0 means value changed)
+-        diff = torch.cat([
+-            torch.ones(self.num_heads, 1, device=device, dtype=torch.bool),
+-            sorted_all[:, 1:] != sorted_all[:, :-1]
+-        ], dim=1)                                                # [H, N]
+-        # Per-head unique count → global safe_len (one .item() sync, unavoidable)
+-        per_head_counts = diff.sum(dim=1)                        # [H]
+-        # FIX (Bug A): Use min-len truncation instead of max-len padding.
+-        # Padding duplicated the last KV entry, corrupting model attention.
+-        # Truncation drops only the highest-index local tail tokens, which
+-        # safely re-enter at the next eviction cycle.
+-        safe_len = int(per_head_counts.min().item())
+-        # Compact: for each head, pull only the unique values up to safe_len
+-        final_indices = torch.stack([
+-            sorted_all[h][diff[h]][:safe_len]
+-            for h in range(self.num_heads)
+-        ], dim=0)
++        final_indices = sorted_all
+         
+         # Shape indices exactly natively indexing vector space across head dimension arrays matching constraints
+         gather_idx = (
+@@ -1330,7 +1231,6 @@
+         self.window_scores.fill_(float("nan"))
+         self.global_token_counter.zero_()
+         self.local_history.zero_()
+-        self._scoreboard_buf.zero_()  # FIX-B: clear pre-allocated buffer between documents
+         self._prefill_done = False
+         self.logical_id_map = None
+         self._dynamic_local_count = 0

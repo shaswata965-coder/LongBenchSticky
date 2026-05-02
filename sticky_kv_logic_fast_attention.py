@@ -984,22 +984,26 @@ class STICKYKVCache_LayerWise(nn.Module):
                             new_logical_id_map, curr_k, self.omega, self.sink_tokens
                         )
                     else:
-                        # OPT-P4: Vectorized PyTorch fallback — O(H) instead of O(H×k)
-                        _H = self.num_heads
-                        _offsets = torch.arange(self.omega, device=device, dtype=torch.long)
-                        _tgt_starts = self.sink_tokens + torch.arange(curr_k, device=device, dtype=torch.long) * self.omega
-                        _tgt_starts_h = _tgt_starts.unsqueeze(0).expand(_H, -1)  # [H, curr_k]
-                        # Expand source/dest to per-token positions: [H, curr_k*omega]
-                        _src_all = (first_phys.unsqueeze(2) + _offsets).view(_H, -1)
-                        _dst_all = (_tgt_starts_h.unsqueeze(2) + _offsets).view(_H, -1)
-                        _mask_exp = found_in_main.unsqueeze(2).expand(-1, -1, self.omega).reshape(_H, -1)
-                        _lid_exp = final_ids.long().unsqueeze(2).expand(-1, -1, self.omega).reshape(_H, -1)
-                        for _h in range(_H):
-                            m = _mask_exp[_h]
-                            if m.any():
-                                new_k[0, _h, _dst_all[_h, m]] = old_k_c[_h, _src_all[_h, m]]
-                                new_v[0, _h, _dst_all[_h, m]] = old_v_c[_h, _src_all[_h, m]]
-                                new_logical_id_map[_h, _dst_all[_h, m]] = _lid_exp[_h, m]
+                        target_starts = self.sink_tokens + torch.arange(curr_k, device=device, dtype=torch.long) * self.omega
+                        target_starts = target_starts.unsqueeze(0).expand(self.num_heads, -1)
+                        offsets = torch.arange(self.omega, device=device, dtype=torch.long)
+                        
+                        phys_gather = (first_phys.unsqueeze(2) + offsets).view(self.num_heads, -1)
+                        target_scatter = (target_starts.unsqueeze(2) + offsets).view(self.num_heads, -1)
+                        
+                        mask = found_in_main.unsqueeze(2).expand(-1, -1, self.omega).reshape(self.num_heads, -1)
+                        
+                        valid_phys = phys_gather[mask]
+                        valid_target = target_scatter[mask]
+                        
+                        head_indices = torch.arange(self.num_heads, device=device).unsqueeze(1).expand(-1, curr_k * self.omega)
+                        valid_heads = head_indices[mask]
+                        
+                        new_k[0, valid_heads, valid_target] = old_k_c[valid_heads, valid_phys]
+                        new_v[0, valid_heads, valid_target] = old_v_c[valid_heads, valid_phys]
+                        
+                        flat_final_ids = final_ids.unsqueeze(2).expand(-1, -1, self.omega).reshape(self.num_heads, -1)
+                        new_logical_id_map[valid_heads, valid_target] = flat_final_ids[mask].long()
 
                 not_in_main_mask = ~found_in_main
                 if not_in_main_mask.any():
@@ -1047,13 +1051,12 @@ class STICKYKVCache_LayerWise(nn.Module):
                     else:
                         # Inline PyTorch fallback for local zone copy
                         new_k[0, :, new_compressed_len:new_compressed_len + actual_local] = \
-                            past_key_values[0][0, :, old_local_start:old_local_start + actual_local]
+                            old_k_c[:, old_local_start:old_local_start + actual_local]
                         new_v[0, :, new_compressed_len:new_compressed_len + actual_local] = \
-                            past_key_values[1][0, :, old_local_start:old_local_start + actual_local]
-                        _loc_offsets = torch.arange(actual_local, device=device, dtype=torch.long)
-                        _loc_lids = _lsw + (_loc_offsets // self.omega)
-                        new_logical_id_map[:, new_compressed_len:new_compressed_len + actual_local] = \
-                            _loc_lids.unsqueeze(0)
+                            old_v_c[:, old_local_start:old_local_start + actual_local]
+                        if _local_lids is not None:
+                            new_logical_id_map[:, new_compressed_len:new_compressed_len + actual_local] = \
+                                _local_lids[:actual_local].unsqueeze(0)
                 
                 self.logical_id_map = new_logical_id_map
                 updated_kv = (new_k, new_v)
@@ -1228,28 +1231,11 @@ class STICKYKVCache_LayerWise(nn.Module):
         # Using simple clamping for gather safety preventing OutOfBounds indexing exceptions natively
         all_indices_clamped = torch.clamp(all_indices, 0, seq_len - 1)
         
-        # OPT-1: Batched sort + adjacent-diff replaces per-head torch.unique() loop.
-        # This collapses H separate CUDA kernel launches (sort+unique) into 2 (sort + diff).
-        # WE MUST SORT AND DEDUPLICATE PER HEAD so the physical KV cache stays chronological
-        # and so that the ledger mapping correctly aligns with the physical tensor dimensions.
+        # FIX (Issue 2): Remove safe_len min-truncation and diff deduplication.
+        # Since sinks, window_tokens, and local_zone are mutually exclusive logically,
+        # there are no duplicates. Sorting provides the exact dense timeline.
         sorted_all, _ = torch.sort(all_indices_clamped, dim=1)   # [H, N]
-        # Mark the first occurrence of each value per row (diff != 0 means value changed)
-        diff = torch.cat([
-            torch.ones(self.num_heads, 1, device=device, dtype=torch.bool),
-            sorted_all[:, 1:] != sorted_all[:, :-1]
-        ], dim=1)                                                # [H, N]
-        # Per-head unique count → global safe_len (one .item() sync, unavoidable)
-        per_head_counts = diff.sum(dim=1)                        # [H]
-        # FIX (Bug A): Use min-len truncation instead of max-len padding.
-        # Padding duplicated the last KV entry, corrupting model attention.
-        # Truncation drops only the highest-index local tail tokens, which
-        # safely re-enter at the next eviction cycle.
-        safe_len = int(per_head_counts.min().item())
-        # Compact: for each head, pull only the unique values up to safe_len
-        final_indices = torch.stack([
-            sorted_all[h][diff[h]][:safe_len]
-            for h in range(self.num_heads)
-        ], dim=0)
+        final_indices = sorted_all
         
         # Shape indices exactly natively indexing vector space across head dimension arrays matching constraints
         gather_idx = (

@@ -485,12 +485,16 @@ class STICKYKVCache_LayerWise(nn.Module):
                 full_importance = attn_score_cache[0, :, :seq_len, :].sum(dim=1)
                 self.token_ledger[:, 2:2+self.num_heads] = -1.0  
                 
+                # FIX (Issue 1): Device NameError in prefill ledger update
+                device = attn_score_cache.device
+                
                 # OPT-C: Vectorize the two O(H×compressed_len) Python loops into O(H) GPU ops.
                 # For each head: compute g_ids in one GPU op, then use boolean-indexed scatter.
                 ledger_size = self.token_ledger.shape[0]
                 for head_idx in range(self.num_heads):
                     clean_survivors = survivor_ids[head_idx].to(torch.long)  # [S] physical positions
-                    g_ids = global_start + clean_survivors                    # [S] ledger row indices
+                    # FIX (Issue 3): Correct g_ids mapping from physical survivors
+                    g_ids = global_start + clean_survivors - (seq_len - num_new_tokens)
                     valid = (g_ids >= 0) & (g_ids < ledger_size)             # [S] validity mask
                     if valid.any():
                         valid_g = g_ids[valid]                               # ledger rows to write
@@ -999,6 +1003,9 @@ class STICKYKVCache_LayerWise(nn.Module):
                 # To support token ledger (only allocated when tracking is active):
                 mapping = torch.full((self.num_heads, seq_len), -1.0, device=device, dtype=torch.float32) if self.tracking_flag else None
 
+                # FIX C: GPU block-boundary arithmetic replaces CPU .tolist() scan.
+                # Instead of O(compressed_len × num_heads) Python iterations, sample
+                # only block start positions on GPU and broadcast-match against final_ids.
                 # OPT-P2: Reuse precomputed block-boundary data from q-cache rebuild.
                 compressed_len = _pre_compressed_len
                 num_old_blocks = _pre_num_old_blocks
@@ -1306,6 +1313,7 @@ class STICKYKVCache_LayerWise(nn.Module):
         # there are no duplicates. Sorting provides the exact dense timeline.
         sorted_all, _ = torch.sort(all_indices_clamped, dim=1)   # [H, N]
         final_indices = sorted_all
+        
         
         gather_idx = (
             final_indices

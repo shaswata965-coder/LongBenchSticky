@@ -349,4 +349,4 @@ class STICKYQwen2Attention(nn.Module):
         attn_output = attn_output.transpose(1, 2).contiguous().reshape(bsz, q_len, self.hidden_size)
         attn_output = self.o_proj(attn_output)
 
-        return attn_output, attn_weights_return
+        return attn_output, attn_weights_return, past_key_value_out

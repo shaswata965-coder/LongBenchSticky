@@ -1,5 +1,5 @@
 torch
-transformers==4.35.2
+transformers==4.43.4
 flash_attn
 numpy
 scipy

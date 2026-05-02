@@ -1,7 +1,8 @@
 
 # import torch
 
-MODEL_PATH = "/kaggle/input/llama-3.2/transformers/1b-instruct/1"
+# Qwen2.5-7B-Instruct (HF Hub id or local directory with config + weights)
+MODEL_PATH = "Qwen/Qwen2.5-7B-Instruct"
 
 # --- STICKY SPECIFIC RATIOS ---
 # Adjust these to match the VRAM usage of your quantized setup
@@ -36,7 +37,8 @@ CONFIDENCE_LEVEL = 0.95
 MAX_CONTEXT_WARNING_TOKENS = 131072
 MAX_POSITION_EMBEDDINGS = 131072
 ORIGINAL_MAX_POSITION_EMBEDDINGS = 8192
-ROPE_THETA = 500000.0
+# Optional overrides; Qwen2.5-7B uses rope_theta=1e6 in config.json when loaded from HF.
+ROPE_THETA = 1000000.0
 ROPE_SCALING_FACTOR = 8.0
 ROPE_LOW_FREQ_FACTOR = 1.0
 ROPE_HIGH_FREQ_FACTOR = 4.0
@@ -55,6 +57,6 @@ DATA_DIR = "/kaggle/input/datasets/shaswatabhattacharya/longbench-12/1LongBenchD
 # --- EVALUATION SCRIPT CONFIGURATIONS ---
 NUM_SAMPLES = 10
 LONGBENCH_SAMPLES = 20
-TRACKED_LAYERS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
-NUM_Q_HEADS = 32
-NUM_KV_HEADS = 8
+TRACKED_LAYERS = list(range(28))
+NUM_Q_HEADS = 28
+NUM_KV_HEADS = 4

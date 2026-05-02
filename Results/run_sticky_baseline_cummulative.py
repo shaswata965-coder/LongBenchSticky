@@ -1,7 +1,7 @@
 import torch
-from transformers import AutoTokenizer, AutoConfig
-from sticky_llama_model import STICKYLlamaForCausalLM
-from configuration_sticky_llama import LlamaConfig
+from transformers import AutoConfig, AutoTokenizer
+from sticky_qwen2_model import STICKYQwen2ForCausalLM
+from configuration_sticky_qwen2 import StickyQwen2Config
 import json
 import os
 from tqdm import tqdm
@@ -29,20 +29,19 @@ def main():
     vanilla_data = load_results_npz(VANILLA_RESULTS_PATH, metadata_only=True)
 
     # 2. Initialize Sticky Model
-    print(f"Loading StickyLlama from {config.MODEL_PATH}...")
+    print(f"Loading STICKYQwen2 from {config.MODEL_PATH}...")
     try:
-        model_config = LlamaConfig.from_pretrained(config.MODEL_PATH)
+        model_config = StickyQwen2Config(**AutoConfig.from_pretrained(config.MODEL_PATH).to_dict())
         
         if hasattr(model_config, "rope_scaling") and model_config.rope_scaling is not None:
              if "rope_type" in model_config.rope_scaling and "type" not in model_config.rope_scaling:
                  model_config.rope_scaling["type"] = model_config.rope_scaling["rope_type"]
-        
-        model_config.rope_theta = getattr(model_config, "rope_theta", 500000.0)
             
         model_config.r_ratio = getattr(config, "R_RATIO", 50)
         model_config.start_idx = getattr(config, "S_IDX", 0)
+        model_config.use_fast_attention = False
 
-        model = STICKYLlamaForCausalLM.from_pretrained(
+        model = STICKYQwen2ForCausalLM.from_pretrained(
             config.MODEL_PATH, 
             config=model_config, 
             torch_dtype=torch.bfloat16, # Match vanilla baseline dtype
@@ -61,7 +60,7 @@ def main():
     results = []
 
     # Map for tracked heads (Attention Head -> KV Head)
-    # Llama 3.2 1B has 32 Q heads and 8 KV heads -> Group size 4
+    # Qwen2.5-7B: 28 Q heads, 4 KV heads -> group size 7
     num_q_heads = model_config.num_attention_heads
     num_kv_heads = model_config.num_key_value_heads
     group_size = num_q_heads // num_kv_heads
@@ -158,10 +157,11 @@ def main():
             ws = layer_module.self_attn.kv_cache.window_scores.detach().cpu().numpy()
             
             if prefill_tensor is None:
-                print(f"  Warning: No prefill_attention_matrix for layer {layer_idx}")
-                prefill_data[str(layer_idx)] = {str(h): [] for h in tracked_heads}
-                prefill_window_scores[str(layer_idx)] = {str(h): [] for h in tracked_heads}
-                continue
+                raise RuntimeError(
+                    f"prefill_attention_matrix is None for layer {layer_idx}. "
+                    "This indicates the fast-attention backend (or tracking disabled) was used. "
+                    "For cumulative evaluation, ensure model_config.use_fast_attention = False and tracking is enabled."
+                )
             
             current_seq_len = prefill_tensor.shape[-1]
             

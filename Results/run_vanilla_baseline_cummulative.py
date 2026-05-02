@@ -1,8 +1,8 @@
 import torch
 import torch.nn.functional as F
-from transformers import AutoTokenizer
-from sticky_llama_model import STICKYLlamaForCausalLM
-from configuration_sticky_llama import LlamaConfig
+from transformers import AutoConfig, AutoTokenizer
+from sticky_qwen2_model import STICKYQwen2ForCausalLM
+from configuration_sticky_qwen2 import StickyQwen2Config
 import json
 import random
 import numpy as np
@@ -19,6 +19,7 @@ OUTPUT_FILE = "vanilla_baseline_results.npz"
 
 GROUP_SIZE = config.NUM_Q_HEADS // config.NUM_KV_HEADS
 TRACKED_HEADS = list(range(config.NUM_KV_HEADS))
+TRACKED_LAYERS = config.TRACKED_LAYERS
 
 def setup_seed(seed):
     random.seed(seed)
@@ -33,21 +34,20 @@ def main():
         print(f"Removing existing {f} to prevent appending bugs...")
         os.remove(f)
     
-    print(f"Loading STICKYLlama (eviction DISABLED) from {config.MODEL_PATH}...")
+    print(f"Loading STICKYQwen2 (eviction DISABLED) from {config.MODEL_PATH}...")
     try:
-        model_config = LlamaConfig.from_pretrained(config.MODEL_PATH)
+        model_config = StickyQwen2Config(**AutoConfig.from_pretrained(config.MODEL_PATH).to_dict())
         
         if hasattr(model_config, "rope_scaling") and model_config.rope_scaling is not None:
             if "rope_type" in model_config.rope_scaling and "type" not in model_config.rope_scaling:
                 model_config.rope_scaling["type"] = model_config.rope_scaling["rope_type"]
-        
-        model_config.rope_theta = getattr(model_config, "rope_theta", config.ROPE_THETA)
             
         # CRITICAL: Set r_ratio=100 to keep 100% of tokens (no eviction)
         model_config.r_ratio = 100   # <-- This disables eviction
         model_config.start_idx = 0
+        model_config.use_fast_attention = False
 
-        model = STICKYLlamaForCausalLM.from_pretrained(
+        model = STICKYQwen2ForCausalLM.from_pretrained(
             config.MODEL_PATH, 
             config=model_config,
             torch_dtype=torch.bfloat16, 

@@ -2,7 +2,7 @@ import sys
 import os
 import json
 import torch
-from transformers import AutoTokenizer
+from transformers import AutoConfig, AutoTokenizer
 
 # Add parent directory to path to import engine, data_loader, etc.
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -10,35 +10,30 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import engine
 import data_loader
 import sticky_config as config
-from sticky_llama_model import STICKYLlamaForCausalLM
-from configuration_sticky_llama import LlamaConfig
+from sticky_qwen2_model import STICKYQwen2ForCausalLM
+from configuration_sticky_qwen2 import StickyQwen2Config
 
 def main():
-    print(f"Loading StickyLlama (Fast Attention v2) from {config.MODEL_PATH}...")
+    print(f"Loading STICKYQwen2 (Fast Attention v2) from {config.MODEL_PATH}...")
     
-    # Load Sticky LLaMA
     try:
-        model_config = LlamaConfig.from_pretrained(config.MODEL_PATH)
+        model_config = StickyQwen2Config(**AutoConfig.from_pretrained(config.MODEL_PATH).to_dict())
         
-        # Resolve RoPE configurations
         if hasattr(model_config, "rope_scaling") and model_config.rope_scaling is not None:
             if "rope_type" in model_config.rope_scaling and "type" not in model_config.rope_scaling:
                 model_config.rope_scaling["type"] = model_config.rope_scaling["rope_type"]
         
-        model_config.rope_theta = getattr(model_config, "rope_theta", 500000.0)
-        
-        # Inject custom sticky config variables
         model_config.r_ratio = getattr(config, "R_RATIO", 50)
         
-        # Either P_RATIO or LOCAL_NUM_TOKENS will be present
         if hasattr(config, "P_RATIO"):
             model_config.p_ratio = config.P_RATIO
         elif hasattr(config, "LOCAL_NUM_TOKENS"):
             model_config.local_num_tokens = config.LOCAL_NUM_TOKENS
             
         model_config.start_idx = getattr(config, "S_IDX", 0)
+        model_config.use_fast_attention = True
 
-        model = STICKYLlamaForCausalLM.from_pretrained(
+        model = STICKYQwen2ForCausalLM.from_pretrained(
             config.MODEL_PATH, 
             config=model_config, 
             torch_dtype=torch.bfloat16, 

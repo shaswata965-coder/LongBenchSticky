@@ -1,7 +1,13 @@
 import torch
 from torch import nn
 import math
-from transformers.models.llama.modeling_llama import rotate_half
+
+
+def rotate_half(x):
+    """Rotates half the hidden dims of the input (same convention as Llama/Qwen2)."""
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
 
 '''
 Duplicates the KV heads n_rep times using memory-efficient 
@@ -282,7 +288,9 @@ class STICKYKVCache_LayerWise(nn.Module):
             self.global_token_counter.zero_()
             self.global_token_counter += q_len
         else:
-            self.global_token_counter += 1
+            # Chunked/speculative decoding may pass q_len > 1 during generation.
+            # The counter must reflect the *logical* number of tokens processed.
+            self.global_token_counter += q_len
         
         if past_key_values is None:
             return past_key_values
@@ -450,7 +458,8 @@ class STICKYKVCache_LayerWise(nn.Module):
                 _prof = (self.layer_idx == 0)
                 if _prof:
                     import time
-                    torch.cuda.synchronize()
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
                     _t0 = time.perf_counter()
                 # ------------------------------------------
                 # FIX (Bug 1): Use the persisted dynamic local count that absorbed
@@ -493,7 +502,9 @@ class STICKYKVCache_LayerWise(nn.Module):
                 valid_mask = ~torch.isnan(self.window_scores[:, :, 1])
                 valid_old_windows = min(self.k_windows, int(valid_mask.sum(dim=1).min().item()))
                 if _prof:
-                    torch.cuda.synchronize(); _t1 = time.perf_counter()
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    _t1 = time.perf_counter()
                     print(f"[PROF L0] scoreboard+scatter: {(_t1-_t0)*1000:.1f}ms")
 
                 raw_ids = self.window_scores[:, :valid_old_windows, 1]
@@ -601,7 +612,9 @@ class STICKYKVCache_LayerWise(nn.Module):
 
                 # --- Q-CACHE: Handle promotions (q-cache → main cache) ---
                 if _prof:
-                    torch.cuda.synchronize(); _t2 = time.perf_counter()
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    _t2 = time.perf_counter()
                     print(f"[PROF L0] competition+topk: {(_t2-_t1)*1000:.1f}ms")
                 promoted_q_data_k = {h: [] for h in range(self.num_heads)}
                 promoted_q_data_v = {h: [] for h in range(self.num_heads)}
@@ -799,7 +812,9 @@ class STICKYKVCache_LayerWise(nn.Module):
                     self.q_cache_scores = None
 
                 if _prof:
-                    torch.cuda.synchronize(); _t3 = time.perf_counter()
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    _t3 = time.perf_counter()
                     print(f"[PROF L0] q-cache rebuild: {(_t3-_t2)*1000:.1f}ms")
                 # ---------------------------------------------------------
                 # 5. PHYSICAL EVICTION (Explicit Construction)
@@ -937,7 +952,9 @@ class STICKYKVCache_LayerWise(nn.Module):
                 self.running_attention_votes[:, :seq_len].zero_()
                 self.tokens_since_last_review = 0
                 if _prof:
-                    torch.cuda.synchronize(); _t4 = time.perf_counter()
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    _t4 = time.perf_counter()
                     print(f"[PROF L0] physical eviction: {(_t4-_t3)*1000:.1f}ms | TOTAL eviction cycle: {(_t4-_t0)*1000:.1f}ms")
                 
                 return updated_kv

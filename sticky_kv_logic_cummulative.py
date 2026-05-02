@@ -1,7 +1,10 @@
 import torch
 from torch import nn
 import math
-from transformers.models.llama.modeling_llama import rotate_half
+def rotate_half(x):
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
 
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -326,17 +329,22 @@ class STICKYKVCache_LayerWise(nn.Module):
                         phys_idx = float(seq_len - q_len + i)
                         self.token_ledger[g_id, 2:2+self.num_heads] = phys_idx
         else:
+            # Chunked/speculative decoding may pass q_len > 1 during generation.
+            # The counter must reflect the *logical* number of tokens processed.
+            num_new = q_len
             global_start = self.global_token_counter.item()
-            self.global_token_counter += 1
+            self.global_token_counter += q_len
             if self.tracking_flag:
-                g_id = global_start
-                if g_id < self.token_ledger.shape[0]:
-                    self.token_ledger[g_id, 0] = float(g_id)
-                    self.token_ledger[g_id, 1] = float(self.layer_idx)
-                    phys_idx = float(seq_len - 1)
-                    self.token_ledger[g_id, 2:2+self.num_heads] = phys_idx
-                    self.token_ledger[g_id, 2+self.num_heads:2+2*self.num_heads] = 0.0
-                    self.global_score_history[g_id, :] = 0.0
+                for i in range(num_new):
+                    g_id = global_start + i
+                    if g_id < self.token_ledger.shape[0]:
+                        self.token_ledger[g_id, 0] = float(g_id)
+                        self.token_ledger[g_id, 1] = float(self.layer_idx)
+                        # The new tokens are appended at the tail of the physical KV.
+                        phys_idx = float(seq_len - q_len + i)
+                        self.token_ledger[g_id, 2:2+self.num_heads] = phys_idx
+                        self.token_ledger[g_id, 2+self.num_heads:2+2*self.num_heads] = 0.0
+                        self.global_score_history[g_id, :] = 0.0
         
         if past_key_values is None:
             return past_key_values

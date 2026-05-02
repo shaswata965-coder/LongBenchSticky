@@ -1,13 +1,13 @@
 import torch
-from transformers import AutoTokenizer, AutoConfig
+from transformers import AutoConfig, AutoTokenizer
 import os
 import sys
 import gc
 import numpy as np
 import time as _time
 
-from sticky_llama_model import STICKYLlamaForCausalLM
-from configuration_sticky_llama import LlamaConfig
+from sticky_qwen2_model import STICKYQwen2ForCausalLM
+from configuration_sticky_qwen2 import StickyQwen2Config
 import sticky_config as config
 from npz_io import save_results_npz
 
@@ -26,29 +26,27 @@ def main():
             os.remove(OUTPUT_FILE)
 
         # 1. Initialize Sticky Model
-        print(f"Loading StickyLlama from {config.MODEL_PATH}...")
+        print(f"Loading STICKYQwen2 from {config.MODEL_PATH}...")
         try:
-            model_config = LlamaConfig.from_pretrained(config.MODEL_PATH)
+            model_config = StickyQwen2Config(**AutoConfig.from_pretrained(config.MODEL_PATH).to_dict())
             if hasattr(model_config, "rope_scaling") and model_config.rope_scaling is not None:
                 if "rope_type" in model_config.rope_scaling and "type" not in model_config.rope_scaling:
                     model_config.rope_scaling["type"] = model_config.rope_scaling["rope_type"]
-            model_config.rope_theta = getattr(model_config, "rope_theta", 500000.0)
             model_config.r_ratio = getattr(config, "R_RATIO", 50)
             
-            # Add local / P_RATIO settings if they exist natively in the file
             if hasattr(config, "P_RATIO"):
                 model_config.p_ratio = config.P_RATIO
             elif hasattr(config, "LOCAL_NUM_TOKENS"):
                 model_config.local_num_tokens = config.LOCAL_NUM_TOKENS
                 
             model_config.start_idx = getattr(config, "S_IDX", 0)
+            model_config.use_fast_attention = False
 
-            model = STICKYLlamaForCausalLM.from_pretrained(
-                config.MODEL_PATH, 
+            model = STICKYQwen2ForCausalLM.from_pretrained(
+                config.MODEL_PATH,
                 config=model_config,
-                max_new_tokens=maxTokens, 
                 torch_dtype=torch.bfloat16,
-                device_map="auto"
+                device_map="auto",
             )
             tokenizer = AutoTokenizer.from_pretrained(config.MODEL_PATH)
             if tokenizer.pad_token is None:
@@ -129,9 +127,11 @@ def main():
                 ws = layer_module.self_attn.kv_cache.window_scores.detach().cpu().numpy()
                 
                 if prefill_tensor is None:
-                    prefill_data[str(layer_idx)] = {str(h): [] for h in tracked_heads}
-                    prefill_window_scores[str(layer_idx)] = {str(h): [] for h in tracked_heads}
-                    continue
+                    raise RuntimeError(
+                        f"prefill_attention_matrix is None for layer {layer_idx}. "
+                        "This indicates the fast-attention backend (or tracking disabled) was used. "
+                        "For cumulative evaluation, ensure model_config.use_fast_attention = False and tracking is enabled."
+                    )
                 
                 current_seq_len = prefill_tensor.shape[-1]
                 prefill_tensor_view = prefill_tensor[:, :current_seq_len, :].view(num_kv_heads, group_size, current_seq_len, -1)

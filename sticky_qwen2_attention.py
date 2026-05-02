@@ -68,11 +68,7 @@ class STICKYQwen2Attention(nn.Module):
         self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=True)
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
 
-        self.rotary_emb = Qwen2RotaryEmbedding(
-            self.head_dim,
-            max_position_embeddings=self.max_position_embeddings,
-            base=self.rope_theta,
-        )
+        self.rotary_emb = Qwen2RotaryEmbedding(config=config)
 
         self.kv_cache = STICKYKVCache_LayerWise(
             p_ratio=config.p_ratio,
@@ -273,4 +269,4 @@ class STICKYQwen2Attention(nn.Module):
         attn_output = attn_output.transpose(1, 2).contiguous().reshape(bsz, q_len, self.hidden_size)
         attn_output = self.o_proj(attn_output)
 
-        return attn_output, attn_weights_return, past_key_value_out
+        return attn_output, attn_weights_return

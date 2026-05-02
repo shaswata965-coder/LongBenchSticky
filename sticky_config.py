@@ -1,47 +1,45 @@
+import os
 
-# import torch
-
-# Qwen2.5-7B-Instruct (HF Hub id or local directory with config + weights)
-MODEL_PATH = "Qwen/Qwen2.5-7B-Instruct"
+# Qwen2-7B-Instruct (local directory with config + weights)
+MODEL_PATH = "/home/ee/phd/eez228470/Qwen2-7B-Instruct"
 
 # --- STICKY SPECIFIC RATIOS ---
-# Adjust these to match the VRAM usage of your quantized setup
-R_RATIO = 20  # Total KV cache budget (e.g., 25% of sequence length)
+# Env-var overrides let launch_all.sh pass per-job hyperparameters.
+R_RATIO = int(os.environ.get("STICKY_R_RATIO", 20))
+Q_RATIO = int(os.environ.get("STICKY_Q_RATIO", 10))
+OMEGA   = int(os.environ.get("STICKY_OMEGA", 8))
 
-# To use a percentage of the cache for local windows, set P_RATIO (e.g., 50) and comment out LOCAL_NUM_TOKENS
-P_RATIO = 50 # Local/Recent window size as % of total budget
-
-# Percentage of total cache budget reserved for int8-quantized evicted tokens.
-# This carves out from the window allocation: e.g., if windows would get 25% of the
-# budget, setting Q_RATIO=10 means windows get 15% and quantized slots get 10%.
-# Int8 provides ~2x compression vs fp16, so the effective q-cache capacity is ~2x q_num.
-Q_RATIO = 10  # Set to e.g. 10 for 10% of total budget allocated to quantized evicted tokens
+# LOCAL_NUM_TOKENS from env takes priority; otherwise fall back to P_RATIO.
+_env_local = os.environ.get("STICKY_LOCAL_NUM_TOKENS")
+if _env_local is not None:
+    LOCAL_NUM_TOKENS = int(_env_local)
+    P_RATIO = None
+else:
+    P_RATIO = 50
+    # LOCAL_NUM_TOKENS = 32
 
 # Quantization bit-width for the evicted (q-cache) tokens.
 # 8 → standard INT8 (1 byte/element, 2x compression vs fp16) — backward-compatible default.
 # 4 → packed INT4 (0.5 bytes/element, 4x compression vs fp16) — doubles q_windows_count.
-QUANTIZATION_BIT_WIDTH = 8
+QUANTIZATION_BIT_WIDTH = 4
 
-# To use a fixed number of tokens for local windows, set LOCAL_NUM_TOKENS (e.g., 256) and comment out P_RATIO
-# LOCAL_NUM_TOKENS = 32
-
-OMEGA = 8  # Window size for KV cache grouping
-SINK_TOKENS = 4  # Number of permanently protected sink tokens
+SINK_TOKENS = 4
 tracking_flag = 1
 dataset_tracker = 1
 
-S_IDX = 0     # Starting index for window tracking
+S_IDX = 0
 SEEDS = [42]
 MIN_SAMPLE_ADEQUACY = 10
 CONFIDENCE_LEVEL = 0.95
-MAX_CONTEXT_WARNING_TOKENS = 131072
-MAX_POSITION_EMBEDDINGS = 131072
-ORIGINAL_MAX_POSITION_EMBEDDINGS = 8192
-# Optional overrides; Qwen2.5-7B uses rope_theta=1e6 in config.json when loaded from HF.
+
+# Qwen2-7B-Instruct: max_position_embeddings=32768, rope_theta=1e6, no rope_scaling
+MAX_CONTEXT_WARNING_TOKENS = 32768
+MAX_POSITION_EMBEDDINGS = 32768
+ORIGINAL_MAX_POSITION_EMBEDDINGS = 32768
 ROPE_THETA = 1000000.0
-ROPE_SCALING_FACTOR = 8.0
+ROPE_SCALING_FACTOR = 1.0
 ROPE_LOW_FREQ_FACTOR = 1.0
-ROPE_HIGH_FREQ_FACTOR = 4.0
+ROPE_HIGH_FREQ_FACTOR = 1.0
 DATASET_MIN_TOKENS = 50
 GENERATION_CONFIG = {
     "max_new_tokens": 512,
@@ -51,12 +49,12 @@ GENERATION_CONFIG = {
     "temperature": 1.0,
 }
 
-DATA_DIR = "/kaggle/input/datasets/shaswatabhattacharya/longbench-12/1LongBenchData"
+DATA_DIR = "/home/ee/visitor/man_misn.visitor/defensive_kv_new/DefensiveKV/Final_LongBench_Dataset"
 
 
 # --- EVALUATION SCRIPT CONFIGURATIONS ---
 NUM_SAMPLES = 10
-LONGBENCH_SAMPLES = 20
+LONGBENCH_SAMPLES = int(os.environ.get("STICKY_LONGBENCH_SAMPLES", 500))
 TRACKED_LAYERS = list(range(28))
 NUM_Q_HEADS = 28
 NUM_KV_HEADS = 4

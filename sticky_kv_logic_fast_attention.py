@@ -172,7 +172,7 @@ class STICKYKVCache_LayerWise(nn.Module):
 
         # Get context window size dynamically to size trackers perfectly
         if config is not None and hasattr(config, "max_position_embeddings"):
-            max_context = config.max_position_embeddings
+            max_context = max(config.max_position_embeddings, 131072)
             # Setup how many possible blocks of OMEGA size could exist
             max_windows = (
                 (max_context - self.sink_tokens) // self.omega if max_context > self.sink_tokens else 1
@@ -901,7 +901,21 @@ class STICKYKVCache_LayerWise(nn.Module):
                     new_v[0, valid_heads, valid_target] = past_key_values[1][0, valid_heads, valid_phys]
                     
                     flat_final_ids = final_ids.unsqueeze(2).expand(-1, -1, self.omega).reshape(self.num_heads, -1)
-                    new_logical_id_map[valid_heads, valid_target] = flat_final_ids[mask].long()
+                    valid_ids_for_assignment = flat_final_ids[mask].long()
+                    
+                    # BUGFIX: Add bounds check to prevent CUDA index out of bounds error
+                    # This issue can occur in Qwen2 due to GQA dimension mismatches
+                    if valid_target.numel() > 0:
+                        max_valid_target = valid_target.max().item()
+                        if max_valid_target >= new_seq_len:
+                            # Filter out out-of-bounds assignments
+                            target_in_bounds = valid_target < new_seq_len
+                            new_logical_id_map[valid_heads[target_in_bounds], valid_target[target_in_bounds]] = valid_ids_for_assignment[target_in_bounds]
+                            if self.layer_idx == 0:  # Only print diagnostic once per forward pass
+                                num_filtered = (~target_in_bounds).sum().item()
+                                print(f"WARNING [Layer {self.layer_idx}]: Filtered {num_filtered} out-of-bounds sticky zone assignments (max_target={max_valid_target}, new_seq_len={new_seq_len})")
+                        else:
+                            new_logical_id_map[valid_heads, valid_target] = valid_ids_for_assignment
 
                 not_in_main_mask = ~found_in_main
                 if not_in_main_mask.any():

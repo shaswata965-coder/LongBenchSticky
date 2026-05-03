@@ -194,7 +194,7 @@ class STICKYKVCache_LayerWise(nn.Module):
 
         # Get context window size dynamically to size trackers perfectly
         if config is not None and hasattr(config, "max_position_embeddings"):
-            max_context = config.max_position_embeddings
+            max_context = max(config.max_position_embeddings, 131072)
             # Setup how many possible blocks of OMEGA size could exist
             max_windows = (
                 (max_context - self.sink_tokens) // self.omega if max_context > self.sink_tokens else 1

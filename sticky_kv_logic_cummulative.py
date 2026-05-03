@@ -485,12 +485,14 @@ class STICKYKVCache_LayerWise(nn.Module):
                 full_importance = attn_score_cache[0, :, :seq_len, :].sum(dim=1)
                 self.token_ledger[:, 2:2+self.num_heads] = -1.0  
                 
+                device = attn_score_cache.device
+                
                 # OPT-C: Vectorize the two O(H×compressed_len) Python loops into O(H) GPU ops.
                 # For each head: compute g_ids in one GPU op, then use boolean-indexed scatter.
                 ledger_size = self.token_ledger.shape[0]
                 for head_idx in range(self.num_heads):
                     clean_survivors = survivor_ids[head_idx].to(torch.long)  # [S] physical positions
-                    g_ids = global_start + clean_survivors                    # [S] ledger row indices
+                    g_ids = global_start + clean_survivors - (seq_len - num_new_tokens) # [S] ledger row indices
                     valid = (g_ids >= 0) & (g_ids < ledger_size)             # [S] validity mask
                     if valid.any():
                         valid_g = g_ids[valid]                               # ledger rows to write
@@ -1142,6 +1144,15 @@ class STICKYKVCache_LayerWise(nn.Module):
                         new_phys = mapping[head_grid, safe_phys]  # [N_live, H] float32
                         # Mark evicted/invalid slots as -1.0 (matches the ledger sentinel)
                         new_phys = torch.where(valid_old, new_phys, torch.full_like(new_phys, -1.0))
+                        
+                        # FIX: Record votes for tokens that are being evicted in this cycle.
+                        # We only record for evicted tokens to ensure non-evicted tokens are not recorded twice.
+                        is_evicted = (new_phys < 0) & valid_old
+                        votes = self.running_attention_votes[head_grid, safe_phys]
+                        votes_to_add = votes * is_evicted.to(votes.dtype)
+                        self.token_ledger[g_ids, 2+self.num_heads:2+2*self.num_heads] += votes_to_add.float()
+                        self.global_score_history[g_ids, :] += votes_to_add.float()
+                        
                         self.token_ledger[g_ids, 2:2+self.num_heads] = new_phys
 
                 self.running_attention_votes[:, :seq_len].zero_()  # zero only the live slice

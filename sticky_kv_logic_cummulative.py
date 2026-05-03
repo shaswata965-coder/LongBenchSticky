@@ -485,16 +485,12 @@ class STICKYKVCache_LayerWise(nn.Module):
                 full_importance = attn_score_cache[0, :, :seq_len, :].sum(dim=1)
                 self.token_ledger[:, 2:2+self.num_heads] = -1.0  
                 
-                # FIX (Issue 1): Device NameError in prefill ledger update
-                device = attn_score_cache.device
-                
                 # OPT-C: Vectorize the two O(H×compressed_len) Python loops into O(H) GPU ops.
                 # For each head: compute g_ids in one GPU op, then use boolean-indexed scatter.
                 ledger_size = self.token_ledger.shape[0]
                 for head_idx in range(self.num_heads):
                     clean_survivors = survivor_ids[head_idx].to(torch.long)  # [S] physical positions
-                    # FIX (Issue 3): Correct g_ids mapping from physical survivors
-                    g_ids = global_start + clean_survivors - (seq_len - num_new_tokens)
+                    g_ids = global_start + clean_survivors                    # [S] ledger row indices
                     valid = (g_ids >= 0) & (g_ids < ledger_size)             # [S] validity mask
                     if valid.any():
                         valid_g = g_ids[valid]                               # ledger rows to write
@@ -1003,9 +999,6 @@ class STICKYKVCache_LayerWise(nn.Module):
                 # To support token ledger (only allocated when tracking is active):
                 mapping = torch.full((self.num_heads, seq_len), -1.0, device=device, dtype=torch.float32) if self.tracking_flag else None
 
-                # FIX C: GPU block-boundary arithmetic replaces CPU .tolist() scan.
-                # Instead of O(compressed_len × num_heads) Python iterations, sample
-                # only block start positions on GPU and broadcast-match against final_ids.
                 # OPT-P2: Reuse precomputed block-boundary data from q-cache rebuild.
                 compressed_len = _pre_compressed_len
                 num_old_blocks = _pre_num_old_blocks
@@ -1143,16 +1136,9 @@ class STICKYKVCache_LayerWise(nn.Module):
                         valid_old = (all_phys >= 0) & (all_phys < seq_len)  # [N_live, H]
                         safe_phys = all_phys.clamp(min=0, max=seq_len - 1)
 
-                        # FIX: Record votes for ALL tokens that were valid in this cycle BEFORE eviction.
-                        # This ensures dying tokens get their final 'omega' steps of attention recorded.
-                        head_grid = torch.arange(self.num_heads, device=device).unsqueeze(0).expand(g_ids.shape[0], -1)
-                        votes = self.running_attention_votes[head_grid, safe_phys]  # [N_live, H]
-                        votes = votes * valid_old.to(votes.dtype)
-                        self.token_ledger[g_ids, 2+self.num_heads:2+2*self.num_heads] += votes.float()
-                        self.global_score_history[g_ids, :] += votes.float()
-
                         # Update physical indices using the mapping tensor.
                         # mapping is float32; use same dtype to preserve ledger column dtype.
+                        head_grid = torch.arange(self.num_heads, device=device).unsqueeze(0).expand(g_ids.shape[0], -1)
                         new_phys = mapping[head_grid, safe_phys]  # [N_live, H] float32
                         # Mark evicted/invalid slots as -1.0 (matches the ledger sentinel)
                         new_phys = torch.where(valid_old, new_phys, torch.full_like(new_phys, -1.0))
@@ -1313,7 +1299,6 @@ class STICKYKVCache_LayerWise(nn.Module):
         # there are no duplicates. Sorting provides the exact dense timeline.
         sorted_all, _ = torch.sort(all_indices_clamped, dim=1)   # [H, N]
         final_indices = sorted_all
-        
         
         gather_idx = (
             final_indices

@@ -891,42 +891,38 @@ class STICKYKVCache_LayerWise(nn.Module):
                     
                     mask = found_in_main.unsqueeze(2).expand(-1, -1, self.omega).reshape(self.num_heads, -1)
                     
+                    # Bounds-check phys_gather against actual KV cache seq_len to prevent
+                    # CUDA index-out-of-bounds when logical_id_map references stale positions.
+                    phys_in_bounds = phys_gather < seq_len
+                    target_in_bounds = target_scatter < new_seq_len
+                    mask = mask & phys_in_bounds & target_in_bounds
+                    
                     valid_phys = phys_gather[mask]
                     valid_target = target_scatter[mask]
                     
                     head_indices = torch.arange(self.num_heads, device=device).unsqueeze(1).expand(-1, curr_k * self.omega)
                     valid_heads = head_indices[mask]
                     
-                    new_k[0, valid_heads, valid_target] = past_key_values[0][0, valid_heads, valid_phys]
-                    new_v[0, valid_heads, valid_target] = past_key_values[1][0, valid_heads, valid_phys]
+                    if valid_phys.numel() > 0:
+                        new_k[0, valid_heads, valid_target] = past_key_values[0][0, valid_heads, valid_phys]
+                        new_v[0, valid_heads, valid_target] = past_key_values[1][0, valid_heads, valid_phys]
                     
                     flat_final_ids = final_ids.unsqueeze(2).expand(-1, -1, self.omega).reshape(self.num_heads, -1)
                     valid_ids_for_assignment = flat_final_ids[mask].long()
                     
-                    # BUGFIX: Add bounds check to prevent CUDA index out of bounds error
-                    # This issue can occur in Qwen2 due to GQA dimension mismatches
                     if valid_target.numel() > 0:
-                        max_valid_target = valid_target.max().item()
-                        if max_valid_target >= new_seq_len:
-                            # Filter out out-of-bounds assignments
-                            target_in_bounds = valid_target < new_seq_len
-                            new_logical_id_map[valid_heads[target_in_bounds], valid_target[target_in_bounds]] = valid_ids_for_assignment[target_in_bounds]
-                            if self.layer_idx == 0:  # Only print diagnostic once per forward pass
-                                num_filtered = (~target_in_bounds).sum().item()
-                                print(f"WARNING [Layer {self.layer_idx}]: Filtered {num_filtered} out-of-bounds sticky zone assignments (max_target={max_valid_target}, new_seq_len={new_seq_len})")
-                        else:
-                            new_logical_id_map[valid_heads, valid_target] = valid_ids_for_assignment
+                        new_logical_id_map[valid_heads, valid_target] = valid_ids_for_assignment
 
                 not_in_main_mask = ~found_in_main
                 if not_in_main_mask.any():
                     heads, indices = not_in_main_mask.nonzero(as_tuple=True)
-                    # OPT-2: Extract all wid_vals in one .tolist() call instead of
-                    # O(count) per-iteration .item() CPU-GPU syncs.
                     all_wid_vals = final_ids[heads, indices].long().tolist()
                     heads_list = heads.tolist()
                     indices_list = indices.tolist()
                     for h_idx, i_idx, wid_val in zip(heads_list, indices_list, all_wid_vals):
                         new_pos = self.sink_tokens + i_idx * self.omega
+                        if new_pos + self.omega > new_seq_len:
+                            continue
                         
                         p_k = _prom_k.get((h_idx, wid_val))
                         p_v = _prom_v.get((h_idx, wid_val))
@@ -938,8 +934,10 @@ class STICKYKVCache_LayerWise(nn.Module):
                             span = self._find_logical_window_span(h_idx, wid_val, seq_len)
                             if span is not None:
                                 old_start, old_end = span
-                                new_k[0, h_idx, new_pos:new_pos+self.omega] = past_key_values[0][0, h_idx, old_start:old_end]
-                                new_v[0, h_idx, new_pos:new_pos+self.omega] = past_key_values[1][0, h_idx, old_start:old_end]
+                                actual_len = min(old_end, seq_len) - old_start
+                                if actual_len > 0:
+                                    new_k[0, h_idx, new_pos:new_pos+actual_len] = past_key_values[0][0, h_idx, old_start:old_start+actual_len]
+                                    new_v[0, h_idx, new_pos:new_pos+actual_len] = past_key_values[1][0, h_idx, old_start:old_start+actual_len]
                                 new_logical_id_map[h_idx, new_pos:new_pos+self.omega] = wid_val
                             else:
                                 print(f"WARNING [Layer {self.layer_idx}]: Physical eviction: window {wid_val} "

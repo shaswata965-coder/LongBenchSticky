@@ -206,11 +206,15 @@ class STICKYQwen2Attention(nn.Module):
                     )
                     attn_chunk = torch.matmul(q_grouped, key_states_t.unsqueeze(2)) / math.sqrt(self.head_dim)
                     attn_chunk = attn_chunk + mask_chunk
+                    if additive_mask is not None:
+                        attn_chunk = attn_chunk + additive_mask.unsqueeze(2)
                     attn_chunk = torch.softmax(attn_chunk.to(torch.float32), dim=-1).to(query_states.dtype)
                     scores_for_cache_chunk = attn_chunk.mean(dim=2)
                 else:
                     attn_chunk = torch.matmul(q_chunk, key_states_t) / math.sqrt(self.head_dim)
                     attn_chunk = attn_chunk + mask_chunk
+                    if additive_mask is not None:
+                        attn_chunk = attn_chunk + additive_mask
                     attn_chunk = torch.softmax(attn_chunk.to(torch.float32), dim=-1).to(query_states.dtype)
                     scores_for_cache_chunk = attn_chunk
 
@@ -332,6 +336,11 @@ class STICKYQwen2Attention(nn.Module):
                     attn_output = torch.matmul(attn_weights, value_states)
                     scores_for_cache = attn_weights
                 attn_weights_for_output = attn_weights
+                
+            if q_len > 1:
+                scores_for_cache = scores_for_cache.sum(dim=2, keepdim=True)
+                if q_scores_for_cache is not None:
+                    q_scores_for_cache = q_scores_for_cache.sum(dim=2, keepdim=True)
 
             past_kv_tuple = self.kv_cache(
                 (key_states, value_states),

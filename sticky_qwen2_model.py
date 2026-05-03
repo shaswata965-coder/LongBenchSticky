@@ -31,7 +31,14 @@ class STICKYQwen2ForCausalLM(Qwen2ForCausalLM):
             inputs_embeds=inputs_embeds,
             **kwargs,
         )
+        past_length = 0
         if past_key_values is not None:
+            if hasattr(past_key_values, "get_seq_length"):
+                past_length = past_key_values.get_seq_length()
+            elif isinstance(past_key_values, tuple) and len(past_key_values) > 0 and past_key_values[0] is not None:
+                past_length = past_key_values[0][0].shape[2]
+
+        if past_length > 0:
             model_inputs["input_ids"] = input_ids[:, -1:]
             position_ids = kwargs.get("position_ids", None)
             if position_ids is None:
@@ -40,7 +47,7 @@ class STICKYQwen2ForCausalLM(Qwen2ForCausalLM):
                     position_ids.masked_fill_(attention_mask == 0, 1)
                     model_inputs["position_ids"] = position_ids[:, -1:]
                 else:
-                    true_seq_length = input_ids.shape[1]
+                    true_seq_length = input_ids.shape[1] + past_length
                     model_inputs["position_ids"] = torch.tensor(
                         [[true_seq_length - 1]], dtype=torch.long, device=input_ids.device
                     )

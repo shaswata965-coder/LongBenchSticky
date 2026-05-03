@@ -16,16 +16,22 @@ from sticky_kv_logic_cummulative import (
 )
 
 
-def _layer_past_from_cache(past_key_value: Optional[Cache], layer_idx: int):
-    if past_key_value is None or not isinstance(past_key_value, Cache):
+def _layer_past_from_cache(past_key_value, layer_idx: int):
+    if past_key_value is None:
         return None
-    if len(past_key_value.key_cache) <= layer_idx:
-        return None
-    k = past_key_value.key_cache[layer_idx]
-    v = past_key_value.value_cache[layer_idx]
-    if k is None or v is None:
-        return None
-    return (k, v)
+    if isinstance(past_key_value, Cache):
+        if len(past_key_value.key_cache) <= layer_idx:
+            return None
+        k = past_key_value.key_cache[layer_idx]
+        v = past_key_value.value_cache[layer_idx]
+        if k is None or v is None:
+            return None
+        return (k, v)
+    if isinstance(past_key_value, tuple) or isinstance(past_key_value, list):
+        if len(past_key_value) <= layer_idx:
+            return None
+        return past_key_value[layer_idx]
+    return None
 
 
 def _write_layer_cache(
@@ -96,17 +102,18 @@ class STICKYQwen2Attention(nn.Module):
 
         bsz, q_len, _ = hidden_states.size()
         cache_obj = past_key_value if isinstance(past_key_value, Cache) else None
-        past_kv = _layer_past_from_cache(cache_obj, self.layer_idx)
+        past_kv = _layer_past_from_cache(past_key_value, self.layer_idx)
 
         # RoPE positions must reflect the *logical* sequence length, not the truncated
         # physical KV cache length (Sticky eviction shortens physical cache).
-        if past_kv is not None:
-            global_past_len = int(self.kv_cache.global_token_counter.item())
-            position_ids = torch.arange(
-                global_past_len, global_past_len + q_len, dtype=torch.long, device=hidden_states.device
-            ).unsqueeze(0)
-        elif position_ids is None:
-            position_ids = torch.arange(0, q_len, dtype=torch.long, device=hidden_states.device).unsqueeze(0)
+        if position_ids is None:
+            if past_kv is not None:
+                global_past_len = int(self.kv_cache.global_token_counter.item())
+                position_ids = torch.arange(
+                    global_past_len, global_past_len + q_len, dtype=torch.long, device=hidden_states.device
+                ).unsqueeze(0)
+            else:
+                position_ids = torch.arange(0, q_len, dtype=torch.long, device=hidden_states.device).unsqueeze(0)
 
         query_states = self.q_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
         key_states = self.k_proj(hidden_states).view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(
@@ -131,6 +138,9 @@ class STICKYQwen2Attention(nn.Module):
             else:
                 # Already in additive/broadcastable form.
                 additive_mask = attention_mask
+
+        if additive_mask is not None and additive_mask.shape[-1] != (phys_past_len + q_len):
+            additive_mask = None
 
         causal_mask = None
         if q_len == 1:

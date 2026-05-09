@@ -107,6 +107,11 @@ class STICKYLlamaAttention(nn.Module):
             layer_idx=layer_idx,
             config=config
         )
+        # Pre-allocated KV buffer for SDPA fast-path (R=100).
+        # Avoids torch.cat O(N) copy on every generation step.
+        self._kv_buf_k: Optional[torch.Tensor] = None
+        self._kv_buf_v: Optional[torch.Tensor] = None
+        self._kv_buf_len: int = 0  # number of valid tokens currently in buffer
 
     def _init_rope(self):
         from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding
@@ -154,6 +159,9 @@ class STICKYLlamaAttention(nn.Module):
 
     def _clean_cache(self):
         self.kv_cache._clean_scores()
+        self._kv_buf_k = None
+        self._kv_buf_v = None
+        self._kv_buf_len = 0
 
     def forward(
         self,
@@ -166,13 +174,20 @@ class STICKYLlamaAttention(nn.Module):
         **kwargs
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
 
+        # OPT-TRACK: When tracking is disabled, never return attention weights.
+        # The cache eviction logic gets its scores from the internal
+        # scores_for_cache path — it does NOT depend on output_attentions.
+        import sticky_config as _sc
+        if not getattr(_sc, 'tracking_flag', 1):
+            output_attentions = False
+
         bsz, q_len, _ = hidden_states.size()
 
         # 1. Update position_ids for generation (Correct RoPE indexing)
         if past_key_value is not None:
             # Overwrite the position_ids provided by the LlamaModel.forward because it
             # calculated them using the length of the currently evicted KV cache
-            global_past_len = self.kv_cache.global_token_counter.item()
+            global_past_len = self.kv_cache.num_of_tokens_without_eviction
             position_ids = torch.arange(
                 global_past_len, global_past_len + q_len, dtype=torch.long, device=hidden_states.device
             ).unsqueeze(0)
@@ -187,16 +202,99 @@ class STICKYLlamaAttention(nn.Module):
         # 3. Causal Masking
         phys_past_len = past_key_value[0].shape[-2] if past_key_value is not None else 0
         attention_mask = None
-        if q_len == 1:
-            attention_mask = _make_causal_mask(bsz, q_len, phys_past_len, query_states.dtype, query_states.device)
+        # OPT: Skip causal mask for q_len=1 generation — a single query token
+        # can attend to all past KV positions, so the mask is all zeros (no-op).
 
         # 4. Rotary Positional Embeddings
         kv_seq_len = key_states.shape[-2] + phys_past_len
-        cos, sin = self.rotary_emb(value_states, seq_len=max(kv_seq_len, position_ids.max().item() + 1))
+        # OPT: Compute rope_seq_len from Python-int counters — ZERO GPU syncs.
+        # The global token position is already known from the cache's counter
+        # (set above for generation) or is simply q_len for prefill.
+        if past_key_value is not None:
+            rope_seq_len = max(kv_seq_len, self.kv_cache.num_of_tokens_without_eviction + q_len)
+        else:
+            rope_seq_len = kv_seq_len
+        cos, sin = self.rotary_emb(value_states, seq_len=rope_seq_len)
         query_states = apply_rotary_pos_emb_single(query_states, cos, sin, position_ids)
         key_states = apply_rotary_pos_emb_single(key_states, cos, sin, position_ids)
 
-        # 5. KV Cache Concatenation
+        # ================================================================
+        # OPT-SDPA: Fast-path for q_len=1 generation with R=100.
+        # Detected BEFORE torch.cat so we can use the raw new single-token
+        # key/value states and avoid the O(N) copy entirely.
+        # ================================================================
+        _use_sdpa = (
+            q_len == 1
+            and past_key_value is not None
+            and self.kv_cache.total_cache_ratio == 100
+            and not output_attentions
+        )
+
+        if _use_sdpa:
+            # phys_past_len = tokens already in past_key_value (no cat yet)
+            # key_states / value_states = the single new token [1, H, 1, D]
+
+            # ── Allocate buffer once on first generation step ──
+            buf_needed = phys_past_len + 512 + 64
+            if self._kv_buf_k is None:
+                self._kv_buf_k = torch.empty(
+                    past_key_value[0].shape[0], past_key_value[0].shape[1],
+                    buf_needed, past_key_value[0].shape[3],
+                    dtype=past_key_value[0].dtype, device=past_key_value[0].device
+                )
+                self._kv_buf_v = torch.empty_like(self._kv_buf_k)
+                self._kv_buf_k[:, :, :phys_past_len] = past_key_value[0]
+                self._kv_buf_v[:, :, :phys_past_len] = past_key_value[1]
+                self._kv_buf_len = phys_past_len
+
+            # ── Grow buffer if headroom exhausted ──
+            new_len = self._kv_buf_len + 1
+            if new_len > self._kv_buf_k.shape[2]:
+                extra = self._kv_buf_k.shape[2] + 128
+                new_k = torch.empty(
+                    self._kv_buf_k.shape[0], self._kv_buf_k.shape[1],
+                    extra, self._kv_buf_k.shape[3],
+                    dtype=self._kv_buf_k.dtype, device=self._kv_buf_k.device
+                )
+                new_v = torch.empty_like(new_k)
+                new_k[:, :, :self._kv_buf_len] = self._kv_buf_k[:, :, :self._kv_buf_len]
+                new_v[:, :, :self._kv_buf_len] = self._kv_buf_v[:, :, :self._kv_buf_len]
+                self._kv_buf_k = new_k
+                self._kv_buf_v = new_v
+
+            # ── In-place append new token (zero copy, single kernel) ──
+            self._kv_buf_k[:, :, self._kv_buf_len:new_len] = key_states
+            self._kv_buf_v[:, :, self._kv_buf_len:new_len] = value_states
+            self._kv_buf_len = new_len
+
+            # Slice view (no copy) — full K/V sequence
+            k_full = self._kv_buf_k[:, :, :new_len]
+            v_full = self._kv_buf_v[:, :, :new_len]
+
+            # GQA expansion for SDPA
+            if self.num_heads != self.num_key_value_heads:
+                k_full = k_full.repeat_interleave(self.num_key_value_groups, dim=1)
+                v_full = v_full.repeat_interleave(self.num_key_value_groups, dim=1)
+
+            attn_output = torch.nn.functional.scaled_dot_product_attention(
+                query_states, k_full, v_full,
+                attn_mask=None,
+                is_causal=False,
+            )
+            attn_output = attn_output.transpose(1, 2).contiguous().reshape(bsz, q_len, self.hidden_size)
+            attn_output = self.o_proj(attn_output)
+
+            past_key_value = (
+                self._kv_buf_k[:, :, :new_len],
+                self._kv_buf_v[:, :, :new_len],
+            ) if use_cache else None
+
+            return attn_output, None, past_key_value
+
+        # ================================================================
+        # Standard path (R<100 or prefill): need attention scores for eviction
+
+        # 5. KV Cache Concatenation (eviction path only — SDPA path returned above)
         if past_key_value is not None:
             key_states = torch.cat([past_key_value[0], key_states], dim=2)
             value_states = torch.cat([past_key_value[1], value_states], dim=2)

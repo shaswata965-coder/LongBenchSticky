@@ -5,9 +5,21 @@ import sys
 from scipy.spatial.distance import cosine
 from scipy.stats import entropy
 import argparse
-from npz_io import load_results_npz
 
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# ---------------------------------------------------------------------------
+# Path setup — Kaggle-safe (no __file__ in Jupyter/Kaggle kernels)
+# ---------------------------------------------------------------------------
+try:
+    _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+except NameError:
+    _SCRIPT_DIR = os.getcwd()  # Kaggle / Jupyter fallback
+
+_REPO_ROOT = os.path.dirname(_SCRIPT_DIR) if os.path.basename(_SCRIPT_DIR) == "Metrices" else _SCRIPT_DIR
+for _p in [_REPO_ROOT, _SCRIPT_DIR, os.path.join(_REPO_ROOT, "Results")]:
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+from npz_io import load_results_npz
 
 def calculate_attention_mass_retention(vanilla_attn, sticky_attn):
     """
@@ -151,8 +163,8 @@ def calculate_global_lir(vanilla_attn, sticky_attn):
 
 def main():
     parser = argparse.ArgumentParser(description="Calculate Layer-wise Information Retention (LIR)")
-    parser.add_argument("--vanilla", type=str, default="pure_vanilla_baseline_results.npz")
-    parser.add_argument("--sticky", type=str, default="sticky_baseline_results.npz")
+    parser.add_argument("--vanilla", type=str, default="vanilla_oracle_teacher_forcing.npz")
+    parser.add_argument("--sticky", type=str, default="sticky_teacher_forcing.npz")
     parser.add_argument("--output", type=str, default="lir_comparison.json")
     
     # In Jupyter notebooks/Kaggle, system adds arguments like '-f' which break standard parse_args()
@@ -223,19 +235,23 @@ def main():
                 # Prevent NaN
                 v_flat = np.nan_to_num(v_flat)
                 s_flat = np.nan_to_num(s_flat)
-                
-                min_len = min(len(v_flat), len(s_flat))
-                
-                if min_len > 0:
-                    v_arr = v_flat[:min_len]
-                    s_arr = s_flat[:min_len]
+
+                # Zero-pad the shorter vector instead of truncating.
+                # Truncating would silently discard vanilla attention mass for positions
+                # that sticky evicted (and therefore never wrote to), causing missed_mass
+                # and global_lir to appear better than they actually are.
+                max_len = max(len(v_flat), len(s_flat))
+
+                if max_len > 0:
+                    v_arr = np.pad(v_flat, (0, max_len - len(v_flat)))
+                    s_arr = np.pad(s_flat, (0, max_len - len(s_flat)))
                     
                     amr = calculate_attention_mass_retention(v_arr, s_arr)
                     cos_sim = calculate_cosine_similarity(v_arr, s_arr)
                     kl_inv = calculate_kl_divergence(v_arr, s_arr)
                     sparsity = calculate_sparsity(s_arr)
                     missed_mass = calculate_missed_mass_drift(v_arr, s_arr)
-                    glir = calculate_global_lir(v_flat, s_flat)
+                    glir = calculate_global_lir(v_arr, s_arr)
                     
                     metrics_by_layer_prefill[layer_idx_str]["amr"].append(amr)
                     metrics_by_layer_prefill[layer_idx_str]["cosine"].append(cos_sim)
@@ -295,25 +311,26 @@ def main():
                     
                     v_head = np.nan_to_num(v_head)
                     s_head = np.nan_to_num(s_head)
-                    
-                    # Ensure same length (due to generation step growing)
-                    min_len = min(len(v_head), len(s_head))
-                    if min_len == 0:
+
+                    # Zero-pad the shorter vector instead of truncating.
+                    # In the teacher-forcing pipeline the sticky cumulative vector is
+                    # inherently zeroed at evicted positions (via _scatter_attention_to_global),
+                    # so if lengths differ the sticky tail represents truly evicted tokens.
+                    # Padding preserves that signal; truncation would hide it.
+                    max_len = max(len(v_head), len(s_head))
+                    if max_len == 0:
                         continue
-                        
-                    v_arr = v_head[:min_len]
-                    s_arr = s_head[:min_len]
-                    
-                    # Calculate metrics
+
+                    v_arr = np.pad(v_head, (0, max_len - len(v_head)))
+                    s_arr = np.pad(s_head, (0, max_len - len(s_head)))
+
+                    # Calculate metrics — all on the same zero-padded arrays
                     amr = calculate_attention_mass_retention(v_arr, s_arr)
                     cos_sim = calculate_cosine_similarity(v_arr, s_arr)
                     kl_inv = calculate_kl_divergence(v_arr, s_arr)
                     sparsity = calculate_sparsity(s_arr)
-                    
-                    # Missed Mass and Global LIR use FULL arrays, not truncated,
-                    # because truncation removes the evicted tokens from view
-                    missed_mass = calculate_missed_mass_drift(v_head, s_head)
-                    glir = calculate_global_lir(v_head, s_head)
+                    missed_mass = calculate_missed_mass_drift(v_arr, s_arr)
+                    glir = calculate_global_lir(v_arr, s_arr)
                     
                     if layer_idx_str not in metrics_by_layer_gen:
                         metrics_by_layer_gen[layer_idx_str] = {

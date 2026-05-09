@@ -164,6 +164,11 @@ class STICKYLlamaAttention(nn.Module):
         **kwargs
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
 
+        # OPT-TRACK: When tracking is disabled, never return attention weights.
+        import sticky_config as _sc
+        if not getattr(_sc, 'tracking_flag', 1):
+            output_attentions = False
+
         bsz, q_len, _ = hidden_states.size()
 
         # 1. Update position_ids for generation (Correct RoPE indexing)

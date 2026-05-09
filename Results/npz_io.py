@@ -13,7 +13,7 @@ import numpy as np
 import os
 
 
-def save_results_npz(results_list, filepath):
+def save_results_npz(results_list, filepath, extra_arrays=None):
     """
     Save a list of sample result dicts to a compressed .npz file.
 
@@ -30,6 +30,9 @@ def save_results_npz(results_list, filepath):
         (optional) generation_attention_fresh / generation_window_scores_fresh
     """
     arrays = {}
+
+    # Version tag — downstream scripts check this to ensure correct code was used
+    arrays["__version__"] = np.frombuffer(b"v3_alive_filter", dtype=np.uint8)
 
     # Structural arrays (shared across samples)
     if results_list:
@@ -101,6 +104,10 @@ def save_results_npz(results_list, filepath):
                         arrays[key] = np.array(ws_list, dtype=np.float32)
                     else:
                         arrays[key] = np.zeros((0, 2), dtype=np.float32)
+
+    # Merge any extra arrays (e.g. tracker data) in the same pass
+    if extra_arrays:
+        arrays.update(extra_arrays)
 
     np.savez_compressed(filepath, **arrays)
     # np.savez_compressed auto-appends .npz if not present

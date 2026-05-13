@@ -1,6 +1,7 @@
 
+import sticky_config
 from transformers.configuration_utils import PretrainedConfig
-from sticky_config import configs
+import sticky_config
 
 class LlamaConfig(PretrainedConfig):
     model_type = "llama"
@@ -28,8 +29,8 @@ class LlamaConfig(PretrainedConfig):
         rope_scaling=None,
         attention_bias=False,
         attention_dropout=0.0,
-        p_ratio=configs.p_ratio,
-        r_ratio=configs.r_ratio,
+        p_ratio=sticky_config.P_RATIO,
+        r_ratio=sticky_config.R_RATIO,
         start_idx=0,
         **kwargs,
     ):

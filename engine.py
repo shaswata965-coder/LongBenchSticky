@@ -6,7 +6,7 @@ from typing import Dict, Any, List
 
 
 import metrics
-from data_loader import data_loader
+import data_loader
 
 # =============================================================================
 # dataset2metric dispatch table  (identical to official LongBench eval.py)

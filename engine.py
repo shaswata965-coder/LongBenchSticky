@@ -1,12 +1,12 @@
 import time
-import sticky_config as config
+import src.sticky_config as config
 import torch
 import numpy as np
 from typing import Dict, Any, List
 
 
-import metrics
-import data_loader
+from src.eval import metrics
+from src.data import data_loader
 
 # =============================================================================
 # dataset2metric dispatch table  (identical to official LongBench eval.py)
@@ -278,17 +278,25 @@ def evaluate_dataset(name, dataset, seed, model, tokenizer, device):
     np.random.seed(seed)
 
     results = []
-    sample_size = min(config.LONGBENCH_SAMPLES, len(dataset))
-    print(f"Running {sample_size} samples from {config.LONGBENCH_SAMPLES} configured (dataset size: {len(dataset)})")
+    target_samples = min(config.LONGBENCH_SAMPLES, len(dataset))
+    print(f"Targeting {target_samples} samples (dataset size: {len(dataset)}, filtering >5000 tokens)")
 
-
-    for i in range(sample_size):
+    for i in range(len(dataset)):
+        if len(results) >= target_samples:
+            break
+            
         ex = dataset[i]
 
         try:
             prompt = data_loader.build_prompt(ex, name)
         except ValueError as e:
             print(f"⚠️  {e}, skipping example")
+            continue
+            
+        # Check token length to avoid OOM
+        prompt_tokens = len(tokenizer.encode(prompt, add_special_tokens=False))
+        if prompt_tokens > 5000:
+            print(f"⚠️  Prompt too long ({prompt_tokens} tokens > 5000), skipping example")
             continue
 
         refs        = get_ground_truth(ex, name)

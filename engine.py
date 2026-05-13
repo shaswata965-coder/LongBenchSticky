@@ -1,12 +1,12 @@
 import time
-import src.sticky_config as config
+import sticky_config as config
 import torch
 import numpy as np
 from typing import Dict, Any, List
 
 
-from src.eval import metrics
-from src.data import data_loader
+from metrics import metrics
+from data_loader import data_loader
 
 # =============================================================================
 # dataset2metric dispatch table  (identical to official LongBench eval.py)

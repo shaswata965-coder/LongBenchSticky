@@ -1,7 +1,7 @@
 import torch
 import copy
 from transformers.models.llama.modeling_llama import LlamaForCausalLM
-from sticky_llama_attention_fast_attention import STICKYLlamaAttention
+from sticky_llama_attention import STICKYLlamaAttention
 
 class STICKYLlamaForCausalLM(LlamaForCausalLM):
     def __init__(self, config, **kwargs):

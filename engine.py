@@ -5,7 +5,7 @@ import numpy as np
 from typing import Dict, Any, List
 
 
-from metrics import metrics
+import metrics
 from data_loader import data_loader
 
 # =============================================================================

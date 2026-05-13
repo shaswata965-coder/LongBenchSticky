@@ -19,14 +19,14 @@ Q_RATIO = 10  # Set to e.g. 10 for 10% of total budget allocated to quantized ev
 # Quantization bit-width for the evicted (q-cache) tokens.
 # 8 → standard INT8 (1 byte/element, 2x compression vs fp16) — backward-compatible default.
 # 4 → packed INT4 (0.5 bytes/element, 4x compression vs fp16) — doubles q_windows_count.
-QUANTIZATION_BIT_WIDTH = 8
+QUANTIZATION_BIT_WIDTH = 4
 
 # To use a fixed number of tokens for local windows, set LOCAL_NUM_TOKENS (e.g., 256) and comment out P_RATIO
 # LOCAL_NUM_TOKENS = 32
 
 OMEGA = 8  # Window size for KV cache grouping
 SINK_TOKENS = 4  # Number of permanently protected sink tokens
-tracking_flag = 1
+tracking_flag = 0
 dataset_tracker = 1
 
 S_IDX = 0     # Starting index for window tracking
@@ -54,7 +54,7 @@ DATA_DIR = "/kaggle/input/datasets/shaswatabhattacharya/longbench-12/1LongBenchD
 
 # --- EVALUATION SCRIPT CONFIGURATIONS ---
 NUM_SAMPLES = 10
-LONGBENCH_SAMPLES = 20
+LONGBENCH_SAMPLES = 5
 TRACKED_LAYERS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
 NUM_Q_HEADS = 32
 NUM_KV_HEADS = 8

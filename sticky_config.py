@@ -54,7 +54,7 @@ DATA_DIR = "/kaggle/input/datasets/shaswatabhattacharya/longbench-12/1LongBenchD
 
 # --- EVALUATION SCRIPT CONFIGURATIONS ---
 NUM_SAMPLES = 10
-LONGBENCH_SAMPLES = 5
+LONGBENCH_SAMPLES = 20
 TRACKED_LAYERS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
 NUM_Q_HEADS = 32
 NUM_KV_HEADS = 8

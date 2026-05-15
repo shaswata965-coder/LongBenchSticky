@@ -154,6 +154,7 @@ class STICKYLlamaAttention(nn.Module):
 
     def _clean_cache(self):
         self.kv_cache._clean_scores()
+        self._dbg_count = 0
 
     def forward(
         self,
@@ -167,6 +168,9 @@ class STICKYLlamaAttention(nn.Module):
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
 
         bsz, q_len, _ = hidden_states.size()
+
+        if self.layer_idx == 0 and not hasattr(self, "_dbg_count"):
+            self._dbg_count = 0
 
         # 1. Update position_ids for generation (Correct RoPE indexing)
         if past_key_value is not None:
@@ -197,9 +201,21 @@ class STICKYLlamaAttention(nn.Module):
         key_states = apply_rotary_pos_emb_single(key_states, cos, sin, position_ids)
 
         # 5. KV Cache Concatenation
+        step1_phys_before = past_key_value[0].shape[-2] if past_key_value is not None else 0
         if past_key_value is not None:
             key_states = torch.cat([past_key_value[0], key_states], dim=2)
             value_states = torch.cat([past_key_value[1], value_states], dim=2)
+
+        if self.layer_idx == 0 and self._dbg_count == 1:
+            pos_dbg = position_ids.detach().flatten().tolist()
+            global_tc = int(self.kv_cache.global_token_counter.item())
+            print(
+                f"[STEP1-CACHE original] cache_type={type(past_key_value).__name__ if past_key_value is not None else 'None'} "
+                f"q_len={q_len} pos_ids={pos_dbg} global_tc={global_tc} "
+                f"phys_before={step1_phys_before} concat_len={key_states.shape[-2]} "
+                f"use_cache={use_cache}",
+                flush=True,
+            )
 
         past_key_value = (key_states, value_states) if use_cache else None
 
@@ -313,5 +329,8 @@ class STICKYLlamaAttention(nn.Module):
         )
         attn_output = attn_output.transpose(1, 2).contiguous().reshape(bsz, q_len, self.hidden_size)
         attn_output = self.o_proj(attn_output)
+
+        if self.layer_idx == 0 and hasattr(self, "_dbg_count") and self._dbg_count < 6:
+            self._dbg_count += 1
 
         return attn_output, (attn_weights_for_output if output_attentions else None), past_key_value

@@ -206,6 +206,15 @@ class STICKYLlamaAttention(nn.Module):
             key_states = torch.cat([past_key_value[0], key_states], dim=2)
             value_states = torch.cat([past_key_value[1], value_states], dim=2)
 
+        trace_decode = False
+        if self.layer_idx == 0 and q_len == 1:
+            tokens_since = getattr(self.kv_cache, "tokens_since_last_review", None)
+            omega = getattr(self.kv_cache, "omega", None)
+            trace_decode = (
+                self._dbg_count <= 10
+                or (omega is not None and tokens_since in {max(int(omega) - 1, 0), int(omega)})
+            )
+
         if self.layer_idx == 0 and self._dbg_count == 1:
             pos_dbg = position_ids.detach().flatten().tolist()
             global_tc = int(self.kv_cache.global_token_counter.item())
@@ -214,6 +223,32 @@ class STICKYLlamaAttention(nn.Module):
                 f"q_len={q_len} pos_ids={pos_dbg} global_tc={global_tc} "
                 f"phys_before={step1_phys_before} concat_len={key_states.shape[-2]} "
                 f"use_cache={use_cache}",
+                flush=True,
+            )
+
+        if trace_decode:
+            pos_dbg = position_ids.detach().flatten().tolist()
+            global_tc = int(self.kv_cache.global_token_counter.item())
+            q_cache_ids = getattr(self.kv_cache, "q_cache_ids", None)
+            q_windows = q_cache_ids.shape[1] if q_cache_ids is not None else 0
+            qcache_active = (
+                hasattr(self.kv_cache, "q_cache_k_quant")
+                and self.kv_cache.q_cache_k_quant is not None
+            )
+            cache_position = kwargs.get("cache_position", None)
+            cache_position_dbg = (
+                cache_position.detach().flatten().tolist()
+                if torch.is_tensor(cache_position)
+                else cache_position
+            )
+            print(
+                f"[DECODE-TRACE original PRE step={self._dbg_count}] "
+                f"cache_type={type(past_key_value).__name__ if past_key_value is not None else 'None'} "
+                f"q_len={q_len} pos_ids={pos_dbg} global_tc={global_tc} "
+                f"phys_before={step1_phys_before} concat_len={key_states.shape[-2]} "
+                f"tokens_since={getattr(self.kv_cache, 'tokens_since_last_review', 'NA')} "
+                f"gen_step={getattr(self.kv_cache, 'gen_step', 'NA')} q_windows={q_windows} "
+                f"qcache_active={qcache_active} cache_position={cache_position_dbg} use_cache={use_cache}",
                 flush=True,
             )
 
@@ -228,6 +263,14 @@ class STICKYLlamaAttention(nn.Module):
             main_logits = main_logits.reshape(bsz, self.num_heads, q_len, -1)
         else:
             main_logits = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+
+        if trace_decode:
+            print(
+                f"[DECODE-TRACE original LOGITS step={self._dbg_count}] "
+                f"main_shape={tuple(main_logits.shape)} logits_norm={main_logits.norm().item():.4e} "
+                f"max={main_logits.max().item():.4e} min={main_logits.min().item():.4e}",
+                flush=True,
+            )
 
         if attention_mask is not None:
             main_logits = main_logits + attention_mask
@@ -320,6 +363,17 @@ class STICKYLlamaAttention(nn.Module):
                 scores_for_cache = attn_weights
             attn_weights_for_output = attn_weights
 
+        if trace_decode:
+            scores_shape = tuple(scores_for_cache.shape) if scores_for_cache is not None else None
+            q_scores_shape = tuple(q_scores_for_cache.shape) if q_scores_for_cache is not None else None
+            out_scores_shape = tuple(attn_weights_for_output.shape) if attn_weights_for_output is not None else None
+            print(
+                f"[DECODE-TRACE original SCORES step={self._dbg_count}] "
+                f"scores_shape={scores_shape} q_scores_shape={q_scores_shape} "
+                f"output_attn_shape={out_scores_shape}",
+                flush=True,
+            )
+
         # Custom Sticky KV Cache Eviction
         # PASS FULL ATTENTION SCORES for Pre-fill Research Analysis
         past_key_value = self.kv_cache(
@@ -327,10 +381,22 @@ class STICKYLlamaAttention(nn.Module):
             full_attn_scores=attn_weights_for_output.detach(),
             q_attn_scores=q_scores_for_cache.detach() if q_scores_for_cache is not None else None
         )
+        if trace_decode:
+            q_cache_ids = getattr(self.kv_cache, "q_cache_ids", None)
+            q_windows = q_cache_ids.shape[1] if q_cache_ids is not None else 0
+            evicted_len = past_key_value[0].shape[-2] if past_key_value is not None else "None"
+            global_tc = int(self.kv_cache.global_token_counter.item())
+            print(
+                f"[DECODE-TRACE original POST step={self._dbg_count}] "
+                f"global_tc={global_tc} evicted_len={evicted_len} "
+                f"tokens_since={getattr(self.kv_cache, 'tokens_since_last_review', 'NA')} "
+                f"gen_step={getattr(self.kv_cache, 'gen_step', 'NA')} q_windows={q_windows}",
+                flush=True,
+            )
         attn_output = attn_output.transpose(1, 2).contiguous().reshape(bsz, q_len, self.hidden_size)
         attn_output = self.o_proj(attn_output)
 
-        if self.layer_idx == 0 and hasattr(self, "_dbg_count") and self._dbg_count < 6:
+        if self.layer_idx == 0 and hasattr(self, "_dbg_count"):
             self._dbg_count += 1
 
         return attn_output, (attn_weights_for_output if output_attentions else None), past_key_value

@@ -45,6 +45,8 @@ class STICKYLlamaForCausalLM(LlamaForCausalLM):
             input_ids, past_key_values=past_key_values, attention_mask=attention_mask, inputs_embeds=inputs_embeds, **kwargs
         )
         if past_key_values is not None:
+            prep_dbg_count = getattr(self, "_dbg_prepare_count", 0)
+
             # Override incorrect slicing done by super() due to evicted cache size
             model_inputs["input_ids"] = input_ids[:, -1:]
             
@@ -63,5 +65,19 @@ class STICKYLlamaForCausalLM(LlamaForCausalLM):
                     model_inputs["position_ids"] = torch.tensor([[true_seq_length - 1]], dtype=torch.long, device=input_ids.device)
             else:
                 model_inputs["position_ids"] = position_ids[:, -1:]
+
+            if prep_dbg_count < 10:
+                cache_pos = model_inputs.get("cache_position", None)
+                pos_ids = model_inputs.get("position_ids", None)
+                cache_pos_dbg = cache_pos.detach().flatten().tolist() if torch.is_tensor(cache_pos) else cache_pos
+                pos_ids_dbg = pos_ids.detach().flatten().tolist() if torch.is_tensor(pos_ids) else pos_ids
+                print(
+                    f"[GEN-PREP original step={prep_dbg_count}] "
+                    f"input_len={input_ids.shape[1]} sliced_len={model_inputs['input_ids'].shape[1]} "
+                    f"cache_position={cache_pos_dbg} position_ids={pos_ids_dbg} "
+                    f"pkv_type={type(past_key_values).__name__}",
+                    flush=True,
+                )
+            self._dbg_prepare_count = prep_dbg_count + 1
         
         return model_inputs

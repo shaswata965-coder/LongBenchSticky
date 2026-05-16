@@ -197,9 +197,23 @@ with open(lcc_path) as f:
 # Filter (same logic as engine.py: skip >5000 tokens)
 MAX_FILTER = 5000
 MAX_PROMPT = args.max_tokens
+_TEXT_FIELDS   = ("input", "prompt", "context", "text", "passage", "article")
+_ANSWER_FIELDS = ("answers", "answer", "output", "label", "labels")
+
+def _get_text(ex):
+    for f in _TEXT_FIELDS:
+        v = ex.get(f)
+        if isinstance(v, str) and v.strip():
+            return v
+    # Last-resort: stringify first string-valued field found
+    for v in ex.values():
+        if isinstance(v, str) and v.strip():
+            return v
+    return ""
+
 filtered = []
 for ex in samples:
-    text = ex.get("input", ex.get("prompt", ""))
+    text = _get_text(ex)
     ntok = tokenizer(text, add_special_tokens=False, return_tensors="pt")["input_ids"].shape[1]
     if ntok <= MAX_FILTER:
         filtered.append((ex, ntok))
@@ -209,9 +223,15 @@ if args.sample >= len(filtered):
     sys.exit(1)
 
 target_ex, prompt_ntok = filtered[args.sample]
-prompt_text  = target_ex.get("input", target_ex.get("prompt", ""))
-ground_truth = target_ex.get("answers", target_ex.get("answer", target_ex.get("output", "")))
-input_ids    = tokenizer(prompt_text, add_special_tokens=False, return_tensors="pt").input_ids
+prompt_text  = _get_text(target_ex)
+ground_truth = next((target_ex[f] for f in _ANSWER_FIELDS if f in target_ex), "")
+
+if not prompt_text:
+    print(f"ERROR: sample {args.sample} has no recognised text field. Keys: {list(target_ex.keys())}")
+    sys.exit(1)
+
+print(f"[data] Using text field from keys: {list(target_ex.keys())}", flush=True)
+input_ids = tokenizer(prompt_text, add_special_tokens=False, return_tensors="pt").input_ids
 
 print(f"[data] Sample {args.sample}: {prompt_ntok} tokens  GT={repr(str(ground_truth)[:80])}", flush=True)
 
@@ -266,7 +286,7 @@ else:  # original
 
 model.eval()
 device = next(model.parameters()).device
-input_ids = input_ids.to(device)
+input_ids = input_ids.to(device).long()
 print(f"[model] Ready. device={device}", flush=True)
 
 
@@ -456,7 +476,7 @@ with torch.inference_mode():
     pkv = out.past_key_values
     last_logits = out.logits[:, -1, :]
     next_tok = int(last_logits.argmax(dim=-1).item())
-    all_ids = torch.cat([input_ids, torch.tensor([[next_tok]], device=device)], dim=1)
+    all_ids = torch.cat([input_ids, torch.tensor([[next_tok]], device=device, dtype=torch.long)], dim=1)
 
     prefill_out_tok = next_tok   # first generated token (from prefill logits)
     print(f"[gen] Prefill done. First token: {next_tok} ({repr(tokenizer.decode([next_tok]))})", flush=True)
@@ -482,7 +502,7 @@ with torch.inference_mode():
         new_logits = out.logits[:, -1, :]
         output_tok = int(new_logits.argmax(dim=-1).item())
 
-        all_ids = torch.cat([all_ids, torch.tensor([[output_tok]], device=device)], dim=1)
+        all_ids = torch.cat([all_ids, torch.tensor([[output_tok]], device=device, dtype=torch.long)], dim=1)
 
         rec = {
             "step":            step,

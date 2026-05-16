@@ -29,12 +29,24 @@ USAGE
 import sys, os, json, argparse, gc
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-# originalQevict/ sits next to src/ in the same repo root as this script.
-# If running from a worktree that doesn't have originalQevict/, check the
-# main repo root two levels up (.claude/worktrees/<name>/ → ../../).
-_candidate1 = os.path.join(SCRIPT_DIR, "Qevict")
-_candidate2 = os.path.join(SCRIPT_DIR, "..", "..", "Qevict")
-ORIG_ROOT = _candidate1 if os.path.isdir(_candidate1) else os.path.normpath(_candidate2)
+
+# ORIG_ROOT: directory containing the original Sticky KV source files.
+# Probe by marker files so this works whether running from the main project,
+# a sibling folder, or a .claude/worktrees/<name>/ worktree (3 levels deep).
+def _find_orig_root():
+    markers = ("configuration_sticky_llama.py", "sticky_config.py")
+    candidates = [
+        os.path.join(SCRIPT_DIR, "Qevict"),
+        SCRIPT_DIR,
+        os.path.normpath(os.path.join(SCRIPT_DIR, "..", "..", "..")),
+        os.path.normpath(os.path.join(SCRIPT_DIR, "..", "..")),
+    ]
+    for c in candidates:
+        if os.path.isdir(c) and all(os.path.isfile(os.path.join(c, m)) for m in markers):
+            return c
+    return os.path.normpath(os.path.join(SCRIPT_DIR, "..", "..", ".."))
+
+ORIG_ROOT = _find_orig_root()
 
 # ──────────────────────────────────────────────────────────────────────────────
 # ARGUMENTS
@@ -128,8 +140,14 @@ if args.diff:
 # ──────────────────────────────────────────────────────────────────────────────
 sys.path.insert(0, SCRIPT_DIR)
 
+# Detect whether source files live under src/ or directly in SCRIPT_DIR.
+_HAS_SRC = os.path.isdir(os.path.join(SCRIPT_DIR, "src"))
+
 if args.mode == "current":
-    import src.sticky_config as cfg
+    if _HAS_SRC:
+        import src.sticky_config as cfg
+    else:
+        import sticky_config as cfg
     if args.q_ratio is not None:
         cfg.Q_RATIO = args.q_ratio
         print(f"[override] Q_RATIO={args.q_ratio}", flush=True)
@@ -202,8 +220,12 @@ print(f"[data] Sample {args.sample}: {prompt_ntok} tokens  GT={repr(str(ground_t
 # LOAD MODEL
 # ──────────────────────────────────────────────────────────────────────────────
 if args.mode == "current":
-    from src.models.configuration_sticky_llama import LlamaConfig
-    from src.models.sticky_llama_model import STICKYLlamaForCausalLM
+    if _HAS_SRC:
+        from src.models.configuration_sticky_llama import LlamaConfig
+        from src.models.sticky_llama_model import STICKYLlamaForCausalLM
+    else:
+        from configuration_sticky_llama import LlamaConfig
+        from sticky_llama_model import STICKYLlamaForCausalLM
 
     model_config = LlamaConfig.from_pretrained(MODEL_PATH)
     if hasattr(model_config, "rope_scaling") and model_config.rope_scaling:

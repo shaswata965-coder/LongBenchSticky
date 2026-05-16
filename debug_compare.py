@@ -497,7 +497,8 @@ with torch.inference_mode():
             past_key_values=pkv,
             attention_mask=torch.ones(1, all_ids.shape[1], device=device),
         )
-        out = model(**model_inputs, return_dict=True, use_cache=True)
+        model_inputs["use_cache"] = True
+        out = model(**model_inputs, return_dict=True)
         pkv = out.past_key_values
         new_logits = out.logits[:, -1, :]
         output_tok = int(new_logits.argmax(dim=-1).item())

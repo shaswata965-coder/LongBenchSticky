@@ -140,7 +140,7 @@ if args.mode == "current":
     DATA_DIR   = cfg.DATA_DIR
 else:
     sys.path.insert(0, ORIG_ROOT)
-    import src.sticky_config as orig_cfg
+    import sticky_config as orig_cfg
     if args.q_ratio is not None: orig_cfg.Q_RATIO = args.q_ratio
     if args.omega   is not None: orig_cfg.OMEGA   = args.omega
     MODEL_PATH = orig_cfg.MODEL_PATH

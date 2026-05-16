@@ -32,8 +32,8 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 # originalQevict/ sits next to src/ in the same repo root as this script.
 # If running from a worktree that doesn't have originalQevict/, check the
 # main repo root two levels up (.claude/worktrees/<name>/ → ../../).
-_candidate1 = os.path.join(SCRIPT_DIR, "originalQevict")
-_candidate2 = os.path.join(SCRIPT_DIR, "..", "..", "originalQevict")
+_candidate1 = os.path.join(SCRIPT_DIR, "Qevict")
+_candidate2 = os.path.join(SCRIPT_DIR, "..", "..", "Qevict")
 ORIG_ROOT = _candidate1 if os.path.isdir(_candidate1) else os.path.normpath(_candidate2)
 
 # ──────────────────────────────────────────────────────────────────────────────
